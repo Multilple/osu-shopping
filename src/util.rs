@@ -11,9 +11,9 @@ pub const DAY: i64 = 24 * HOUR;
 // ---------------------------------------------------------------- keys
 
 /// An ID as a 128-bit key. IDs of 1..=15 bytes are stored exactly: the bytes
-/// left-aligned (big-endian) in the top 15 bytes and the length in the low
-/// byte, so comparing two such keys as integers is a byte-wise comparison of
-/// the IDs. Longer IDs are interned and carry 0xFF in the low byte.
+/// in memory order (little-endian) in the low 15 bytes and the length in the
+/// top byte. Byte-swapped, two such keys compare as the IDs do byte-wise.
+/// Longer IDs are interned and carry 0xFF in the top byte.
 pub type Key = u128;
 
 static LONG: Mutex<Option<(HashMap<Vec<u8>, u32>, Vec<Vec<u8>>)>> = Mutex::new(None);
@@ -32,7 +32,7 @@ fn intern_long(b: &[u8]) -> Key {
             i
         }
     };
-    ((idx as u128) << 8) | 0xFF
+    (idx as u128) | (0xFFu128 << 120)
 }
 
 /// Pack a non-empty ID.
@@ -43,7 +43,8 @@ pub fn pack(b: &[u8]) -> Key {
     if n <= 15 {
         let mut buf = [0u8; 16];
         buf[..n].copy_from_slice(b);
-        u128::from_be_bytes(buf) | n as u128
+        buf[15] = n as u8;
+        u128::from_le_bytes(buf)
     } else {
         intern_long(b)
     }
@@ -51,17 +52,17 @@ pub fn pack(b: &[u8]) -> Key {
 
 #[inline(always)]
 pub fn is_long(k: Key) -> bool {
-    (k as u8) == 0xFF
+    (k >> 120) as u8 == 0xFF
 }
 
 pub fn key_bytes(k: Key, out: &mut Vec<u8>) {
     if is_long(k) {
         let guard = LONG.lock().unwrap();
         let (_, list) = guard.as_ref().unwrap();
-        out.extend_from_slice(&list[(k >> 8) as u32 as usize]);
+        out.extend_from_slice(&list[k as u32 as usize]);
     } else {
-        let n = (k as u8) as usize;
-        out.extend_from_slice(&k.to_be_bytes()[..n]);
+        let n = (k >> 120) as usize;
+        out.extend_from_slice(&k.to_le_bytes()[..n]);
     }
 }
 
@@ -69,7 +70,7 @@ pub fn key_bytes(k: Key, out: &mut Vec<u8>) {
 #[inline(always)]
 pub fn cmp_key(a: Key, b: Key) -> std::cmp::Ordering {
     if !is_long(a) && !is_long(b) {
-        a.cmp(&b)
+        a.swap_bytes().cmp(&b.swap_bytes())
     } else {
         cmp_key_slow(a, b)
     }
@@ -98,14 +99,13 @@ pub fn hash64(k: Key) -> u64 {
     )
 }
 
-/// A second, independent hash, used to tell apart event IDs whose first
-/// hashes collide.
+/// `hash64` and a second word of the same 128-bit product, used to tell
+/// apart event IDs whose first hashes collide.
 #[inline(always)]
-pub fn hash64b(k: Key) -> u64 {
-    wymix(
-        (k as u64) ^ 0xA076_1D64_78BD_642F,
-        ((k >> 64) as u64) ^ 0xE703_7ED1_A0B4_28DB,
-    )
+pub fn hash_pair(k: Key) -> (u64, u64) {
+    let r = (((k as u64) ^ 0x9E37_79B9_7F4A_7C15) as u128)
+        .wrapping_mul((((k >> 64) as u64) ^ 0xD6E8_FEB8_6659_FD93) as u128);
+    ((r as u64) ^ ((r >> 64) as u64), (r >> 64) as u64)
 }
 
 // ---------------------------------------------------------------- map

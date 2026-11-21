@@ -420,7 +420,7 @@ fn build_ctx(data: &Path, event_bytes: usize, click_bytes: usize, link_bytes: us
     let event_lines = event_bytes / 64 + 1;
     let ids_guess = event_lines / 6 + click_bytes / 512 + link_bytes / 64 + 1024;
     let nregions = ((ids_guess * scale).div_ceil(RSIZE)).max(4);
-    let rpb = nregions.div_ceil(400).next_power_of_two();
+    let rpb = nregions.div_ceil(env_usize("SS_NQ", 400)).next_power_of_two();
     let qshift = (RBITS + rpb.trailing_zeros() as usize) as u32;
     let nq = nregions.div_ceil(rpb);
     assert!(nq <= 1 << Q_BITS);
@@ -466,6 +466,10 @@ fn chunk_tasks(bytes: &[u8], events: bool, file: usize, chunk: usize, tasks: &mu
 fn exp() -> u32 {
     static EXP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *EXP.get_or_init(|| std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn slow_only() -> bool {
@@ -548,18 +552,32 @@ struct PendC {
     camp: u32,
 }
 
-/// Ingest time in seconds as a biased u32 (only ever compared between copies of one event).
+/// Ingest time in seconds as a biased u32 (only ever compared between copies
+/// of one event). `None` (unparsable) sorts last.
 #[inline(always)]
-fn ingest32(ctx: &Ctx, ing: i64) -> u32 {
-    (ing.saturating_sub(ctx.origin) / 1000).saturating_add(1 << 31).clamp(0, u32::MAX as i64 - 1) as u32
+fn ingest32(ctx: &Ctx, ing: Option<i64>) -> u32 {
+    const TOP: u32 = u32::MAX - 1;
+    match ing {
+        Some(ms) => {
+            let rel = ms.wrapping_sub(ctx.origin).wrapping_add((1i64 << 31) * 1000);
+            if (rel as u64) < TOP as u64 * 1000 {
+                (rel as u64 / 1000) as u32
+            } else if rel < 0 {
+                0
+            } else {
+                TOP
+            }
+        }
+        None => TOP,
+    }
 }
 
 /// Record one parsed event line: `ev` is `Some` when the copy is valid.
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
-fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev: Option<u64>, ing: i64) {
-    let h = hash64(ek);
-    let h2 = (hash64b(ek) >> 40) & H2_MASK;
+fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev: Option<u64>, ing: Option<i64>) {
+    let (h, hb) = hash_pair(ek);
+    let h2 = (hb >> 20) & H2_MASK;
     let ingest = ingest32(ctx, ing);
     match ev {
         Some(ev) => {
@@ -637,11 +655,11 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
                     return;
                 }
                 let ek = fast::pack_at(base, s[0], e[0]);
-                let ing = out.dates.f1(base, s[3], e[3]).unwrap_or(i64::MAX);
+                let ing = out.dates.f1(base, s[3], e[3]);
                 let mut ev = None;
                 if e[1] > s[1] && e[5] > s[5] {
                     if let Some(t) = out.dates.ts(base, s[2], e[2]) {
-                        if t >= ctx.ws && t < ctx.we && ing.saturating_sub(t) <= DAY {
+                        if t >= ctx.ws && t < ctx.we && ing.is_some_and(|i| i - t <= DAY) {
                             let off = ((t - ctx.origin) as u64) << 33;
                             let tn = e[4] - s[4];
                             let tp = base.add(s[4]);
@@ -678,12 +696,12 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
             continue;
         }
         let ek = pack(eid);
-        let ing = parse_f1(ingest).unwrap_or(i64::MAX);
+        let ing = parse_f1(ingest);
         let mut ev = None;
         if !user.is_empty() && !prod.is_empty() {
             if let Some(t) = parse_ts(ts) {
                 // In the window, and not ingested more than 24 hours late.
-                if t >= ctx.ws && t < ctx.we && ing.saturating_sub(t) <= DAY {
+                if t >= ctx.ws && t < ctx.we && ing.is_some_and(|i| i - t <= DAY) {
                     let off = ((t - ctx.origin) as u64) << 33;
                     if typ == b"view" || typ == b"cart" {
                         ev = Some(off);
@@ -1055,13 +1073,15 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
         return;
     }
     // Latest ts last; among equal ts the smallest click_id last.
-    cks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(b.cid, a.cid)));
-    // Copies of one click are identical, so they are neighbours now.
     let mut nc = 1;
-    for k in 1..cks.len() {
-        if cks[k].cid != cks[nc - 1].cid {
-            cks[nc] = cks[k];
-            nc += 1;
+    if cks.len() > 1 {
+        cks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(b.cid, a.cid)));
+        // Copies of one click are identical, so they are neighbours now.
+        for k in 1..cks.len() {
+            if cks[k].cid != cks[nc - 1].cid {
+                cks[nc] = cks[k];
+                nc += 1;
+            }
         }
     }
     let cks = &cks[..nc];
@@ -1086,14 +1106,23 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
     tl.prof[7] += (t4 - t3) as f64;
     tl.tmp.clear();
     tl.tmp.extend(cks.iter().map(|c| ((c.camp as u64) << 32) | c.ts as u64));
-    tl.tmp.sort_unstable();
+    if nc > 1 {
+        tl.tmp.sort_unstable();
+    }
     let t5 = unsafe { core::arch::x86_64::_rdtsc() };
     tl.prof[8] += (t5 - t4) as f64;
     let mut nflush = 0u64;
     let sess = &tl.sess;
     let assisted = &mut tl.cells.assisted;
+    let few = sess.len() <= 12;
     let mut flush = |camp: usize, a: u32, b: u32| {
         nflush += 1;
+        if few {
+            for s in sess.iter() {
+                assisted[camp * nd + s.day as usize] += (s.start.wrapping_sub(a) <= b - a) as u32;
+            }
+            return;
+        }
         let lo = sess.partition_point(|s| s.start < a);
         let hi = lo + sess[lo..].partition_point(|s| s.start <= b);
         if hi - lo <= 8 {
@@ -1171,9 +1200,9 @@ fn write_user_daily(path: &Path, rows: &Rows, ctx: &Ctx) {
             user.extend_from_slice(&(scratch.len() as u32).to_le_bytes());
             user.extend_from_slice(&scratch);
         } else {
-            let len = (k as u8) as usize;
+            let len = (k >> 120) as usize;
             user.extend_from_slice(&(len as u32).to_le_bytes());
-            user.extend_from_slice(&k.to_be_bytes()[..len]);
+            user.extend_from_slice(&k.to_le_bytes()[..len]);
         }
     }
     let mut day = Vec::with_capacity(n * 4);

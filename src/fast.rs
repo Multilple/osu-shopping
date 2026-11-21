@@ -83,14 +83,40 @@ pub unsafe fn strip(base: *const u8, s: &mut usize, e: &mut usize) -> u32 {
     q as u32
 }
 
+#[repr(C, align(32))]
+struct PackRow {
+    mask: [u8; 16],
+    len: [u8; 16],
+}
+
+/// For each length 0..=15: a mask keeping that many bytes, and the length in the top byte.
+static PACK: [PackRow; 16] = {
+    let mut t = [const { PackRow { mask: [0; 16], len: [0; 16] } }; 16];
+    let mut n = 0;
+    while n < 16 {
+        let mut i = 0;
+        while i < n {
+            t[n].mask[i] = 0xFF;
+            i += 1;
+        }
+        t[n].len[15] = n as u8;
+        n += 1;
+    }
+    t
+};
+
 /// `pack` for a non-empty field at `base[s..e]`, with 16 readable bytes at `s`.
 #[inline(always)]
 pub unsafe fn pack_at(base: *const u8, s: usize, e: usize) -> Key {
     let n = e - s;
     if n <= 15 {
-        let v = u128::from_be(std::ptr::read_unaligned(base.add(s) as *const u128));
-        let sh = (16 - n) * 8;
-        ((v >> sh) << sh) | n as u128
+        let row = PACK.get_unchecked(n);
+        let v = _mm_loadu_si128(base.add(s) as *const __m128i);
+        let v = _mm_or_si128(
+            _mm_and_si128(v, _mm_load_si128(row.mask.as_ptr() as *const __m128i)),
+            _mm_load_si128(row.len.as_ptr() as *const __m128i),
+        );
+        std::mem::transmute::<__m128i, u128>(v)
     } else {
         pack(std::slice::from_raw_parts(base.add(s), n))
     }
@@ -120,30 +146,31 @@ unsafe fn digits16(p: *const u8, n: usize) -> Option<u64> {
     Some(hi * 100_000_000 + lo)
 }
 
-/// Per-thread memo of calendar dates seen (`YYYY-MM-DD` -> ms at midnight).
+/// Per-thread memo of calendar dates seen: the 11 bytes `YYYY-MM-DDT` -> ms
+/// at midnight, or BAD_DATE when they are not a valid date followed by `T`.
 pub struct Dates {
-    key8: [u64; 32],
-    key2: [u16; 32],
-    val: [i64; 32],
+    key8: [u64; 64],
+    key4: [u32; 64],
+    val: [i64; 64],
 }
 
 const BAD_DATE: i64 = i64::MIN;
 
 impl Dates {
     pub fn new() -> Dates {
-        Dates { key8: [0; 32], key2: [0; 32], val: [BAD_DATE; 32] }
+        Dates { key8: [0; 64], key4: [0; 64], val: [BAD_DATE; 64] }
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn miss(&mut self, p: *const u8, idx: usize, k8: u64, k2: u16) -> i64 {
-        let b = std::slice::from_raw_parts(p, 10);
+    unsafe fn miss(&mut self, p: *const u8, idx: usize, k8: u64, k4: u32) -> i64 {
+        let b = std::slice::from_raw_parts(p, 11);
         let d = |i: usize| -> Option<i64> {
             let v = b[i].wrapping_sub(b'0');
             (v <= 9).then_some(v as i64)
         };
         let v = (|| {
-            if b[4] != b'-' || b[7] != b'-' {
+            if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
                 return None;
             }
             let year = d(0)? * 1000 + d(1)? * 100 + d(2)? * 10 + d(3)?;
@@ -170,7 +197,7 @@ impl Dates {
         })()
         .unwrap_or(BAD_DATE);
         self.key8[idx] = k8;
-        self.key2[idx] = k2;
+        self.key4[idx] = k4;
         self.val[idx] = v;
         v
     }
@@ -179,21 +206,24 @@ impl Dates {
     #[cfg_attr(feature = "prof", inline(never))]
     #[cfg_attr(not(feature = "prof"), inline(always))]
     pub unsafe fn civil(&mut self, p: *const u8) -> Option<i64> {
+        // Bytes 0..8 and 7..11 (`-DDT`) identify the date; the day's two
+        // digits pick the memo slot.
         let k8 = std::ptr::read_unaligned(p as *const u64);
-        let k2 = std::ptr::read_unaligned(p.add(8) as *const u16);
-        let idx = (((k2 & 0xF) * 10 + ((k2 >> 8) & 0xF)) & 31) as usize;
-        let date = if *self.key8.get_unchecked(idx) == k8 && *self.key2.get_unchecked(idx) == k2 {
+        let k4 = std::ptr::read_unaligned(p.add(7) as *const u32);
+        let idx = (((k4 >> 4) & 0x30) | ((k4 >> 16) & 0xF)) as usize;
+        let date = if *self.key8.get_unchecked(idx) == k8 && *self.key4.get_unchecked(idx) == k4 {
             *self.val.get_unchecked(idx)
         } else {
-            self.miss(p, idx, k8, k2)
+            self.miss(p, idx, k8, k4)
         };
+        // `HH:MM:SS`: after the xor, digits are 0..=9 and the colons are 0.
         let x = std::ptr::read_unaligned(p.add(11) as *const u64) ^ 0x3030_3A30_303A_3030;
-        let bad = ((x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080)
-            | (x & 0x0000_FF00_00FF_0000);
-        let hh = (x & 0xFF) * 10 + ((x >> 8) & 0xFF);
-        let mm = ((x >> 24) & 0xFF) * 10 + ((x >> 32) & 0xFF);
-        let ss = ((x >> 48) & 0xFF) * 10 + (x >> 56);
-        if date == BAD_DATE || bad != 0 || *p.add(10) != b'T' || hh > 23 || mm > 59 || ss > 59 {
+        let bad = ((x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080) | (x & 0x0000_FF00_00FF_0000);
+        // Each byte becomes itself plus ten times the byte before it.
+        let y = x.wrapping_mul(0x0A01);
+        let (hh, mm, ss) = ((y >> 8) & 0xFF, (y >> 32) & 0xFF, y >> 56);
+        let over = (23u64.wrapping_sub(hh) | 59u64.wrapping_sub(mm) | 59u64.wrapping_sub(ss)) >> 63;
+        if (date == BAD_DATE) | (bad | over != 0) {
             return None;
         }
         Some(date + ((hh * 3600 + mm * 60 + ss) as i64) * 1000)

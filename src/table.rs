@@ -96,11 +96,11 @@ impl IdTable {
         let mut pos = start;
         loop {
             let s = self.slot(base | pos);
-            let lo = s.lo.load(Acquire);
-            if lo == klo && s.hi.load(Relaxed) == khi {
+            let hi = s.hi.load(Acquire);
+            if hi == khi && s.lo.load(Relaxed) == klo {
                 return (base | pos) as u32;
             }
-            if lo == 0 {
+            if hi == 0 {
                 break;
             }
             pos = (pos + 1) & RMASK;
@@ -119,21 +119,22 @@ impl IdTable {
         let mut pos = start;
         let found = loop {
             let s = self.slot(base | pos);
-            let lo = s.lo.load(Relaxed);
-            if lo == klo && s.hi.load(Relaxed) == khi {
+            let hi = s.hi.load(Relaxed);
+            if hi == khi && s.lo.load(Relaxed) == klo {
                 break (base | pos) as u32;
             }
-            if lo == 0 {
+            if hi == 0 {
                 let count = unsafe { &mut *self.counts[region].get() };
                 if *count >= RLIMIT {
                     self.overflow.store(true, Relaxed);
                     break base as u32;
                 }
                 *count += 1;
-                // The key's low word goes last: a reader that sees it sees the rest.
+                // The key's high word (never 0: it holds the length) goes
+                // last: a reader that sees it sees the rest.
                 s.root.store((base | pos) as u32, Relaxed);
-                s.hi.store(khi, Relaxed);
-                s.lo.store(klo, Release);
+                s.lo.store(klo, Relaxed);
+                s.hi.store(khi, Release);
                 break (base | pos) as u32;
             }
             pos = (pos + 1) & RMASK;
@@ -191,7 +192,7 @@ impl IdTable {
     pub fn flatten_region(&self, region: usize) {
         let base = region << RBITS;
         for i in base..base + RSIZE {
-            if self.slot(i).lo.load(Relaxed) != 0 {
+            if self.slot(i).hi.load(Relaxed) != 0 {
                 let r = self.find(i as u32);
                 self.slot(i).root.store(r, Relaxed);
             }
