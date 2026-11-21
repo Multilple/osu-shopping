@@ -13,6 +13,7 @@
 //!              attribute, aggregate, and write Parquet.
 
 mod dense;
+#[cfg(feature = "lab")]
 mod lab;
 mod dense_ck;
 mod dense_ev;
@@ -194,7 +195,9 @@ fn main() {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .min(MAX_THREADS);
-    if std::env::var_os("SS_LAB").is_some() {
+    // (A lab build only measures: see lab.rs.)
+    #[cfg(feature = "lab")]
+    if !lab::is_child() {
         lab::main(threads);
     }
     SUM_ON.store(std::env::var_os("SS_SUM").is_some(), Relaxed);

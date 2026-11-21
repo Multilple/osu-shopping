@@ -14,6 +14,22 @@ use crate::util::sys;
 
 static PAGE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// What a run started by the lab carries (SS_T), for the lab process `pid`.
+fn ticket(pid: u64) -> String {
+    let mut x = pid ^ 0x5DEE_CE66_D1CE_4E5B;
+    for _ in 0..5 {
+        x = (x ^ (x >> 31)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        x = x.rotate_left(23).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    }
+    format!("{:x}", x ^ (x >> 29))
+}
+
+/// Whether this process was started by a lab process to do one run.
+pub fn is_child() -> bool {
+    let parent = unsafe { sys::getppid() } as u64;
+    std::env::var("SS_T").is_ok_and(|t| t == ticket(parent))
+}
+
 fn read(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
@@ -80,7 +96,7 @@ fn one(exe: &Path, data: &Path, out: &Path, threads: usize, env: &[(&str, &str)]
     let (u0, s0) = sys::usage_children();
     let t = Instant::now();
     let mut cmd = Command::new(exe);
-    cmd.arg(data).arg(out).env_remove("SS_LAB").env("NCPU", threads.to_string()).env("SS_TIMING", "1").env("SS_SUM", "1").stdout(Stdio::null()).stderr(Stdio::piped());
+    cmd.arg(data).arg(out).env("SS_T", ticket(std::process::id() as u64)).env("NCPU", threads.to_string()).env("SS_TIMING", "1").env("SS_SUM", "1").stdout(Stdio::null()).stderr(Stdio::piped());
     for (k, v) in env {
         cmd.env(k, v);
     }
