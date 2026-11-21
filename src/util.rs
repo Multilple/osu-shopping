@@ -14,6 +14,17 @@ pub const DAY: i64 = 24 * HOUR;
 /// in memory order (little-endian) in the low 15 bytes and the length in the
 /// top byte. Byte-swapped, two such keys compare as the IDs do byte-wise.
 /// Longer IDs are interned and carry 0xFF in the top byte.
+/// `x`, computed where the compiler would otherwise turn a flag into a
+/// branch: it must treat the result as unknown, and emits nothing for it.
+#[inline(always)]
+pub fn opaque(x: u64) -> u64 {
+    let mut y = x;
+    unsafe {
+        core::arch::asm!("/* {0} */", inout(reg) y, options(pure, nomem, nostack, preserves_flags));
+    }
+    y
+}
+
 pub type Key = u128;
 
 static LONG: Mutex<Option<(HashMap<Vec<u8>, u32>, Vec<Vec<u8>>)>> = Mutex::new(None);
@@ -197,6 +208,7 @@ pub mod sys {
     pub const MAP_ANONYMOUS: i32 = 0x20;
     pub const MAP_NORESERVE: i32 = 0x4000;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
+    pub const MADV_DONTNEED: i32 = 4;
     pub const MADV_HUGEPAGE: i32 = 14;
     pub const M_MMAP_THRESHOLD: i32 = -3;
     extern "C" {

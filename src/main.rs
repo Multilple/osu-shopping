@@ -107,15 +107,22 @@ struct Aux {
 
 struct ThreadOut {
     arena: Arena,
+    /// The dedup notes live apart, so they can be given back after dedup.
+    arena_slim: Arena,
     ev: EvStreams,
     ck: CkStreams,
     slim: SlimStreams,
     dates: fast::Dates,
     reader: input::Reader,
-    pend_e: Vec<PendE>,
+    /// Events and clicks waiting for their table lookups, `npe` and `npc` of them.
+    pend_e: Box<[PendE]>,
+    npe: usize,
+    /// How many of them wait for a table line that was not at hand (see `flush_events`).
+    held: usize,
     /// Purchases among `pend_e` (by index) and their product IDs.
     pend_p: Vec<(u32, Key)>,
-    pend_c: Vec<PendC>,
+    pend_c: Box<[PendC]>,
+    npc: usize,
     pend_l: Vec<(Key, u64, Key, u64)>,
 }
 
@@ -208,21 +215,25 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     let link_files = input::list_dir(&data_dir.join("links"));
     let bytes = |files: &[input::Src]| files.iter().map(|s| s.len).sum::<usize>();
     let mut ctx = build_ctx(data_dir, bytes(&event_files), bytes(&click_files), bytes(&link_files), scale);
-    let chunk = env_usize("SS_CHUNK", 128 << 10);
+    let chunk = env_usize("SS_CHUNK", 64 << 10);
     lap("setup");
 
     let outs: Outs = (0..threads)
         .map(|_| {
             Shared(UnsafeCell::new(ThreadOut {
                 arena: Arena::new(),
+                arena_slim: Arena::new(),
                 ev: Streams::new(ctx.nq),
                 ck: Streams::new(ctx.nq),
                 slim: Streams::new(1 << ctx.pbits),
                 dates: fast::Dates::new(),
                 reader: input::Reader::new(chunk),
-                pend_e: Vec::with_capacity(PEND),
+                pend_e: vec![PendE::default(); PEND].into_boxed_slice(),
+                npe: 0,
+                held: 0,
                 pend_p: Vec::with_capacity(PEND),
-                pend_c: Vec::with_capacity(PEND),
+                pend_c: vec![PendC::default(); PEND].into_boxed_slice(),
+                npc: 0,
                 pend_l: Vec::with_capacity(PEND),
             }))
         })
@@ -277,17 +288,17 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             let (start, end) = out.reader.load(src, task.a, task.b);
             let buf = std::mem::take(&mut out.reader.buf);
             if task.events {
-                parse_events(&buf[..end + 64], start, end, &ctx, out, tid);
+                parse_events(&buf[..end + 128], start, end, &ctx, out, tid);
             } else {
-                parse_clicks(&buf[..end + 64], start, end, &ctx, out);
+                parse_clicks(&buf[..end + 128], start, end, &ctx, out);
             }
             out.reader.buf = buf;
         }
-        flush_events(&ctx, out, tid);
+        flush_events(&ctx, out, tid, true);
         flush_clicks(&ctx, out);
         out.ev.finish(&mut out.arena);
         out.ck.finish(&mut out.arena);
-        out.slim.finish(&mut out.arena);
+        out.slim.finish(&mut out.arena_slim);
     });
     if ctx.ids.overflow.load(Ordering::Relaxed) {
         return false;
@@ -321,15 +332,18 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     std::fs::create_dir_all(&camp_dir).unwrap();
 
     let ncell = (ctx.aux.camp_names.len() + 1) * ctx.nd;
+    // Biggest buckets first, so one huge person cannot be left for the end.
+    let mut order: Vec<usize> = (0..ctx.nq).collect();
+    order.sort_by_key(|&q| std::cmp::Reverse(outs_ref.iter().map(|o| o.ev.len(q) + o.ck.len(q)).sum::<usize>()));
     let next = AtomicUsize::new(0);
     let cells: Vec<Shared<UnsafeCell<Option<Cells>>>> = (0..threads).map(|_| Shared(UnsafeCell::new(None))).collect();
     par(threads, |tid| {
+        // Nobody reads the dedup notes any more.
+        outs_ref[tid].arena_slim.release();
         let mut tl = Tl::new(&ctx, ncell);
         loop {
-            let q = next.fetch_add(1, Ordering::Relaxed);
-            if q >= ctx.nq {
-                break;
-            }
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&q) = order.get(i) else { break };
             person_bucket(q, &outs_ref, &ctx, &mut tl);
         }
         let t_w = Instant::now();
@@ -337,15 +351,22 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             write_user_daily(&user_dir.join(format!("part-{tid:03}.parquet")), &mut tl.rows, &ctx);
         }
         if log {
-            eprintln!("    t{tid}: count {:.0} place {:.0} persons {:.0} write {:.0} ms | Mcycles sort {:.0} sess {:.0} attr {:.0}", tl.prof[0] * 1e3, tl.prof[1] * 1e3, tl.prof[2] * 1e3, t_w.elapsed().as_secs_f64() * 1e3, tl.prof[3] / 1e6, tl.prof[4] / 1e6, tl.prof[5] / 1e6);
-            eprintln!("       attr: cksort {:.0} credit {:.0} tmpsort {:.0} flush {:.0} Mcycles; persons_with_clicks {:.0} flushes {:.0}", tl.prof[6] / 1e6, tl.prof[7] / 1e6, tl.prof[8] / 1e6, tl.prof[9] / 1e6, tl.prof[10], tl.prof[11]);
+            eprintln!("    t{tid}: count {:.0} place {:.0} persons {:.0} write {:.0} ms | slowest bucket {:.1} ms ({} events, {} clicks) | biggest person {:.1} ms ({} events, {} clicks)", tl.prof[0] * 1e3, tl.prof[1] * 1e3, tl.prof[2] * 1e3, t_w.elapsed().as_secs_f64() * 1e3, tl.prof[3] * 1e3, tl.prof[4], tl.prof[5], tl.prof[6] * 1e3, tl.prof[7], tl.prof[8]);
         }
         unsafe { *cells[tid].0.get() = Some(tl.cells) };
     });
     lap("persons + user_daily");
 
+    // The last table is small: write it while the other threads give the big
+    // buffers back, which is quicker than leaving it all to process exit.
     let cells: Vec<Cells> = cells.into_iter().map(|c| c.0.into_inner().unwrap()).collect();
-    write_campaign_daily(&camp_dir.join("part-000.parquet"), &cells, &ctx);
+    par(threads, |tid| {
+        if tid == 0 {
+            write_campaign_daily(&camp_dir.join("part-000.parquet"), &cells, &ctx);
+        }
+        outs_ref[tid].arena.release();
+        ctx.ids.release_part(tid, threads);
+    });
     lap("campaign_daily");
     true
 }
@@ -411,8 +432,12 @@ fn build_ctx(data: &Path, event_bytes: usize, click_bytes: usize, link_bytes: us
     let qshift = (RBITS + rpb.trailing_zeros() as usize) as u32;
     let nq = nregions.div_ceil(rpb);
     assert!(nq <= 1 << Q_BITS);
-    // Dedup buckets of about 32k lines each.
-    let pbits = ((event_lines / 32_768).max(1).next_power_of_two().trailing_zeros()).clamp(4, 11);
+    // Dedup buckets of 50k to 100k lines each: few enough streams to write
+    // them cheaply, and a per-bucket table of about 1 MB.
+    let pbits = match env_usize("SS_PB", 0) {
+        0 => ((event_lines / 131_072).max(1).next_power_of_two().trailing_zeros()).clamp(4, 11),
+        pb => pb as u32,
+    };
 
     Ctx {
         ws,
@@ -489,11 +514,6 @@ fn load_aux(data: &Path) -> Aux {
     Aux { products, unknown, cat_names, campaigns, camp_names, camp_channel }
 }
 
-fn exp() -> u32 {
-    static EXP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *EXP.get_or_init(|| std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
-}
-
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -559,22 +579,30 @@ fn parse_links(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Threa
 // ====================================================================== parse
 
 /// A valid event waiting for its ID-table lookup (the slot is prefetched).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 struct PendE {
-    user: Key,
+    ulo: u64,
+    uhi: u64,
     ev: u64,
     h: u64,
     /// The extra hash bits in place, and the ingest time in the low 32 bits.
     x: u64,
+    /// The first table slot to try for the user.
+    first: u32,
+    _pad: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 struct PendC {
-    user: Key,
-    uh: u64,
     cid: Key,
+    ulo: u64,
+    uhi: u64,
     ts: u32,
     camp: u32,
+    first: u32,
+    _pad: u32,
 }
 
 /// Ingest time in seconds as a biased u32 (only ever compared between copies
@@ -597,62 +625,126 @@ fn ingest32(ctx: &Ctx, ing: Option<i64>) -> u32 {
     }
 }
 
-/// Record one parsed event line: `ev` is `Some` when the copy is valid, and
-/// then `prod` is its product ID if it is a purchase (0 otherwise); the
-/// category is filled in when the batch is flushed.
-#[cfg_attr(feature = "prof", inline(never))]
-#[cfg_attr(not(feature = "prof"), inline(always))]
-fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev: Option<u64>, prod: Key, ing: Option<i64>) {
-    let (h, hb) = hash_pair(ek);
-    let h2 = (hb >> 20) & H2_MASK;
-    let ingest = ingest32(ctx, ing);
-    match ev {
-        Some(ev) => {
-            ctx.ids.prefetch(hash64(user));
-            if prod != 0 {
-                ctx.aux.products.prefetch(prod);
-                out.pend_p.push((out.pend_e.len() as u32, prod));
-            }
-            out.pend_e.push(PendE { user, ev, h, x: (h2 << H2_SHIFT) | ingest as u64 });
-            if out.pend_e.len() == PEND {
-                flush_events(ctx, out, tid);
-            }
-        }
-        None => {
-            let p = (h >> (64 - ctx.pbits)) as usize;
-            out.slim.push(p, Slim { h, x: TAG | (h2 << H2_SHIFT) | ingest as u64 }, &mut out.arena);
-        }
+/// `ingest32` for a time in whole seconds (`fast::BAD` when unparsable) and
+/// the time origin in seconds.
+#[inline(always)]
+fn ingest32_s(origin_s: i64, secs: i64) -> u32 {
+    const TOP: u32 = u32::MAX - 1;
+    let r = secs.wrapping_sub(origin_s).wrapping_add(1i64 << 31);
+    if (secs != fast::BAD) & ((r as u64) < TOP as u64) {
+        r as u32
+    } else if secs == fast::BAD || r >= 0 {
+        TOP
+    } else {
+        0
     }
 }
 
+/// Record one parsed event line: its ID, its ingest time, and when the copy
+/// is valid its user, time and price (`ev`) and, for a purchase, its product
+/// (0 otherwise; the category is filled in when the batch is flushed).
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
-fn flush_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
+fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, ing32: u32, valid: bool, user: Key, ev: u64, prod: Key) {
+    let (h, hb) = hash_pair(ek);
+    let x = (((hb >> 20) & H2_MASK) << H2_SHIFT) | ing32 as u64;
+    if valid {
+        let first = ctx.ids.first(hash64(user));
+        ctx.ids.prefetch_at(first);
+        let n = out.npe;
+        if prod != 0 {
+            ctx.aux.products.prefetch(prod);
+            out.pend_p.push((n as u32, prod));
+        }
+        unsafe {
+            *out.pend_e.get_unchecked_mut(n) = PendE { ulo: user as u64, uhi: (user >> 64) as u64, ev, h, x, first, _pad: 0 };
+        }
+        out.npe = n + 1;
+        if n + 1 == PEND {
+            flush_events(ctx, out, tid, false);
+        }
+    } else {
+        let p = (h >> (64 - ctx.pbits)) as usize;
+        out.slim.push16(p, h, TAG | x, &mut out.arena_slim);
+    }
+}
+
+/// Look up the pending events' users and append the events to their lists.
+///
+/// First every lookup, then every append: an append's address depends on the
+/// person found, and must not wait on a table line that is still on its way.
+/// A user who is not in the first cache line tried (a few in a hundred) has
+/// the next line fetched and stays pending until the following call, unless
+/// this is the `last` one.
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+fn flush_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize, last: bool) {
     for &(i, prod) in &out.pend_p {
         let cat = ctx.aux.products.get(prod).unwrap_or(ctx.aux.unknown);
         out.pend_e[i as usize].ev |= (cat as u64) << 24;
     }
     out.pend_p.clear();
-    for i in 0..out.pend_e.len() {
+    let n = out.npe;
+    let here = (tid as u64) << (IDX_BITS + Q_BITS);
+    let mut later = [0u8; PEND];
+    let mut nl = 0;
+    // The first `held` were left by the call before; their lines are here now.
+    for i in 0..out.held {
+        let pe = unsafe { out.pend_e.get_unchecked_mut(i) };
+        pe.first = ctx.ids.root(ctx.ids.get_or_insert_at(pe.ulo, pe.uhi, pe.first));
+    }
+    for i in out.held..n {
+        let pe = unsafe { out.pend_e.get_unchecked_mut(i) };
+        match ctx.ids.peek(pe.ulo, pe.uhi, pe.first) {
+            Some(slot) => pe.first = ctx.ids.root(slot),
+            None => {
+                later[nl] = i as u8;
+                nl += 1;
+            }
+        }
+    }
+    let mut m = n;
+    if last || nl > PEND / 4 {
+        for &i in &later[..nl] {
+            let pe = unsafe { out.pend_e.get_unchecked_mut(i as usize) };
+            pe.first = ctx.ids.root(ctx.ids.get_or_insert_at(pe.ulo, pe.uhi, pe.first));
+        }
+        nl = 0;
+    } else {
+        // Move the ones to hold to the end (from the last one down, so each
+        // swap brings a looked-up event forward).
+        for k in (0..nl).rev() {
+            m -= 1;
+            out.pend_e.swap(later[k] as usize, m);
+        }
+    }
+    for i in 0..m {
         let pe = unsafe { *out.pend_e.get_unchecked(i) };
-        let person = ctx.ids.root(ctx.ids.get_or_insert(pe.user, hash64(pe.user)));
+        let person = pe.first;
         let q = (person >> ctx.qshift) as usize;
-        let idx = out.ev.push(q, Ev { ev: pe.ev, person, ingest: pe.x as u32 }, &mut out.arena);
+        // An `Ev`: the event word, then the person and the ingest time.
+        let idx = out.ev.push16(q, pe.ev, person as u64 | (pe.x << 32), &mut out.arena);
         assert!(idx < 1 << IDX_BITS, "bucket too large");
         let p = (pe.h >> (64 - ctx.pbits)) as usize;
-        let x = (pe.x & (H2_MASK << H2_SHIFT)) | ((tid as u64) << (IDX_BITS + Q_BITS)) | ((q as u64) << IDX_BITS) | idx as u64;
-        out.slim.push(p, Slim { h: pe.h, x }, &mut out.arena);
+        let x = (pe.x & (H2_MASK << H2_SHIFT)) | here | ((q as u64) << IDX_BITS) | idx as u64;
+        out.slim.push16(p, pe.h, x, &mut out.arena_slim);
     }
-    out.pend_e.clear();
+    out.pend_e.copy_within(m..n, 0);
+    out.held = nl;
+    out.npe = nl;
 }
 
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
 fn emit_click(ctx: &Ctx, out: &mut ThreadOut, user: Key, cid: Key, ts: u32, camp: u32) {
-    let uh = hash64(user);
-    ctx.ids.prefetch(uh);
-    out.pend_c.push(PendC { user, uh, cid, ts, camp });
-    if out.pend_c.len() == PEND {
+    let first = ctx.ids.first(hash64(user));
+    ctx.ids.prefetch_at(first);
+    let n = out.npc;
+    unsafe {
+        *out.pend_c.get_unchecked_mut(n) = PendC { cid, ulo: user as u64, uhi: (user >> 64) as u64, ts, camp, first, _pad: 0 };
+    }
+    out.npc = n + 1;
+    if n + 1 == PEND {
         flush_clicks(ctx, out);
     }
 }
@@ -660,156 +752,196 @@ fn emit_click(ctx: &Ctx, out: &mut ThreadOut, user: Key, cid: Key, ts: u32, camp
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
 fn flush_clicks(ctx: &Ctx, out: &mut ThreadOut) {
-    for i in 0..out.pend_c.len() {
-        let c = out.pend_c[i];
-        let person = ctx.ids.root(ctx.ids.get_or_insert(c.user, c.uh));
-        let q = (person >> ctx.qshift) as usize;
-        out.ck.push(q, Ck { cid: c.cid, person, ts: c.ts, camp: c.camp, _pad: 0 }, &mut out.arena);
+    let mut later = [0u8; PEND];
+    let mut nl = 0;
+    for i in 0..out.npc {
+        let c = unsafe { out.pend_c.get_unchecked_mut(i) };
+        match ctx.ids.peek(c.ulo, c.uhi, c.first) {
+            Some(slot) => c.first = ctx.ids.root(slot),
+            None => {
+                later[nl] = i as u8;
+                nl += 1;
+            }
+        }
     }
-    out.pend_c.clear();
+    for &i in &later[..nl] {
+        let c = unsafe { out.pend_c.get_unchecked_mut(i as usize) };
+        c.first = ctx.ids.root(ctx.ids.get_or_insert_at(c.ulo, c.uhi, c.first));
+    }
+    for i in 0..out.npc {
+        let c = unsafe { *out.pend_c.get_unchecked(i) };
+        let person = c.first;
+        let q = (person >> ctx.qshift) as usize;
+        // A `Ck`: the click ID, then the person and time, then the campaign.
+        out.ck.push32(q, [c.cid as u64, (c.cid >> 64) as u64, person as u64 | ((c.ts as u64) << 32), c.camp as u64], &mut out.arena);
+    }
+    out.npc = 0;
 }
 
-fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
-    let base = file.as_ptr();
-    let exp = exp();
-    if exp == 3 {
+/// One event line by the plain rules: the reference for `events_fast`, and
+/// what handles every line that one leaves alone.
+fn event_line(line: &[u8], ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
+    let Some([eid, user, ts, ingest, typ, prod, price]) = split::<7>(line) else { return };
+    if eid.is_empty() {
         return;
     }
-    if exp == 4 || exp == 5 {
-        let mut sum = 0u64;
-        let mut i = start;
-        while i < end {
-            sum += file[i] as u64;
-            i += if exp == 4 { 64 } else { 4096 };
-        }
-        std::hint::black_box(sum);
-        return;
-    }
-    let rest = if slow_only() {
-        start
-    } else {
-        unsafe {
-            fast::scan(file, start, end, |ls, commas, nc, le, nq| {
-                if nc != 6 || exp == 1 {
-                    return;
-                }
-                let mut s = [ls, commas[0] + 1, commas[1] + 1, commas[2] + 1, commas[3] + 1, commas[4] + 1, commas[5] + 1];
-                let mut e = [commas[0], commas[1], commas[2], commas[3], commas[4], commas[5], le];
-                let mut k = 0;
-                for i in 0..7 {
-                    k += fast::strip(base, &mut s[i], &mut e[i]);
-                }
-                if nq != 2 * k || e[0] == s[0] {
-                    return;
-                }
-                let ek = fast::pack_at(base, s[0], e[0]);
-                let ing = out.dates.f1(base, s[3], e[3]);
-                let mut ev = None;
-                let mut prod = 0;
-                if e[1] > s[1] && e[5] > s[5] {
-                    if let Some(t) = out.dates.ts(base, s[2], e[2]) {
-                        if t >= ctx.ws && t < ctx.we && ing.is_some_and(|i| i - t <= DAY) {
-                            let off = ((t - ctx.origin) as u64) << 33;
-                            let tn = e[4] - s[4];
-                            let tp = base.add(s[4]);
-                            if tn == 4 {
-                                let w = std::ptr::read_unaligned(tp as *const u32);
-                                if w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart") {
-                                    ev = Some(off);
-                                }
-                            } else if tn == 8
-                                && std::ptr::read_unaligned(tp as *const u64) == u64::from_le_bytes(*b"purchase")
-                            {
-                                let price = std::slice::from_raw_parts(base.add(s[6]), e[6] - s[6]);
-                                if let Some(p) = parse_price(price) {
-                                    prod = fast::pack_at(base, s[5], e[5]);
-                                    ev = Some(off | p as u64);
-                                }
-                            }
-                        }
-                    }
-                }
-                let user = if ev.is_some() { fast::pack_at(base, s[1], e[1]) } else { 0 };
-                if exp == 2 {
-                    std::hint::black_box((ek, user, ev, ing));
-                    return;
-                }
-                emit_event(ctx, out, tid, ek, user, ev, prod, ing);
-            })
-        }
-    };
-    // The scalar reference path: the tail of a file, and everything under SS_SLOW.
-    for line in lines(&file[rest..end]) {
-        let Some([eid, user, ts, ingest, typ, prod, price]) = split::<7>(line) else { continue };
-        if eid.is_empty() {
-            continue;
-        }
-        let ek = pack(eid);
-        let ing = parse_f1(ingest);
-        let mut ev = None;
-        let mut prod_key = 0;
-        if !user.is_empty() && !prod.is_empty() {
-            if let Some(t) = parse_ts(ts) {
-                // In the window, and not ingested more than 24 hours late.
-                if t >= ctx.ws && t < ctx.we && ing.is_some_and(|i| i - t <= DAY) {
-                    let off = ((t - ctx.origin) as u64) << 33;
-                    if typ == b"view" || typ == b"cart" {
-                        ev = Some(off);
-                    } else if typ == b"purchase" {
-                        if let Some(p) = parse_price(price) {
-                            prod_key = pack(prod);
-                            ev = Some(off | p as u64);
-                        }
+    let ek = pack(eid);
+    let ing = parse_f1(ingest);
+    let mut ev = None;
+    let mut prod_key = 0;
+    if !user.is_empty() && !prod.is_empty() {
+        if let Some(t) = parse_ts(ts) {
+            // In the window, and not ingested more than 24 hours late.
+            if t >= ctx.ws && t < ctx.we && ing.is_some_and(|i| i - t <= DAY) {
+                let off = ((t - ctx.origin) as u64) << 33;
+                if typ == b"view" || typ == b"cart" {
+                    ev = Some(off);
+                } else if typ == b"purchase" {
+                    if let Some(p) = parse_price(price) {
+                        prod_key = pack(prod);
+                        ev = Some(off | p as u64);
                     }
                 }
             }
         }
-        let user = if ev.is_some() { pack(user) } else { 0 };
-        emit_event(ctx, out, tid, ek, user, ev, prod_key, ing);
+    }
+    let user = if ev.is_some() { pack(user) } else { 0 };
+    emit_event(ctx, out, tid, ek, ingest32(ctx, ing), ev.is_some(), user, ev.unwrap_or(0), prod_key);
+}
+
+/// The event lines of `file[start..end]` that end before `end`, as far as
+/// they can be handled 128 bytes at a time; returns where the rest starts.
+#[inline(never)]
+unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) -> usize {
+    const VIEW: u32 = u32::from_le_bytes(*b"view");
+    const CART: u32 = u32::from_le_bytes(*b"cart");
+    const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+    let base = file.as_ptr();
+    let len = file.len();
+    let span = (ctx.we - ctx.ws) as u64;
+    let origin_s = ctx.origin / 1000;
+    let mut s = start;
+    while s < end {
+        if s + 128 > len {
+            break;
+        }
+        let c = fast::cut::<3, 3, 8>(base, s);
+        if !c.shape {
+            // An unusual line: the plain code decides.
+            let Some(i) = memchr(b'\n', &file[s..end]) else { break };
+            event_line(&file[s..s + i], ctx, out, tid);
+            s += i + 1;
+            continue;
+        }
+        let e = c.p[7];
+        if e >= end {
+            break;
+        }
+        s = e + 1;
+        let (s0, n0) = c.field(0);
+        if !c.quotes | (n0 == 0) {
+            continue;
+        }
+        let (s1, n1) = c.field(1);
+        let (s2, n2) = c.field(2);
+        let (s3, n3) = c.field(3);
+        let (s4, n4) = c.field(4);
+        let (s5, n5) = c.field(5);
+        let ek = fast::pack_at(base, s0, s0 + n0);
+        let ing = out.dates.f1(base.add(s3), n3);
+        let t = out.dates.ts(base.add(s2), n2);
+        // A user, a product, a time in the window, and not ingested more than 24 hours late.
+        let fresh = (ing != fast::BAD) & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY);
+        let ok = (n1 != 0) & (n5 != 0) & ((t.wrapping_sub(ctx.ws) as u64) < span) & fresh;
+        let tp = base.add(s4);
+        let w = std::ptr::read_unaligned(tp as *const u32);
+        let browse = ok & (n4 == 4) & ((w == VIEW) | (w == CART));
+        let (mut valid, mut ev, mut prod) = (false, 0u64, 0);
+        if opaque(browse as u64) != 0 {
+            valid = true;
+            ev = ((t - ctx.origin) as u64) << 33;
+        } else if ok && n4 == 8 && std::ptr::read_unaligned(tp as *const u64) == PURCHASE {
+            let (s6, n6) = c.field(6);
+            if let Some(p) = parse_price(std::slice::from_raw_parts(base.add(s6), n6)) {
+                prod = fast::pack_at(base, s5, s5 + n5);
+                valid = true;
+                ev = (((t - ctx.origin) as u64) << 33) | p as u64;
+            }
+        }
+        let user = fast::pack_at(base, s1, s1 + n1);
+        emit_event(ctx, out, tid, ek, ingest32_s(origin_s, ing), valid, user, ev, prod);
+    }
+    s
+}
+
+fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
+    let rest = if slow_only() { start } else { unsafe { events_fast(file, start, end, ctx, out, tid) } };
+    for line in lines(&file[rest..end]) {
+        event_line(line, ctx, out, tid);
     }
 }
 
-fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut) {
+/// One click line by the plain rules.
+fn click_line(line: &[u8], ctx: &Ctx, out: &mut ThreadOut) {
+    let Some([cid, user, camp, ts]) = split::<4>(line) else { return };
+    if cid.is_empty() || user.is_empty() || camp.is_empty() {
+        return;
+    }
+    let Some(t) = parse_ts(ts) else { return };
+    if t < ctx.cws || t >= ctx.we {
+        return;
+    }
+    let Some(camp) = ctx.aux.campaigns.get(pack(camp)) else { return };
+    emit_click(ctx, out, pack(user), pack(cid), (t - ctx.origin) as u32, camp);
+}
+
+/// `events_fast` for click lines.
+#[inline(never)]
+unsafe fn clicks_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut) -> usize {
     let base = file.as_ptr();
-    let rest = if slow_only() {
-        start
-    } else {
-        unsafe {
-            fast::scan(file, start, end, |ls, commas, nc, le, nq| {
-                if nc != 3 {
-                    return;
-                }
-                let mut s = [ls, commas[0] + 1, commas[1] + 1, commas[2] + 1];
-                let mut e = [commas[0], commas[1], commas[2], le];
-                let mut k = 0;
-                for i in 0..4 {
-                    k += fast::strip(base, &mut s[i], &mut e[i]);
-                }
-                if nq != 2 * k || e[0] == s[0] || e[1] == s[1] || e[2] == s[2] {
-                    return;
-                }
-                let Some(t) = out.dates.ts(base, s[3], e[3]) else { return };
-                if t < ctx.cws || t >= ctx.we {
-                    return;
-                }
-                let Some(camp) = ctx.aux.campaigns.get(fast::pack_at(base, s[2], e[2])) else { return };
-                let user = fast::pack_at(base, s[1], e[1]);
-                let cid = fast::pack_at(base, s[0], e[0]);
-                emit_click(ctx, out, user, cid, (t - ctx.origin) as u32, camp);
-            })
+    let len = file.len();
+    let span = (ctx.we - ctx.cws) as u64;
+    let mut s = start;
+    while s < end {
+        if s + 128 > len {
+            break;
         }
-    };
+        let c = fast::cut::<2, 1, 5>(base, s);
+        if !c.shape {
+            let Some(i) = memchr(b'\n', &file[s..end]) else { break };
+            click_line(&file[s..s + i], ctx, out);
+            s += i + 1;
+            continue;
+        }
+        let e = c.p[4];
+        if e >= end {
+            break;
+        }
+        s = e + 1;
+        let (s0, n0) = c.field(0);
+        let (s1, n1) = c.field(1);
+        let (s2, n2) = c.field(2);
+        let (s3, n3) = c.field(3);
+        if !c.quotes | (n0 == 0) | (n1 == 0) | (n2 == 0) {
+            continue;
+        }
+        let t = out.dates.ts(base.add(s3), n3);
+        // In the click window (a bad time is far outside it).
+        if (t.wrapping_sub(ctx.cws) as u64) >= span {
+            continue;
+        }
+        let Some(camp) = ctx.aux.campaigns.get(fast::pack_at(base, s2, s2 + n2)) else { continue };
+        let user = fast::pack_at(base, s1, s1 + n1);
+        let cid = fast::pack_at(base, s0, s0 + n0);
+        emit_click(ctx, out, user, cid, (t - ctx.origin) as u32, camp);
+    }
+    s
+}
+
+fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut) {
+    let rest = if slow_only() { start } else { unsafe { clicks_fast(file, start, end, ctx, out) } };
     for line in lines(&file[rest..end]) {
-        let Some([cid, user, camp, ts]) = split::<4>(line) else { continue };
-        if cid.is_empty() || user.is_empty() || camp.is_empty() {
-            continue;
-        }
-        let Some(t) = parse_ts(ts) else { continue };
-        if t < ctx.cws || t >= ctx.we {
-            continue;
-        }
-        let Some(camp) = ctx.aux.campaigns.get(pack(camp)) else { continue };
-        emit_click(ctx, out, pack(user), pack(cid), (t - ctx.origin) as u32, camp);
+        click_line(line, ctx, out);
     }
 }
 
@@ -843,6 +975,7 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
     // A repeat is settled a little later, in arrival order, so the events
     // it needs (far apart in memory) can be fetched meanwhile.
     const LATER: usize = 16;
+    const AHEAD: usize = 12;
     let mut later = [(0usize, Slim { h: 0, x: 0 }, 0u32); LATER];
     let mut nl = 0;
     let settle = |later: &[(usize, Slim, u32)], table: &mut Vec<u64>| {
@@ -868,6 +1001,11 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
         let mut idx = (t as u32) << IDX_BITS;
         for (ptr, len) in o.slim.pieces(p) {
             for k in 0..len {
+                // The table may not fit in cache: ask for a later note's slot now.
+                if k + AHEAD < len {
+                    let h = unsafe { (*ptr.add(k + AHEAD)).h };
+                    unsafe { core::arch::x86_64::_mm_prefetch(table.as_ptr().add(h as usize & mask) as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+                }
                 let s = unsafe { *ptr.add(k) };
                 let tag = (s.h >> 24) as u32;
                 let mut i = (s.h as usize) & mask;
@@ -909,6 +1047,19 @@ struct Sess {
     day: u32,
     purch: bool,
     rev: u64,
+    events: u32,
+}
+
+/// One half-hour of one person's events (see `person_grid`).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Bin {
+    /// Which person last used this bin.
+    stamp: u32,
+    /// Events in it; later, the index of the session it belongs to.
+    cnt: u32,
+    min: u32,
+    max: u32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -955,12 +1106,31 @@ struct Tl {
     /// Per campaign: the last session (by serial number) it was counted for.
     stamp: Vec<u32>,
     serial: u32,
+    /// `person_grid`: half-hour bins, the bitmap of bins in use, purchases
+    /// (bin, category, price), revenue per (day, category) and the best
+    /// category per day.
+    grid: Vec<Bin>,
+    bits: Vec<u64>,
+    words: (usize, usize),
+    pserial: u32,
+    purchases: Vec<u64>,
+    daycat: Vec<u64>,
+    touched_dc: Vec<u32>,
+    best: Vec<u16>,
+    best_sum: Vec<u64>,
+    ncat: usize,
+    /// Persons with at least this many events use the grid.
+    grid_min: usize,
     prof: [f64; 12],
 }
 
 impl Tl {
     fn new(ctx: &Ctx, ncell: usize) -> Tl {
         let bslots = 1usize << ctx.qshift;
+        // Half-hour bins of event time, counted from the time origin.
+        let bin_lo = ((ctx.ws - ctx.origin).max(0) / GAP as i64) as usize;
+        let bin_hi = ((ctx.we - ctx.origin).max(0) / GAP as i64) as usize;
+        let nbins = bin_hi + 1;
         Tl {
             cnt_e: vec![0; bslots + 1],
             cnt_c: vec![0; bslots + 1],
@@ -983,6 +1153,17 @@ impl Tl {
             dayfirst: Vec::new(),
             stamp: vec![0; ctx.aux.camp_names.len() + 1],
             serial: 0,
+            grid: vec![Bin::default(); nbins + 1],
+            bits: vec![0; nbins / 64 + 2],
+            words: (bin_lo / 64, bin_hi / 64 + 1),
+            pserial: 0,
+            purchases: Vec::new(),
+            daycat: vec![0; ctx.nd * ctx.aux.cat_names.len()],
+            touched_dc: Vec::new(),
+            best: vec![NOCAT; ctx.nd],
+            best_sum: vec![0; ctx.nd],
+            ncat: ctx.aux.cat_names.len(),
+            grid_min: if nbins <= 1 << 14 && std::env::var_os("SS_SORT").is_none() { env_usize("SS_GRID_MIN", 0) } else { usize::MAX },
             prof: [0.0; 12],
         }
     }
@@ -1068,7 +1249,23 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
         let (ee, ce) = (tl.cnt_e[i] as usize, tl.cnt_c[i] as usize);
         if ee > pe {
             // Slots are visited in table order, so these reads are sequential.
-            person(ctx.ids.key(base | i as u32), &mut evs[pe..ee], &mut cks[pc..ce], tl);
+            let big = ee - pe > 20_000;
+            let t_p = if big { Some(Instant::now()) } else { None };
+            let who = ctx.ids.key(base | i as u32);
+            if ee - pe >= tl.grid_min {
+                person_grid(who, &evs[pe..ee], tl);
+            } else {
+                person_sorted(who, &mut evs[pe..ee], tl);
+            }
+            attribute(&mut cks[pc..ce], tl);
+            if let Some(t_p) = t_p {
+                let took = t_p.elapsed().as_secs_f64();
+                if took > tl.prof[6] {
+                    tl.prof[6] = took;
+                    tl.prof[7] = (ee - pe) as f64;
+                    tl.prof[8] = (ce - pc) as f64;
+                }
+            }
         }
         pe = ee;
         pc = ce;
@@ -1076,13 +1273,124 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
     tl.evs = evs;
     tl.cks = cks;
     tl.prof[2] += t_c.elapsed().as_secs_f64();
+    let whole = t_a.elapsed().as_secs_f64();
+    if whole > tl.prof[3] {
+        tl.prof[3] = whole;
+        tl.prof[4] = ne as f64;
+        tl.prof[5] = ncl as f64;
+    }
 }
 
-/// One person: sessions, their user_daily rows, attribution and assists.
-fn person(who: Key, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
+/// One person's sessions and user_daily rows without sorting their events.
+///
+/// Events go into half-hour bins. A bin is exactly as long as the session
+/// gap, so the events of one bin always share a session; two neighbouring
+/// bins share one when the last event of the first and the first event of the
+/// second are at most the gap apart; and an empty bin between two events
+/// always separates their sessions. So each bin needs only its count and its
+/// earliest and latest event.
+fn person_grid(who: Key, evs: &[u64], tl: &mut Tl) {
+    let serial = tl.pserial + 1;
+    tl.pserial = serial;
+    let grid = tl.grid.as_mut_ptr();
+    let bits = tl.bits.as_mut_ptr();
+    tl.purchases.clear();
+    for &e in evs {
+        let ts = (e >> 33) as u32;
+        let b = (ts / GAP) as usize;
+        unsafe {
+            let c = &mut *grid.add(b);
+            let fresh = c.stamp != serial;
+            c.stamp = serial;
+            let mn = std::hint::select_unpredictable(fresh, ts, c.min);
+            let mx = std::hint::select_unpredictable(fresh, ts, c.max);
+            let cn = std::hint::select_unpredictable(fresh, 0, c.cnt);
+            c.min = mn.min(ts);
+            c.max = mx.max(ts);
+            c.cnt = cn + 1;
+            *bits.add(b >> 6) |= 1u64 << (b & 63);
+        }
+        if e & 0xFF_FFFF != 0 {
+            tl.purchases.push(((b as u64) << 40) | (e & 0x1_FFFF_FFFF));
+        }
+    }
+
+    // Sessions, in time order.
+    tl.sess.clear();
+    let (mut prev_b, mut prev_max) = (usize::MAX - 1, 0u32);
+    for w in tl.words.0..tl.words.1 {
+        let mut m = unsafe { *bits.add(w) };
+        if m == 0 {
+            continue;
+        }
+        unsafe { *bits.add(w) = 0 };
+        while m != 0 {
+            let b = w * 64 + m.trailing_zeros() as usize;
+            m &= m - 1;
+            let c = unsafe { &mut *grid.add(b) };
+            if b == prev_b + 1 && c.min - prev_max <= GAP {
+                let last = tl.sess.len() - 1;
+                unsafe { tl.sess.get_unchecked_mut(last).events += c.cnt };
+            } else {
+                tl.sess.push(Sess { start: c.min, day: c.min / DAY_MS - 7, purch: false, rev: 0, events: c.cnt });
+            }
+            c.cnt = (tl.sess.len() - 1) as u32;
+            prev_b = b;
+            prev_max = c.max;
+        }
+    }
+
+    // Purchases: revenue per session and per (day, category).
+    let ncat = tl.ncat;
+    for &p in &tl.purchases {
+        let b = (p >> 40) as usize;
+        let cat = ((p >> 24) & 0x1FF) as usize;
+        let price = p & 0xFF_FFFF;
+        let s = &mut tl.sess[unsafe { (*grid.add(b)).cnt } as usize];
+        s.rev += price;
+        s.purch = true;
+        let k = s.day as usize * ncat + cat;
+        if tl.daycat[k] == 0 {
+            tl.touched_dc.push(k as u32);
+        }
+        tl.daycat[k] += price;
+    }
+    for &k in &tl.touched_dc {
+        let (d, c) = (k as usize / ncat, (k as usize % ncat) as u16);
+        let s = tl.daycat[k as usize];
+        tl.daycat[k as usize] = 0;
+        // Categories are ranked byte-wise, so the smaller index wins a tie.
+        if s > tl.best_sum[d] || (s == tl.best_sum[d] && c < tl.best[d]) {
+            tl.best[d] = c;
+            tl.best_sum[d] = s;
+        }
+    }
+    tl.touched_dc.clear();
+
+    // One row per day with a session.
+    let n = tl.sess.len();
+    let mut i = 0;
+    while i < n {
+        let day = tl.sess[i].day;
+        let (mut d_sessions, mut d_events, mut d_rev) = (0u32, 0u32, 0u64);
+        while i < n && tl.sess[i].day == day {
+            d_sessions += 1;
+            d_events += tl.sess[i].events;
+            d_rev += tl.sess[i].rev;
+            i += 1;
+        }
+        let best = tl.best[day as usize];
+        tl.best[day as usize] = NOCAT;
+        tl.best_sum[day as usize] = 0;
+        emit_row(who, day, d_sessions, d_events, d_rev, best, tl);
+    }
+}
+
+/// One person's sessions and user_daily rows by sorting their events: the
+/// plain reading of the rules, used for odd windows and to check `person_grid`.
+fn person_sorted(who: Key, evs: &mut [u64], tl: &mut Tl) {
     evs.sort_unstable();
     let n = evs.len();
-    let nd = tl.nd;
 
     tl.sess.clear();
     let mut cur_day = u32::MAX;
@@ -1122,14 +1430,17 @@ fn person(who: Key, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
             }
             i += 1;
         }
-        tl.sess.push(Sess { start, day, purch, rev });
+        tl.sess.push(Sess { start, day, purch, rev, events: nev });
         d_sessions += 1;
         d_events += nev;
         d_rev += rev;
     }
     flush_row(who, cur_day, d_sessions, d_events, d_rev, tl);
+}
 
-    // ---- attribution
+/// Credit and assists for the sessions in `tl.sess` (in time order).
+fn attribute(cks: &mut [Ckl], tl: &mut Tl) {
+    let nd = tl.nd;
     let organic = tl.organic;
     if cks.is_empty() {
         for s in &tl.sess {
@@ -1254,6 +1565,11 @@ fn flush_row(who: Key, day: u32, sessions: u32, events: u32, rev: u64, tl: &mut 
         }
     }
     tl.touched.clear();
+    emit_row(who, day, sessions, events, rev, best, tl);
+}
+
+#[inline(always)]
+fn emit_row(who: Key, day: u32, sessions: u32, events: u32, rev: u64, best: u16, tl: &mut Tl) {
     let rows = &mut tl.rows;
     rows.n += 1;
     if is_long(who) {

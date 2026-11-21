@@ -34,7 +34,7 @@ pub fn list_dir(dir: &Path) -> Vec<Src> {
 
 /// Bytes kept readable before the data and after it.
 const FRONT: usize = 64;
-const BACK: usize = 128;
+const BACK: usize = 192;
 
 pub struct Reader {
     pub buf: Vec<u8>,
@@ -47,7 +47,7 @@ impl Reader {
 
     /// Loads the data lines of `src` that start in file offsets `a..b` (the
     /// header line never counts). They span `buf[start..end]`; the byte before
-    /// `start` is a newline, and `buf[..end + 64]` is readable.
+    /// `start` is a newline, and `buf[..end + 128]` is readable.
     pub fn load(&mut self, src: &Src, a: usize, b: usize) -> (usize, usize) {
         let r0 = a.saturating_sub(1);
         let mut extra = 4096;

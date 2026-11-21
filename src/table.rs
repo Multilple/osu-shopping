@@ -16,7 +16,9 @@ pub fn map_anon(bytes: usize) -> *mut u8 {
             0,
         );
         assert!(p != sys::MAP_FAILED, "mmap of {bytes} bytes failed");
-        sys::madvise(p, bytes, sys::MADV_HUGEPAGE);
+        if std::env::var_os("SS_NOHUGE").is_none() {
+            sys::madvise(p, bytes, sys::MADV_HUGEPAGE);
+        }
         p as *mut u8
     }
 }
@@ -59,6 +61,16 @@ impl IdTable {
         }
     }
 
+    /// Give back the pages of part `i` of `n` of the table.
+    pub fn release_part(&self, i: usize, n: usize) {
+        let bytes = self.nregions * RSIZE * std::mem::size_of::<Slot>();
+        let page = 2 << 20;
+        let (a, b) = (bytes * i / n / page * page, if i + 1 == n { bytes } else { bytes * (i + 1) / n / page * page });
+        if b > a {
+            release(unsafe { (self.slots as *mut u8).add(a) }, b - a);
+        }
+    }
+
     /// IDs in the table (diagnostics; call between stages only).
     pub fn len(&self) -> usize {
         (0..self.nregions * RSIZE).filter(|&i| self.slot(i).hi.load(Relaxed) != 0).count()
@@ -69,26 +81,79 @@ impl IdTable {
         unsafe { &*self.slots.add(i) }
     }
 
+    /// Where a probe starts: always the first of the two slots of a cache
+    /// line, so the first two slots tried cost one cache miss.
     #[inline(always)]
     fn home(&self, h: u64) -> (usize, usize) {
         let region = (((h >> 32) * self.nregions as u64) >> 32) as usize;
-        (region << RBITS, (h as usize) & RMASK)
+        (region << RBITS, (h as usize) & RMASK & !1)
     }
 
     #[inline(always)]
     pub fn prefetch(&self, h: u64) {
         let (base, pos) = self.home(h);
+        self.prefetch_at((base | pos) as u32);
+    }
+
+    /// The first slot a probe for hash `h` tries.
+    #[inline(always)]
+    pub fn first(&self, h: u64) -> u32 {
+        let (base, pos) = self.home(h);
+        (base | pos) as u32
+    }
+
+    #[inline(always)]
+    pub fn prefetch_at(&self, first: u32) {
         unsafe {
-            core::arch::x86_64::_mm_prefetch(self.slots.add(base | pos) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+            core::arch::x86_64::_mm_prefetch(self.slots.add(first as usize) as *const i8, core::arch::x86_64::_MM_HINT_T0);
         }
     }
 
     /// The slot of `k` (whose hash is `h`), inserting it as its own root if new.
+    #[inline(always)]
+    pub fn get_or_insert(&self, k: Key, h: u64) -> u32 {
+        self.get_or_insert_at(k as u64, (k >> 64) as u64, self.first(h))
+    }
+
+    /// The key's slot if it is one of the two at `first`. When it is not,
+    /// `None`, having asked for the next cache line, where `get_or_insert_at`
+    /// will most likely look next.
+    #[inline(always)]
+    pub fn peek(&self, klo: u64, khi: u64, first: u32) -> Option<u32> {
+        let first = first as usize;
+        let (s0, s1) = (self.slot(first), self.slot(first | 1));
+        let d0 = (s0.hi.load(Acquire) ^ khi) | (s0.lo.load(Relaxed) ^ klo);
+        let d1 = (s1.hi.load(Acquire) ^ khi) | (s1.lo.load(Relaxed) ^ klo);
+        let at = opaque((first | (d0 != 0) as usize) as u64);
+        if opaque(((d0 != 0) & (d1 != 0)) as u64) == 0 {
+            return Some(at as u32);
+        }
+        self.prefetch_at(((first & !RMASK) | ((first + 2) & RMASK)) as u32);
+        None
+    }
+
+    /// `get_or_insert` for a key given as two words and its `first` slot.
     #[cfg_attr(feature = "prof", inline(never))]
     #[cfg_attr(not(feature = "prof"), inline(always))]
-    pub fn get_or_insert(&self, k: Key, h: u64) -> u32 {
-        let (base, start) = self.home(h);
-        let (klo, khi) = (k as u64, (k >> 64) as u64);
+    pub fn get_or_insert_at(&self, klo: u64, khi: u64, first: u32) -> u32 {
+        let (base, start) = (first as usize & !RMASK, first as usize & RMASK);
+        // Nearly always the key is in one of the first two slots: test both
+        // without branching on which. (A slot's high word is its key's only
+        // once the whole slot is written, so a match is never a half-written
+        // slot; a missed one is found again by the careful loop.)
+        let (s0, s1) = (self.slot(base | start), self.slot(base | start | 1));
+        let d0 = (s0.hi.load(Acquire) ^ khi) | (s0.lo.load(Relaxed) ^ klo);
+        let d1 = (s1.hi.load(Acquire) ^ khi) | (s1.lo.load(Relaxed) ^ klo);
+        let at = opaque((base | start | (d0 != 0) as usize) as u64);
+        if opaque(((d0 != 0) & (d1 != 0)) as u64) == 0 {
+            return at as u32;
+        }
+        self.probe(klo, khi, base, start)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn probe(&self, klo: u64, khi: u64, base: usize, start: usize) -> u32 {
         let mut pos = start;
         loop {
             let s = self.slot(base | pos);
@@ -200,15 +265,30 @@ impl IdTable {
 
 // ---------------------------------------------------------------- arena
 
-/// Bump allocator over large anonymous mappings (never freed).
+/// Give the pages of a mapping back to the system (the mapping stays).
+pub fn release(ptr: *mut u8, bytes: usize) {
+    unsafe {
+        sys::madvise(ptr as *mut std::ffi::c_void, bytes, sys::MADV_DONTNEED);
+    }
+}
+
+/// Bump allocator over large anonymous mappings.
 pub struct Arena {
     cur: usize,
     end: usize,
+    blocks: Vec<(usize, usize)>,
 }
 
 impl Arena {
     pub fn new() -> Arena {
-        Arena { cur: 0, end: 0 }
+        Arena { cur: 0, end: 0, blocks: Vec::new() }
+    }
+
+    /// Give every page back. Nothing allocated here may be used afterwards.
+    pub fn release(&self) {
+        for &(ptr, bytes) in &self.blocks {
+            release(ptr as *mut u8, bytes);
+        }
     }
 
     #[inline(always)]
@@ -217,6 +297,7 @@ impl Arena {
             let block = bytes.max(32 << 20);
             self.cur = map_anon(block) as usize;
             self.end = self.cur + block;
+            self.blocks.push((self.cur, block));
         }
         let p = self.cur;
         self.cur += bytes;
@@ -235,6 +316,8 @@ struct Line([u8; 64]);
 pub struct Streams<T, const CB: usize> {
     lines: Vec<Line>,
     n: Vec<u32>,
+    /// Where each stream's staging line goes when it fills.
+    dst: Vec<*mut T>,
     chunks: Vec<Vec<*mut T>>,
 }
 
@@ -246,7 +329,12 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
 
     pub fn new(streams: usize) -> Self {
         assert!(64 % std::mem::size_of::<T>() == 0 && (1usize << CB) % Self::PER_LINE == 0);
-        Streams { lines: vec![Line([0; 64]); streams], n: vec![0; streams], chunks: (0..streams).map(|_| Vec::new()).collect() }
+        Streams {
+            lines: vec![Line([0; 64]); streams],
+            n: vec![0; streams],
+            dst: vec![std::ptr::null_mut(); streams],
+            chunks: (0..streams).map(|_| Vec::new()).collect(),
+        }
     }
 
     /// Where item `idx` of stream `s` lives, allocating its chunk if needed.
@@ -259,22 +347,70 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
         unsafe { self.chunks.get_unchecked(s).get_unchecked(idx >> CB).add(off) }
     }
 
-    /// Append to stream `s` and return the item's index.
-    #[cfg_attr(feature = "prof", inline(never))]
-    #[cfg_attr(not(feature = "prof"), inline(always))]
-    pub fn push(&mut self, s: usize, v: T, arena: &mut Arena) -> usize {
+    #[cold]
+    #[inline(never)]
+    fn new_chunk(&mut self, s: usize, arena: &mut Arena) {
+        let p = arena.alloc(std::mem::size_of::<T>() << CB) as *mut T;
+        self.chunks[s].push(p);
+        self.dst[s] = p;
+    }
+
+    /// Append a 16-byte item, given as two words, to stream `s` and return
+    /// its index. The item that fills a staging line goes out straight from
+    /// the registers: reading it back from the line right after writing it
+    /// would stall on the store.
+    #[inline(always)]
+    pub fn push16(&mut self, s: usize, a: u64, b: u64, arena: &mut Arena) -> usize {
+        debug_assert!(std::mem::size_of::<T>() == 16);
         unsafe {
+            use core::arch::x86_64::*;
             let n = *self.n.get_unchecked(s) as usize;
-            let r = n & (Self::PER_LINE - 1);
-            let line = self.lines.as_mut_ptr().add(s);
-            (line as *mut T).add(r).write(v);
+            let r = n & 3;
+            let line = self.lines.as_mut_ptr().add(s) as *mut u64;
             *self.n.get_unchecked_mut(s) = (n + 1) as u32;
-            if r == Self::PER_LINE - 1 {
-                use core::arch::x86_64::*;
-                let d = self.dest(s, n + 1 - Self::PER_LINE, arena) as *mut __m256i;
-                let src = line as *const __m256i;
-                _mm256_stream_si256(d, _mm256_load_si256(src));
-                _mm256_stream_si256(d.add(1), _mm256_load_si256(src.add(1)));
+            if r == 3 {
+                if (n - 3) & ((1 << CB) - 1) == 0 {
+                    self.new_chunk(s, arena);
+                }
+                let d = *self.dst.get_unchecked(s) as *mut __m256i;
+                let lo = _mm256_load_si256(line as *const __m256i);
+                let third = _mm_load_si128(line.add(4) as *const __m128i);
+                let hi = _mm256_inserti128_si256(_mm256_castsi128_si256(third), _mm_set_epi64x(b as i64, a as i64), 1);
+                _mm256_stream_si256(d, lo);
+                _mm256_stream_si256(d.add(1), hi);
+                *self.dst.get_unchecked_mut(s) = d.add(2) as *mut T;
+            } else {
+                *line.add(2 * r) = a;
+                *line.add(2 * r + 1) = b;
+            }
+            n
+        }
+    }
+
+    /// `push16` for 32-byte items given as four words.
+    #[inline(always)]
+    pub fn push32(&mut self, s: usize, w: [u64; 4], arena: &mut Arena) -> usize {
+        debug_assert!(std::mem::size_of::<T>() == 32);
+        unsafe {
+            use core::arch::x86_64::*;
+            let n = *self.n.get_unchecked(s) as usize;
+            let line = self.lines.as_mut_ptr().add(s) as *mut u64;
+            *self.n.get_unchecked_mut(s) = (n + 1) as u32;
+            if n & 1 == 1 {
+                if (n - 1) & ((1 << CB) - 1) == 0 {
+                    self.new_chunk(s, arena);
+                }
+                let d = *self.dst.get_unchecked(s) as *mut __m256i;
+                let lo = _mm256_load_si256(line as *const __m256i);
+                let hi = _mm256_set_epi64x(w[3] as i64, w[2] as i64, w[1] as i64, w[0] as i64);
+                _mm256_stream_si256(d, lo);
+                _mm256_stream_si256(d.add(1), hi);
+                *self.dst.get_unchecked_mut(s) = d.add(2) as *mut T;
+            } else {
+                *line = w[0];
+                *line.add(1) = w[1];
+                *line.add(2) = w[2];
+                *line.add(3) = w[3];
             }
             n
         }
