@@ -17,10 +17,18 @@ pub struct Src {
 impl Src {
     /// Map the whole file read-only. On failure it simply stays unmapped.
     pub fn map(&mut self) {
+        let at = self.map_addr();
+        self.set_map(at);
+    }
+
+    /// Where `map` would put the file: maps it and gives the address of
+    /// file offset 0 (0: not mapped, or already mapped), without taking it
+    /// up yet (see `set_map`), so that any thread can do the mapping.
+    pub fn map_addr(&self) -> usize {
         use std::os::unix::io::AsRawFd;
         const PAGE: usize = 4096;
         if self.len == 0 || self.map != 0 {
-            return;
+            return 0;
         }
         let pages = (self.len + PAGE - 1) & !(PAGE - 1);
         unsafe {
@@ -33,14 +41,21 @@ impl Src {
                 0,
             );
             if all == sys::MAP_FAILED {
-                return;
+                return 0;
             }
             let at = (all as usize + PAGE) as *mut std::ffi::c_void;
             let m = sys::mmap(at, pages, sys::PROT_READ, sys::MAP_PRIVATE | sys::MAP_FIXED, self.file.as_raw_fd(), 0);
             if m == sys::MAP_FAILED {
-                return;
+                return 0;
             }
-            self.map = at as usize;
+            at as usize
+        }
+    }
+
+    /// Take up a mapping that `map_addr` made for this file (0: none).
+    pub fn set_map(&mut self, at: usize) {
+        if at != 0 && self.map == 0 {
+            self.map = at;
         }
     }
 
