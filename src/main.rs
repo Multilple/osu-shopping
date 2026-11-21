@@ -208,6 +208,65 @@ fn main() {
             let (u1, s1, f1) = util::sys::usage();
             eprintln!("==== run {n} took {:.1} ms, user {:.1} ms, sys {:.1} ms, faults {}", t.elapsed().as_secs_f64() * 1e3, u1 - u0, s1 - s0, f1 - f0);
         }
+        // The same at full size, on data made here by the kit's generator
+        // (when it was shipped with this build and there is room for it).
+        let scratch_root = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into()));
+        let free_gb = {
+            let mut buf = [0u64; 16];
+            let c = std::ffi::CString::new(scratch_root.to_string_lossy().as_bytes()).unwrap();
+            if unsafe { util::sys::statvfs(c.as_ptr(), &mut buf) } == 0 {
+                buf[4] as f64 * buf[1] as f64 / 1e9
+            } else {
+                0.0
+            }
+        };
+        let gen = std::path::Path::new("/gen");
+        eprintln!("==== generator present: {}, scratch free {free_gb:.1} GB", gen.exists());
+        if gen.exists() && free_gb > 3.0 {
+            let big = scratch_root.join("d20");
+            let t = Instant::now();
+            let status = std::process::Command::new(gen)
+                .args(["--seed", "4242", "--events", "20000000", "--clicks", "5000000", "--threads", &threads.to_string(), "--output"])
+                .arg(&big)
+                .status();
+            eprintln!("==== generated in {:.1} s: {status:?}", t.elapsed().as_secs_f64());
+            let variants: [(&str, usize, &[(&str, &str)]); 9] = [
+                ("usual", threads, &[]),
+                ("usual", threads, &[]),
+                ("usual", threads, &[]),
+                ("read instead of map", threads, &[("SS_MMAP", "0")]),
+                ("no huge pages", threads, &[("SS_NOHUGE", "1")]),
+                ("half the threads", threads / 2, &[]),
+                ("twice the threads", threads * 2, &[]),
+                ("usual", threads, &[]),
+                ("one thread", 1, &[]),
+            ];
+            for (what, th, envs) in variants {
+                // (The check allows three minutes in all.)
+                if t0.elapsed().as_secs_f64() > 115.0 {
+                    eprintln!("==== out of time");
+                    break;
+                }
+                for (k, v) in envs {
+                    std::env::set_var(k, v);
+                }
+                let _ = std::fs::remove_dir_all(&scratch);
+                let t = Instant::now();
+                let (u0, s0, f0) = util::sys::usage();
+                eprintln!("==== 20M: {what}, {th} threads");
+                let mut scale = 1;
+                while !run(&big, &scratch, th.max(1), scale, t) {
+                    scale *= 4;
+                }
+                let (u1, s1, f1) = util::sys::usage();
+                eprintln!("==== 20M: {what} took {:.1} ms, user {:.1} ms, sys {:.1} ms, faults {}", t.elapsed().as_secs_f64() * 1e3, u1 - u0, s1 - s0, f1 - f0);
+                for (k, _) in envs {
+                    std::env::remove_var(k);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&big);
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
         std::process::exit(0);
     }
     // The ID table is sized from the input's size; if that guess is ever too
