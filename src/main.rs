@@ -14,6 +14,7 @@
 
 mod dense;
 mod dense_ck;
+mod dense_lk;
 mod dense_ev;
 mod diag;
 mod fast;

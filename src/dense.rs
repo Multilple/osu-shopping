@@ -80,6 +80,46 @@ pub fn id_key(prefix: u8, s: u64) -> Key {
     prefix as u128 | (w as u128) << 8 | ((len + 1) as u128) << 120
 }
 
+const POW36: [u64; 9] = {
+    let mut t = [1u64; 9];
+    let mut i = 1;
+    while i < 9 {
+        t[i] = t[i - 1] * 36;
+        i += 1;
+    }
+    t
+};
+
+/// The digit count in base 36 of the smallest number with this many
+/// significant bits (one digit for none).
+const DIGITS_OF_BITS: [u8; 41] = {
+    let mut t = [1u8; 41];
+    let mut b = 1;
+    while b < 41 {
+        let v = 1u64 << (b - 1);
+        let mut l = 1;
+        while v >= POW36[l] {
+            l += 1;
+        }
+        t[b] = l as u8;
+        b += 1;
+    }
+    t
+};
+
+/// Where the ID `prefix + base36(s)` stands among the IDs with its prefix,
+/// byte-wise, for `s` below 2^40: `digit_order(s) < digit_order(t)` exactly
+/// when `id_key(p, s)` is before `id_key(p, t)`. It is the digits as a
+/// number with zeros behind them up to eight, then how many there are (a
+/// string is after every one it starts with).
+#[inline(always)]
+pub fn digit_order(s: u64) -> u64 {
+    let l = DIGITS_OF_BITS[(64 - s.leading_zeros()) as usize] as usize;
+    // (Twice a number has at most one digit more.)
+    let l = l + (s >= POW36[l]) as usize;
+    (s * POW36[8 - l]) << 4 | l as u64
+}
+
 /// `id_key` the plain way (for checking it).
 #[allow(dead_code)]
 pub fn id_key_plain(prefix: u8, s: u64) -> Key {
@@ -323,16 +363,31 @@ impl Dn {
     #[inline(always)]
     fn find(&self, mut x: u32) -> u32 {
         loop {
+            // A root is its own parent, so this asks one thing of a root and
+            // of a root's child alike: whether a node is a root is a coin,
+            // whether its parent is one hardly ever is not.
             let p = self.parent_of(x);
-            if p == x {
-                return x;
-            }
             let gp = self.parent_of(p);
-            if gp != p {
-                let _ = self.parent_slot(x).compare_exchange(p ^ x, gp ^ x, Relaxed, Relaxed);
+            if gp == p {
+                return p;
             }
+            let _ = self.parent_slot(x).compare_exchange(p ^ x, gp ^ x, Relaxed, Relaxed);
             x = p;
         }
+    }
+
+    /// Where a direct node's name stands among the direct nodes' names (see `digit_order`).
+    #[inline(always)]
+    fn direct_order(&self, n: u32) -> u64 {
+        let v = ((n as u64 >> 3) << 9) | (n as u64 & 7);
+        digit_order(scramble(v, self.keys.user))
+    }
+
+    /// Whether node `a`'s name is before node `b`'s, when one of them is interned.
+    #[cold]
+    #[inline(never)]
+    fn name_before(&self, a: u32, b: u32) -> bool {
+        cmp_key(self.node_key(a), self.node_key(b)).is_lt()
     }
 
     /// Join the persons of two nodes. A person's root is its node with the
@@ -348,7 +403,9 @@ impl Dn {
             if ra == rb {
                 return;
             }
-            let (child, parent) = if cmp_key(self.node_key(ra), self.node_key(rb)).is_lt() { (rb, ra) } else { (ra, rb) };
+            // (Two direct nodes: their names compare as two numbers do.)
+            let a_first = if (ra.max(rb) as usize) < self.d { self.direct_order(ra) < self.direct_order(rb) } else { self.name_before(ra, rb) };
+            let (child, parent) = if a_first { (rb, ra) } else { (ra, rb) };
             if self.parent_slot(child).compare_exchange(0, parent ^ child, Relaxed, Relaxed).is_ok() {
                 return;
             }
@@ -587,7 +644,12 @@ fn plan(event_files: &[Src], click_files: &[Src]) -> Option<Plan> {
 
 #[inline(always)]
 fn link(dn: &Dn, out: &mut DOut, a: &[u8], b: &[u8]) {
-    let (na, nb) = (dn.user_node(a), dn.user_node(b));
+    link_nodes(dn, out, dn.user_node(a), dn.user_node(b));
+}
+
+/// Join two nodes' persons, once their parents' cache lines are here.
+#[inline(always)]
+pub(crate) fn link_nodes(dn: &Dn, out: &mut DOut, na: u32, nb: u32) {
     dn.prefetch_parent(na);
     dn.prefetch_parent(nb);
     out.pend_l.push((na, nb));
@@ -614,6 +676,8 @@ fn parse_links(file: &[u8], start: usize, end: usize, dn: &Dn, out: &mut DOut) {
         start
     } else {
         unsafe {
+            // The kernel takes the lines it can prove sound; the scanner and the plain code the rest.
+            let start = crate::dense_lk::links_dense(file, start, end, dn, out);
             fast::scan(file, start, end, |ls, commas, nc, le, nq| {
                 if nc != 1 {
                     return;
@@ -636,6 +700,27 @@ fn parse_links(file: &[u8], start: usize, end: usize, dn: &Dn, out: &mut DOut) {
     }
 }
 
+#[repr(C, align(64))]
+struct SetBits([[u8; 8]; 256]);
+
+/// For every byte: the positions of its set bits, lowest first.
+static SET_BITS: SetBits = {
+    let mut t = [[0u8; 8]; 256];
+    let mut m = 0;
+    while m < 256 {
+        let (mut k, mut b) = (0, 0);
+        while b < 8 {
+            if m >> b & 1 != 0 {
+                t[m][k] = b as u8;
+                k += 1;
+            }
+            b += 1;
+        }
+        m += 1;
+    }
+    SetBits(t)
+};
+
 /// Turn the joined sets into the `r8` table and the list of persons that
 /// need a lookup: those with an interned ID, or IDs of more than one
 /// generator person.
@@ -645,19 +730,41 @@ fn settle_links(dn: &mut Dn, threads: usize) {
     {
         let dn = &*dn;
         par(threads, |tid| {
-            let (lo, hi) = (d * tid / threads, d * (tid + 1) / threads);
+            // (`d` is a multiple of 8.)
+            let (lo, hi) = (d / 8 * tid / threads * 8, d / 8 * (tid + 1) / threads * 8);
             let mut odd = Vec::new();
-            for n in lo..hi {
-                if dn.parent_slot(n as u32).load(Relaxed) == 0 {
-                    continue;
+            // Most nodes have no link, and which do is a coin: list the
+            // linked ones of a stretch first, eight slots at a step with no
+            // branch, then settle those.
+            const STRETCH: usize = 2048;
+            let mut linked = [0u32; STRETCH + 8];
+            let mut at = lo;
+            while at < hi {
+                let to = (at + STRETCH).min(hi);
+                let mut k = 0;
+                unsafe {
+                    use core::arch::x86_64::*;
+                    let mut g = at;
+                    while g < to {
+                        let slots = _mm256_loadu_si256(dn.parent.add(g) as *const __m256i);
+                        let m = !_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(slots, _mm256_setzero_si256()))) as usize & 0xFF;
+                        // The numbers of the slots that hold something, packed to the front.
+                        let idx = _mm256_cvtepu8_epi32(_mm_loadl_epi64(SET_BITS.0.as_ptr().add(m) as *const __m128i));
+                        _mm256_storeu_si256(linked.as_mut_ptr().add(k) as *mut __m256i, _mm256_add_epi32(idx, _mm256_set1_epi32(g as i32)));
+                        k += m.count_ones() as usize;
+                        g += 8;
+                    }
                 }
-                let r = dn.find(n as u32);
-                if r as usize >= d || (r >> 3) != (n as u32 >> 3) {
-                    unsafe { *dn.r8.add(n) = 0xFF };
-                    odd.push((n as u32, r));
-                } else {
-                    unsafe { *dn.r8.add(n) = (n as u32 ^ r) as u8 };
+                for &n in &linked[..k] {
+                    let r = dn.find(n);
+                    if r as usize >= d || (r >> 3) != (n >> 3) {
+                        unsafe { *dn.r8.add(n as usize) = 0xFF };
+                        odd.push((n, r));
+                    } else {
+                        unsafe { *dn.r8.add(n as usize) = (n ^ r) as u8 };
+                    }
                 }
+                at = to;
             }
             *found[tid].lock().unwrap() = odd;
         });
@@ -1677,7 +1784,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
                 let Some(task) = tasks.get(i) else { break };
                 let (start, end) = out.reader.load(&link_files[task.file], task.a, task.b);
                 let buf = std::mem::take(&mut out.reader.buf);
-                parse_links(&buf[..end + 64], start, end, dn, out);
+                parse_links(&buf[..end + 128], start, end, dn, out);
                 out.reader.buf = buf;
             }
             flush_links(dn, out);
