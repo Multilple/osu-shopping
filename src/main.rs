@@ -192,6 +192,8 @@ fn main() {
     // times (with the stage times shown), and write no output, so that the
     // check of the public set fails and shows the log.
     if std::env::var("SS_DIAG").as_deref() == Ok("log") {
+        let resident = diag::resident(&data_dir);
+        eprintln!("==== input pages in memory at the start: {resident}");
         diag::report(&data_dir, threads, &|t, f| par(t, f));
         let scratch = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into())).join("diag-out");
         std::env::remove_var("SS_DIAG");
@@ -267,6 +269,15 @@ fn main() {
             let _ = std::fs::remove_dir_all(&big);
         }
         let _ = std::fs::remove_dir_all(&scratch);
+        eprintln!("==== brief (input pages in memory at the start: {resident})");
+        for l in diag::brief() {
+            eprintln!("{l}");
+        }
+        eprintln!("==== done after {:.1} s", t0.elapsed().as_secs_f64());
+        // SS_DIAG_END=fail: stop here with an error status, and no output.
+        if std::env::var("SS_DIAG_END").as_deref() == Ok("fail") {
+            std::process::exit(3);
+        }
         // Last, the real output with one number off (see SS_BREAK).
         std::env::set_var("SS_BREAK", "1");
         std::env::remove_var("SS_TIMING");

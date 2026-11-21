@@ -499,3 +499,119 @@ pub fn report(data_dir: &std::path::Path, threads: usize, par: &dyn Fn(usize, &(
     }
     eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
 }
+
+/// How much of the input is in the page cache right now (call before reading any of it).
+pub fn resident(data_dir: &std::path::Path) -> String {
+    use std::os::unix::io::AsRawFd;
+    let mut out = Vec::new();
+    for sub in ["events", "clicks", "links"] {
+        let (mut pages, mut inside) = (0usize, 0usize);
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(data_dir.join(sub)).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+        files.sort();
+        for f in files {
+            let Ok(file) = std::fs::File::open(&f) else { continue };
+            let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+            if len == 0 {
+                continue;
+            }
+            unsafe {
+                let m = sys::mmap(std::ptr::null_mut(), len, sys::PROT_READ, sys::MAP_PRIVATE, file.as_raw_fd(), 0);
+                if m == sys::MAP_FAILED {
+                    continue;
+                }
+                let n = len.div_ceil(4096);
+                let mut v = vec![0u8; n];
+                if sys::mincore(m, len, v.as_mut_ptr()) == 0 {
+                    pages += n;
+                    inside += v.iter().filter(|&&b| b & 1 != 0).count();
+                }
+                sys::munmap(m, len);
+            }
+        }
+        out.push(format!("{sub} {inside}/{pages}"));
+    }
+    out.join(", ")
+}
+
+/// The machine in a few short lines (what `report` says at length).
+pub fn brief() -> Vec<String> {
+    let mut out = Vec::new();
+    let cpuinfo = read("/proc/cpuinfo");
+    let first: Vec<&str> = cpuinfo.lines().take_while(|l| !l.trim().is_empty()).collect();
+    let field = |k: &str| first.iter().find(|l| l.starts_with(k)).and_then(|l| l.split(':').nth(1)).map(|v| v.trim().to_string()).unwrap_or_default();
+    out.push(format!(
+        "cpu: {} | {} fam {} model {} step {} ucode {} | {} listed | MHz {} | cache {}",
+        field("model name"),
+        field("vendor_id"),
+        field("cpu family"),
+        first.iter().find(|l| l.starts_with("model\t") || l.starts_with("model ") && !l.starts_with("model name")).and_then(|l| l.split(':').nth(1)).map(|v| v.trim().to_string()).unwrap_or_default(),
+        field("stepping"),
+        field("microcode"),
+        cpuinfo.lines().filter(|l| l.starts_with("processor")).count(),
+        field("cpu MHz"),
+        field("cache size"),
+    ));
+    let flags = field("flags");
+    let has: Vec<&str> = flags.split_whitespace().collect();
+    let want = [
+        "avx2", "bmi2", "adx", "avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni", "avx512vbmi", "avx512_vbmi2", "avx512_bitalg", "avx512_vpopcntdq", "avx512ifma", "gfni", "vaes",
+        "vpclmulqdq", "sha_ni", "erms", "fsrm", "movdiri", "movdir64b", "serialize", "amx_tile", "avx_vnni", "hypervisor", "pdpe1gb", "invpcid", "md_clear", "arch_capabilities", "clwb", "clflushopt", "rdpid", "la57",
+    ];
+    out.push(format!("flags yes: {} | no: {}", want.iter().filter(|w| has.contains(w)).copied().collect::<Vec<_>>().join(" "), want.iter().filter(|w| !has.contains(w)).copied().collect::<Vec<_>>().join(" ")));
+    out.push(format!("bugs: {}", field("bugs")));
+    let status = read("/proc/self/status");
+    let allowed = status.lines().find(|l| l.starts_with("Cpus_allowed_list:")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()).unwrap_or_default();
+    let mut cpus: Vec<u32> = Vec::new();
+    for part in allowed.split(',').filter(|p| !p.is_empty()) {
+        let (a, b) = match part.split_once('-') {
+            Some((a, b)) => (a.parse().unwrap_or(0), b.parse().unwrap_or(0)),
+            None => {
+                let a = part.parse().unwrap_or(0);
+                (a, a)
+            }
+        };
+        cpus.extend(a..=b.min(a + 255));
+    }
+    let topo: Vec<String> = cpus
+        .iter()
+        .take(32)
+        .map(|c| {
+            let f = |name: &str| read(&format!("/sys/devices/system/cpu/cpu{c}/topology/{name}")).trim().to_string();
+            format!("{c}:core{}[{}]", f("core_id"), f("thread_siblings_list"))
+        })
+        .collect();
+    out.push(format!("allowed {allowed} | {}", topo.join(" ")));
+    if let Some(&c) = cpus.first() {
+        let caches: Vec<String> = (0..5)
+            .filter_map(|i| {
+                let f = |name: &str| read(&format!("/sys/devices/system/cpu/cpu{c}/cache/index{i}/{name}")).trim().to_string();
+                (!f("size").is_empty()).then(|| format!("L{}{} {} [{}]", f("level"), &f("type")[..1.min(f("type").len())], f("size"), f("shared_cpu_list")))
+            })
+            .collect();
+        out.push(format!("caches: {}", caches.join(" | ")));
+    }
+    let t = |f: &str| read(&format!("/sys/kernel/mm/transparent_hugepage/{f}")).trim().to_string();
+    out.push(format!("kernel: {} | thp enabled {} defrag {} shmem {}", read("/proc/sys/kernel/osrelease").trim(), t("enabled"), t("defrag"), t("shmem_enabled")));
+    let meminfo = read("/proc/meminfo");
+    let mem: Vec<String> = meminfo
+        .lines()
+        .filter(|l| ["MemTotal", "MemFree", "MemAvailable", "Cached", "AnonHugePages", "HugePages_Total", "Dirty"].iter().any(|k| l.starts_with(k)))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    out.push(format!("mem: {}", mem.join(" | ")));
+    let cg: Vec<String> = ["cpu.max", "cpuset.cpus.effective", "memory.max", "memory.high", "pids.max"].iter().map(|f| format!("{f}={}", read(&format!("/sys/fs/cgroup/{f}")).trim())).collect();
+    out.push(format!("cgroup: {}", cg.join(" | ")));
+    let mut mounts = Vec::new();
+    for l in read("/proc/self/mounts").lines() {
+        let mut it = l.split_whitespace();
+        let (dev, at, fs) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
+        if ["/", "/data", "/output", "/scratch", "/tmp"].contains(&at) {
+            let mut buf = [0u64; 16];
+            let c = std::ffi::CString::new(at).unwrap();
+            unsafe { sys::statvfs(c.as_ptr(), &mut buf) };
+            mounts.push(format!("{at} {fs} {} free {:.1}G", &dev[..dev.len().min(24)], buf[4] as f64 * buf[1] as f64 / 1e9));
+        }
+    }
+    out.push(format!("mounts: {}", mounts.join(" | ")));
+    out
+}

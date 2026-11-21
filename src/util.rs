@@ -219,6 +219,7 @@ pub mod sys {
         pub fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
         pub fn statvfs(path: *const std::ffi::c_char, buf: *mut [u64; 16]) -> i32;
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+        pub fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> i32;
     }
 
     /// CPU time in user mode and in the kernel (ms), and page faults so far.
