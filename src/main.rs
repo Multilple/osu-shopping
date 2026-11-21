@@ -25,6 +25,7 @@ mod fast;
 mod input;
 mod keys;
 mod parquet;
+mod pool;
 #[cfg(feature = "sprof")]
 mod sprof;
 mod table;
@@ -206,6 +207,8 @@ fn main() {
     if !lab::is_child() {
         lab::main(threads);
     }
+    // The worker threads start now, while the setup runs.
+    pool::warm(threads);
     SUM_ON.store(std::env::var_os("SS_SUM").is_some(), Relaxed);
     // The ID table is sized from the input's size; if that guess is ever too
     // small, start over with a bigger one.
@@ -341,6 +344,12 @@ fn mem_note() -> String {
 
 /// Run `f(tid)` on every thread.
 fn par<F: Fn(usize) + Sync>(threads: usize, f: F) {
+    if threads <= 1 {
+        return f(0);
+    }
+    if let Some(p) = pool::get(threads) {
+        return p.run(&f);
+    }
     std::thread::scope(|scope| {
         for tid in 1..threads {
             let f = &f;

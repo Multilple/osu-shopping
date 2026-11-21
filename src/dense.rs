@@ -1807,6 +1807,12 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     // ------------------------------------------------------------ links
     let mut tasks = Vec::new();
     grid_tasks(&link_files, false, chunk, &mut tasks);
+    // The event and click files are mapped by the link stage's threads once
+    // they run out of link tasks (the mapping is serial work otherwise).
+    let mapped = env_usize("SS_MMAP", 1) != 0;
+    let to_map: Vec<&Src> = if mapped { event_files.iter().chain(click_files.iter()).collect() } else { Vec::new() };
+    let maps: Vec<AtomicUsize> = to_map.iter().map(|_| AtomicUsize::new(0)).collect();
+    let next_map = AtomicUsize::new(0);
     let aux = std::thread::scope(|scope| {
         let aux = scope.spawn(|| load_aux(data_dir));
         let dn = &dn;
@@ -1834,6 +1840,11 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
                 out.reader.buf = buf;
             }
             flush_links(dn, out);
+            loop {
+                let i = next_map.fetch_add(1, Relaxed);
+                let Some(src) = to_map.get(i) else { break };
+                maps[i].store(src.map_addr(), Relaxed);
+            }
         });
         lap("    links: parsed");
         aux.join().unwrap()
@@ -1852,11 +1863,9 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     }
 
     // ------------------------------------------------------------ parse
-    let mapped = env_usize("SS_MMAP", 1) != 0;
-    if mapped {
-        for src in event_files.iter_mut().chain(click_files.iter_mut()) {
-            src.map();
-        }
+    drop(to_map);
+    for (src, at) in event_files.iter_mut().chain(click_files.iter_mut()).zip(&maps) {
+        src.set_map(at.load(Relaxed));
     }
     let mut tasks = Vec::new();
     let piece = env_usize("SS_PIECE", if mapped { 4 << 20 } else { chunk });
