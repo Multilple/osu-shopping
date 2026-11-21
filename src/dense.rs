@@ -1658,6 +1658,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
                 o += 4096;
             }
         });
+        lap("    links: parents touched");
         let next = AtomicUsize::new(0);
         par(threads, |tid| {
             let out = mine(&outs, tid);
@@ -1671,6 +1672,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             }
             flush_links(dn, out);
         });
+        lap("    links: parsed");
         aux.join().unwrap()
     });
     lap("  links: parse and join");
