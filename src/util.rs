@@ -206,6 +206,7 @@ pub mod sys {
     pub const PROT_WRITE: i32 = 2;
     pub const MAP_PRIVATE: i32 = 2;
     pub const MAP_ANONYMOUS: i32 = 0x20;
+    pub const MAP_FIXED: i32 = 0x10;
     pub const MAP_NORESERVE: i32 = 0x4000;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
     pub const MADV_DONTNEED: i32 = 4;

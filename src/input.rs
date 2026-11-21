@@ -1,14 +1,87 @@
-//! Reading input files a chunk at a time into a small per-thread buffer that
-//! stays in cache, instead of mapping whole files.
+//! Input files: read a chunk at a time into a small per-thread buffer that
+//! stays in cache, or mapped whole and parsed in place.
 
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use crate::util::memchr;
+use crate::util::{memchr, sys};
 
 pub struct Src {
     pub file: std::fs::File,
     pub len: usize,
+    /// Where file offset 0 is mapped (0: not mapped). A readable page of
+    /// zeros comes before the file's pages and another after them.
+    map: usize,
+}
+
+impl Src {
+    /// Map the whole file read-only. On failure it simply stays unmapped.
+    pub fn map(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        const PAGE: usize = 4096;
+        if self.len == 0 || self.map != 0 {
+            return;
+        }
+        let pages = (self.len + PAGE - 1) & !(PAGE - 1);
+        unsafe {
+            let all = sys::mmap(
+                std::ptr::null_mut(),
+                pages + 2 * PAGE,
+                sys::PROT_READ,
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                -1,
+                0,
+            );
+            if all == sys::MAP_FAILED {
+                return;
+            }
+            let at = (all as usize + PAGE) as *mut std::ffi::c_void;
+            let m = sys::mmap(at, pages, sys::PROT_READ, sys::MAP_PRIVATE | sys::MAP_FIXED, self.file.as_raw_fd(), 0);
+            if m == sys::MAP_FAILED {
+                return;
+            }
+            self.map = at as usize;
+        }
+    }
+
+    pub fn mapped(&self) -> bool {
+        self.map != 0
+    }
+
+    /// Let go of a mapped file's pages (cheaper done by several threads
+    /// before the end than by process exit alone). It must not be read after.
+    pub fn unmap(&self) {
+        if self.map != 0 {
+            unsafe { sys::madvise(self.map as *mut std::ffi::c_void, (self.len + 4095) & !4095, sys::MADV_DONTNEED) };
+        }
+    }
+
+    /// For a mapped file, what `Reader::load` gives: the data lines that
+    /// start in file offsets `a..b` span `buf[start..end]`, the byte before
+    /// `start` is a newline, and all of `buf` (which reaches 128 bytes past
+    /// `end`) is readable.
+    pub fn view(&self, a: usize, b: usize) -> (&[u8], usize, usize) {
+        let r0 = a.saturating_sub(1);
+        // File offset x is at v[FRONT + x - r0]; the page of zeros before the
+        // file covers the first FRONT bytes when r0 is 0, and the one after
+        // it covers what is read past the end.
+        let data_end = FRONT + self.len - r0;
+        let v = unsafe { std::slice::from_raw_parts((self.map + r0 - FRONT) as *const u8, data_end + 1024) };
+        let ib = FRONT + b - r0;
+        let lim = (ib - 1).min(data_end);
+        let Some(i) = memchr(b'\n', &v[FRONT..lim.max(FRONT)]) else { return (&v[..FRONT + 128], FRONT, FRONT) };
+        let start = FRONT + i + 1;
+        let end = if ib - 1 >= data_end {
+            data_end
+        } else {
+            match memchr(b'\n', &v[ib - 1..data_end]) {
+                Some(j) => ib + j,
+                None => data_end,
+            }
+        };
+        let end = end.max(start);
+        (&v[..end + 128], start, end)
+    }
 }
 
 /// Every `*.csv` file directly in `dir`, in name order.
@@ -27,7 +100,7 @@ pub fn list_dir(dir: &Path) -> Vec<Src> {
         .map(|p| {
             let file = std::fs::File::open(p).unwrap();
             let len = file.metadata().unwrap().len() as usize;
-            Src { file, len }
+            Src { file, len, map: 0 }
         })
         .collect()
 }

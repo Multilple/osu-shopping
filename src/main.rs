@@ -32,10 +32,10 @@ use util::*;
 
 const DEAD: u64 = u64::MAX;
 const TAG: u64 = 1 << 63;
-const H2_SHIFT: u32 = 42;
+const H2_SHIFT: u32 = 43;
 const H2_MASK: u64 = 0xF_FFFF;
 const IDX_BITS: u32 = 26;
-const Q_BITS: u32 = 10;
+const Q_BITS: u32 = 11;
 const T_BITS: u32 = 6;
 const MAX_THREADS: usize = (1 << T_BITS) - 2;
 
@@ -117,6 +117,9 @@ struct ThreadOut {
     slim: SlimStreams,
     dates: fast::Dates,
     reader: input::Reader,
+    /// How far ahead of the line being parsed to ask for input bytes
+    /// (0: the input is in a buffer that is in cache already).
+    ahead: usize,
     /// Events waiting for their table lookups, in two halves of `HALF`: the
     /// one being filled starts at `cur` and holds `npe`; when it is full the
     /// other one, whose table lines have had that long to arrive, is looked
@@ -200,6 +203,23 @@ fn main() {
     std::process::exit(0);
 }
 
+/// With SS_TIMING=2: resident and huge-page-backed memory right now, in MB.
+fn mem_note() -> String {
+    if std::env::var("SS_TIMING").as_deref() != Ok("2") {
+        return String::new();
+    }
+    let text = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+    let mb = |key: &str| {
+        text.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            / 1024
+    };
+    format!("  rss {} anon {} huge {} file {}", mb("Rss:"), mb("Anonymous:"), mb("AnonHugePages:"), mb("Rss:") - mb("Anonymous:"))
+}
+
 /// Run `f(tid)` on every thread.
 fn par<F: Fn(usize) + Sync>(threads: usize, f: F) {
     std::thread::scope(|scope| {
@@ -223,7 +243,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         let now = t0.elapsed().as_secs_f64();
         if log {
             let (user, sys, faults) = util::sys::usage();
-            eprintln!("{:>8.1} ms  {:<28} user {:>7.1} sys {:>6.1} faults {}", now * 1e3, what, user, sys, faults);
+            eprintln!("{:>8.1} ms  {:<28} user {:>7.1} sys {:>6.1} faults {}{}", now * 1e3, what, user, sys, faults, mem_note());
         }
         if !what.starts_with(' ') {
             if pad.as_deref() == Some(what) {
@@ -233,8 +253,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         }
     };
 
-    let event_files = input::list_dir(&data_dir.join("events"));
-    let click_files = input::list_dir(&data_dir.join("clicks"));
+    let mut event_files = input::list_dir(&data_dir.join("events"));
+    let mut click_files = input::list_dir(&data_dir.join("clicks"));
     let link_files = input::list_dir(&data_dir.join("links"));
     let bytes = |files: &[input::Src]| files.iter().map(|s| s.len).sum::<usize>();
     let mut ctx = build_ctx(data_dir, bytes(&event_files), bytes(&click_files), bytes(&link_files), scale);
@@ -251,6 +271,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
                 slim: Streams::new(1 << ctx.pbits),
                 dates: fast::Dates::new(),
                 reader: input::Reader::new(chunk),
+                ahead: 0,
                 pend_e: vec![PendE::default(); 2 * HALF].into_boxed_slice(),
                 cur: 0,
                 npe: 0,
@@ -308,9 +329,21 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     lap("links");
 
     // ------------------------------------------------------------ parse
+    // The files are parsed in place, mapped: copying them through a buffer
+    // costs more kernel time than the page faults do. The parsers ask for
+    // the bytes a page ahead, since nothing else brings them into cache in
+    // time. (SS_MMAP=0: read into a buffer instead, as for unmappable files.)
+    let mapped = env_usize("SS_MMAP", 1) != 0;
+    if mapped {
+        for src in event_files.iter_mut().chain(click_files.iter_mut()) {
+            src.map();
+        }
+    }
+    let ahead = env_usize("SS_AHEAD", 4096);
     let mut tasks = Vec::new();
-    grid_tasks(&event_files, true, chunk, &mut tasks);
-    grid_tasks(&click_files, false, chunk, &mut tasks);
+    let piece = env_usize("SS_PIECE", if mapped { 256 << 10 } else { chunk });
+    grid_tasks(&event_files, true, piece, &mut tasks);
+    grid_tasks(&click_files, false, piece, &mut tasks);
     let next = AtomicUsize::new(0);
     par(threads, |tid| {
         let out = out_mut(&outs, tid);
@@ -318,6 +351,17 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(task) = tasks.get(i) else { break };
             let src = if task.events { &event_files[task.file] } else { &click_files[task.file] };
+            if src.mapped() {
+                let (buf, start, end) = src.view(task.a, task.b);
+                out.ahead = ahead;
+                if task.events {
+                    parse_events(buf, start, end, &ctx, out, tid);
+                } else {
+                    parse_clicks(buf, start, end, &ctx, out);
+                }
+                continue;
+            }
+            out.ahead = 0;
             let (start, end) = out.reader.load(src, task.a, task.b);
             let buf = std::mem::take(&mut out.reader.buf);
             if task.events {
@@ -411,12 +455,20 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     // The last table is small: write it while the other threads give the big
     // buffers back, which is quicker than leaving it all to process exit.
     let cells: Vec<Cells> = cells.into_iter().map(|c| c.0.into_inner().unwrap()).collect();
+    let next = AtomicUsize::new(0);
     par(threads, |tid| {
         if tid == 0 {
             write_campaign_daily(&camp_dir.join("part-000.parquet"), &cells, &ctx);
         }
         outs_ref[tid].arena.release();
         ctx.ids.release_part(tid, threads);
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            match event_files.get(i).or_else(|| click_files.get(i.wrapping_sub(event_files.len()))) {
+                Some(src) => src.unmap(),
+                None => break,
+            }
+        }
     });
     lap("campaign_daily");
     if pad.is_some() {
@@ -486,7 +538,10 @@ fn build_ctx(data: &Path, event_bytes: usize, click_bytes: usize, link_bytes: us
     let event_lines = event_bytes / 64 + 1;
     let ids_guess = event_lines / 8 + click_bytes / 512 + link_bytes / 64 + 1024;
     let nregions = ((ids_guess * scale).div_ceil(RSIZE)).max(4);
-    let rpb = nregions.div_ceil(env_usize("SS_NQ", 640)).next_power_of_two();
+    // Person buckets: up to 640, or more for very large inputs so that a
+    // bucket stays under roughly 100k events (it should fit a core's share
+    // of the cache while its people are put together).
+    let rpb = nregions.div_ceil(env_usize("SS_NQ", 640.max(event_lines / 100_000))).next_power_of_two();
     let qshift = (RBITS + rpb.trailing_zeros() as usize) as u32;
     let nq = nregions.div_ceil(rpb);
     assert!(nq <= 1 << Q_BITS);
@@ -955,10 +1010,16 @@ unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
     let span = (ctx.we - ctx.ws) as u64;
     let origin_s = ctx.origin / 1000;
     let exp = exp();
+    let ahead = out.ahead;
     let mut s = start;
     while s < end {
         if s + 128 > len {
             break;
+        }
+        if ahead != 0 {
+            // (two cache lines per line: lines are mostly shorter than that)
+            core::arch::x86_64::_mm_prefetch(base.wrapping_add(s + ahead) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+            core::arch::x86_64::_mm_prefetch(base.wrapping_add(s + ahead + 64) as *const i8, core::arch::x86_64::_MM_HINT_T0);
         }
         let c = fast::cut::<3, 3, 8>(base, s);
         if !c.shape {
@@ -1067,10 +1128,14 @@ unsafe fn clicks_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
     let base = file.as_ptr();
     let len = file.len();
     let span = (ctx.we - ctx.cws) as u64;
+    let ahead = out.ahead;
     let mut s = start;
     while s < end {
         if s + 128 > len {
             break;
+        }
+        if ahead != 0 {
+            core::arch::x86_64::_mm_prefetch(base.wrapping_add(s + ahead) as *const i8, core::arch::x86_64::_MM_HINT_T0);
         }
         let c = fast::cut::<2, 1, 5>(base, s);
         if !c.shape {
