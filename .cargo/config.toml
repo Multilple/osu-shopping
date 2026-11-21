@@ -1,4 +1,4 @@
 [build]
-# The last flag keeps jumps from crossing or ending on 32-byte boundaries: on Skylake to Cascade Lake
-# processors (the scoring machine's family) such jumps are not served from the decoded-instruction cache.
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static", "-C", "llvm-args=-x86-branches-within-32B-boundaries"]
+# (Keeping jumps off 32-byte boundaries, -x86-branches-within-32B-boundaries, was measured on the scoring
+# machine: no gain there, and the padding costs about 2%.)
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
