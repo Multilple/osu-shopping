@@ -33,30 +33,66 @@ const AINV24: u64 = (inverse(MUL_A) & M40) << 24;
 
 // ------------------------------------------------------------------ times
 
-/// What `Dates::miss` gives for bytes that are not a valid `YYYY-MM-DDT`.
-const BAD_DATE: i64 = i64::MIN;
-
-/// Per-thread memo of calendar dates seen: the 11 bytes `YYYY-MM-DDT` ->
-/// seconds at midnight. Only valid dates are kept, so a hit needs no check.
-struct Dates {
+/// Per-thread memos for the two things about a timestamp that take few
+/// values: its calendar date, and its form with its UTC offset.
+struct Memo {
+    /// Dates seen: the 11 bytes `YYYY-MM-DDT` -> the time at midnight, in
+    /// milliseconds and in seconds. Only valid dates are kept, so a hit
+    /// needs no check.
     key8: [u64; 64],
     key4: [u32; 64],
-    val: [i64; 64],
+    ms: [i64; 64],
+    sec: [i64; 64],
+    /// Forms seen (see `form_key`) -> what to take off the local time, ms.
+    fkey: [u64; 512],
+    fval: [i64; 512],
 }
 
-impl Dates {
-    fn new() -> Dates {
-        // Every slot starts as 1970-01-01, which is right for the one slot
-        // that date maps to and can never match in any other.
+/// The bits of a form key that pick its slot: of the sign, the hours and the
+/// tens of minutes, and one that tells the offset form from the others.
+const FORM_BITS: u64 = 0x02 | (0x01 << 8) | (0x0F << 16) | (0x05 << 32) | (1 << 58);
+
+#[repr(C, align(64))]
+struct T64([u64; 64]);
+
+/// By ts length: which of the 8 bytes from its 20th on belong to a form's key
+/// (`Z` of the 20-byte form, `+HH:MM` of the 25-byte one, nothing of the
+/// 13-digit one) ...
+static FORM_MASK: T64 = {
+    let mut t = [0u64; 64];
+    t[20] = 0xFF;
+    t[25] = 0xFFFF_FFFF_FFFF;
+    T64(t)
+};
+
+/// ... and the length itself in the key's top byte, so that no two lengths
+/// share a key and a length that no form has gives a key that is never kept.
+static FORM_TAG: T64 = {
+    let mut t = [0u64; 64];
+    let mut n = 0;
+    while n < 64 {
+        t[n] = (n as u64) << 56;
+        n += 1;
+    }
+    T64(t)
+};
+
+impl Memo {
+    fn new() -> Memo {
+        // Every date slot starts as 1970-01-01, which is right for the one
+        // slot that date maps to and can never match in any other. No form
+        // key has all its bits set.
         let k = b"1970-01-01T";
         let k8 = u64::from_le_bytes(k[..8].try_into().unwrap());
         let k4 = u32::from_le_bytes(k[7..11].try_into().unwrap());
-        Dates { key8: [k8; 64], key4: [k4; 64], val: [0; 64] }
+        Memo { key8: [k8; 64], key4: [k4; 64], ms: [0; 64], sec: [0; 64], fkey: [!0; 512], fval: [0; 512] }
     }
 
+    /// A date not in its slot: checks it by the plain rules and keeps it.
+    /// False when the 11 bytes at `p` are not a valid `YYYY-MM-DDT`.
     #[cold]
     #[inline(never)]
-    unsafe fn miss(&mut self, p: *const u8, idx: usize, k8: u64, k4: u32) -> i64 {
+    unsafe fn date_miss(&mut self, p: *const u8, idx: usize) -> bool {
         let b = std::slice::from_raw_parts(p, 11);
         let d = |i: usize| -> Option<i64> {
             let v = b[i].wrapping_sub(b'0');
@@ -90,100 +126,124 @@ impl Dates {
         })();
         match v {
             Some(v) => {
-                self.key8[idx] = k8;
-                self.key4[idx] = k4;
-                self.val[idx] = v;
-                v
+                self.key8[idx] = std::ptr::read_unaligned(p as *const u64);
+                self.key4[idx] = std::ptr::read_unaligned(p.add(7) as *const u32);
+                self.sec[idx] = v;
+                self.ms[idx] = v * 1000;
+                true
             }
-            None => BAD_DATE,
+            None => false,
         }
     }
 
-    /// Seconds at midnight of the date `YYYY-MM-DDT` at `p`, if it is one.
+    /// The slot of the date `YYYY-MM-DDT` at `p`, if it is one.
     #[inline(always)]
-    unsafe fn date(&mut self, p: *const u8) -> Option<i64> {
+    unsafe fn date(&mut self, p: *const u8) -> Option<usize> {
         let k8 = std::ptr::read_unaligned(p as *const u64);
         let k4 = std::ptr::read_unaligned(p.add(7) as *const u32);
         let idx = _pext_u32(k4, 0x000F_0300) as usize;
-        if (*self.key8.get_unchecked(idx) == k8) & (*self.key4.get_unchecked(idx) == k4) {
-            Some(*self.val.get_unchecked(idx))
-        } else {
-            let v = self.miss(p, idx, k8, k4);
-            if v == BAD_DATE {
-                None
-            } else {
-                Some(v)
-            }
+        if (*self.key8.get_unchecked(idx) != k8 || *self.key4.get_unchecked(idx) != k4) && !self.date_miss(p, idx) {
+            return None;
         }
+        Some(idx)
+    }
+
+    /// A form key not in its slot: checks it by the plain rules and keeps it.
+    /// False when a ts of `n` bytes with this key has none of the three forms
+    /// (as far as its form bytes tell).
+    #[cold]
+    #[inline(never)]
+    fn form_miss(&mut self, key: u64, idx: usize, n: usize) -> bool {
+        let b = key.to_le_bytes();
+        let val = match n {
+            13 => 0,
+            20 if b[0] == b'Z' => 0,
+            25 => {
+                let d = |i: usize| (b[i].wrapping_sub(b'0') as i64, b[i].wrapping_sub(b'0') <= 9);
+                let ((h1, a), (h0, c), (m1, e), (m0, f)) = (d(1), d(2), d(4), d(5));
+                let (hh, mm) = (h1 * 10 + h0, m1 * 10 + m0);
+                if !(a && c && e && f) || (b[0] != b'+' && b[0] != b'-') || b[3] != b':' || hh > 23 || mm > 59 {
+                    return false;
+                }
+                let off = (hh * 60 + mm) * MINUTE;
+                if b[0] == b'+' {
+                    off
+                } else {
+                    -off
+                }
+            }
+            _ => return false,
+        };
+        self.fkey[idx] = key;
+        self.fval[idx] = val;
+        true
     }
 }
 
 thread_local! {
-    static DATES: UnsafeCell<Dates> = UnsafeCell::new(Dates::new());
+    static MEMO: UnsafeCell<Memo> = UnsafeCell::new(Memo::new());
 }
 
-/// Seconds since midnight of two `HH:MM:SS` at `a` and `b` (8 readable bytes
-/// each), or `None` when either is not a time of day.
+#[repr(C, align(32))]
+struct Y32([u8; 32]);
+#[repr(C, align(32))]
+struct W16([i16; 16]);
+#[repr(C, align(32))]
+struct D8([u32; 8]);
+
+// The constants of `times`, low lane (two times of day) then high lane (13 digits).
+static T_PAT: Y32 = Y32(*b"00:00:0000:00:000000000000000000");
+static T_MAX: Y32 = Y32([2, 9, 0, 5, 9, 0, 5, 9, 2, 9, 0, 5, 9, 0, 5, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 255, 255, 255]);
+static T_W1: Y32 = Y32([10, 1, 0, 10, 1, 0, 10, 1, 10, 1, 0, 10, 1, 0, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 1, 0, 0, 0]);
+static T_MAXW: W16 = W16([23, 0x7FFF, 0x7FFF, 0x7FFF, 23, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF]);
+static T_W2: W16 = W16([60, 1, 60, 1, 60, 1, 60, 1, 100, 1, 100, 1, 100, 1, 1, 0]);
+static T_SHUF: Y32 = Y32([0, 1, 4, 5, 128, 128, 128, 128, 8, 9, 12, 13, 128, 128, 128, 128, 0, 1, 4, 5, 8, 9, 12, 13, 128, 128, 128, 128, 128, 128, 128, 128]);
+static T_W3: W16 = W16([60, 1, 0, 0, 60, 1, 0, 0, 10_000, 1, 10, 1, 0, 0, 0, 0]);
+static T_MUL: D8 = D8([1000, 0, 1, 0, 100_000, 0, 0, 0]);
+
+/// By ts length, 8 bytes apart: the parts of what `times` finds wrong that
+/// count. The two times of day always do; the 13 digits when ts has that
+/// form. (Lengths that no form has never get here.)
+static T_COUNTS: [u8; 64 * 8 + 32] = {
+    let mut t = [0u8; 64 * 8 + 32];
+    let mut i = 0;
+    while i < 32 {
+        t[13 * 8 + i] = 255;
+        if i < 16 {
+            t[20 * 8 + i] = 255;
+            t[25 * 8 + i] = 255;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// Two times of day `HH:MM:SS` at `a` and `b` and 13 digits at `c`, all at
+/// once: (the first in milliseconds since midnight, the second in seconds,
+/// the digits' number, 0) and what is wrong with any of them (nonzero bytes;
+/// in the low half for the times, in the high half for the digits).
 #[inline(always)]
-unsafe fn tod2(a: *const u8, b: *const u8) -> Option<(u32, u32)> {
-    let x = _mm_set_epi64x(std::ptr::read_unaligned(b as *const i64), std::ptr::read_unaligned(a as *const i64));
+unsafe fn times(a: *const u8, b: *const u8, c: *const u8) -> (__m256i, __m256i) {
+    let lo = _mm_set_epi64x(std::ptr::read_unaligned(b as *const i64), std::ptr::read_unaligned(a as *const i64));
+    let x = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), _mm_loadu_si128(c as *const __m128i), 1);
+    let ld = |t: *const u8| _mm256_load_si256(t as *const __m256i);
     // After the xor, digits are 0..=9 and the colons are 0.
-    let x = _mm_xor_si128(x, _mm_set1_epi64x(0x3030_3A30_303A_3030));
-    // No digit above 2 9 : 5 9 : 5 9, and the hour at most 23.
-    let over = _mm_subs_epu8(x, _mm_set1_epi64x(0x0905_0009_0500_0902));
-    // Pairs of bytes: hour, ten-minutes, minutes, seconds.
-    let w = _mm_maddubs_epi16(x, _mm_set1_epi64x(0x010A_0001_0A00_010A));
-    let late = _mm_cmpgt_epi16(w, _mm_set1_epi64x(0x7FFF_7FFF_7FFF_0017));
-    let bad = _mm_or_si128(over, late);
-    if _mm_testz_si128(bad, bad) == 0 {
-        return None;
-    }
-    // Seconds since midnight in two halves; their sum lands in the low half.
-    let f = _mm_madd_epi16(w, _mm_set1_epi64x(0x0001_003C_003C_0E10));
-    let g = _mm_add_epi32(f, _mm_srli_epi64(f, 32));
-    Some((_mm_cvtsi128_si32(g) as u32, _mm_extract_epi32(g, 2) as u32))
-}
-
-/// 13 ASCII digits at `p` (with 3 readable bytes before them) as a number.
-#[inline(always)]
-unsafe fn digits13(p: *const u8) -> Option<i64> {
-    let v = _mm_loadu_si128(p.sub(3) as *const __m128i);
-    let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
-    let d = _mm_and_si128(d, _mm_set_epi64x(-1, 0xFFFF_FFFF_FF00_0000u64 as i64));
-    let over = _mm_subs_epu8(d, _mm_set1_epi8(9));
-    if _mm_testz_si128(over, over) == 0 {
-        return None;
-    }
-    // Pairs, then fours, then eights of digits.
-    let w = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
-    let f = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_0064));
-    let f = _mm_packus_epi32(f, f);
-    let e = _mm_madd_epi16(f, _mm_set1_epi32(0x0001_2710));
-    let both = _mm_cvtsi128_si64(e) as u64;
-    Some(((both & 0xFFFF_FFFF) * 100_000_000 + (both >> 32)) as i64)
-}
-
-/// The UTC offset `+HH:MM` / `-HH:MM` at `p` in seconds east, or `None`.
-#[inline(always)]
-unsafe fn utc_offset(p: *const u8) -> Option<i64> {
-    let d = |i: usize| (*p.add(i)).wrapping_sub(b'0') as i64;
-    let (h1, h0, m1, m0) = (d(1), d(2), d(4), d(5));
-    let sign = *p;
-    if (sign != b'+' && sign != b'-') || h1 > 9 || h0 > 9 || m1 > 9 || m0 > 9 || *p.add(3) != b':' {
-        return None;
-    }
-    let (hh, mm) = (h1 * 10 + h0, m1 * 10 + m0);
-    if hh > 23 || mm > 59 {
-        return None;
-    }
-    let off = (hh * 60 + mm) * 60;
-    Some(if sign == b'+' { off } else { -off })
+    let x = _mm256_xor_si256(x, ld(T_PAT.0.as_ptr()));
+    // No digit above 2 9 : 5 9 : 5 9, or above 9.
+    let over = _mm256_subs_epu8(x, ld(T_MAX.0.as_ptr()));
+    // Pairs of bytes: hours, ten-minutes, minutes, seconds; or two digits.
+    let w = _mm256_maddubs_epi16(x, ld(T_W1.0.as_ptr()));
+    let late = _mm256_cmpgt_epi16(w, ld(T_MAXW.0.as_ptr() as *const u8));
+    // Minutes of the day and seconds of ten minutes; or four digits.
+    let f = _mm256_madd_epi16(w, ld(T_W2.0.as_ptr() as *const u8));
+    let f = _mm256_shuffle_epi8(f, ld(T_SHUF.0.as_ptr()));
+    // Seconds of the day (twice); or eight digits, then five.
+    let g = _mm256_madd_epi16(f, ld(T_W3.0.as_ptr() as *const u8));
+    let v = _mm256_add_epi64(_mm256_mul_epu32(g, ld(T_MUL.0.as_ptr() as *const u8)), _mm256_srli_epi64(g, 32));
+    (v, _mm256_or_si256(over, late))
 }
 
 // ------------------------------------------------------------------ the fast path
-
-#[repr(C, align(64))]
-struct T64([u64; 64]);
 
 /// By `digits + 2` (the length of an ID field less its quotes, plus 1): a
 /// mask keeping the last `digits` bytes of 8, for 1..=8 digits; else 0.
@@ -319,7 +379,7 @@ pub(crate) unsafe fn events_dense(file: &[u8], start: usize, end: usize, ctx: &C
     if end < MARGIN {
         return s;
     }
-    let dates = &mut *DATES.with(|d| d.get());
+    let memo = &mut *MEMO.with(|d| d.get());
     let limit = end - MARGIN;
     let span = (ctx.we - ctx.ws).max(0) as u64;
     let origin_s = ctx.origin / 1000;
@@ -405,37 +465,36 @@ pub(crate) unsafe fn events_dense(file: &[u8], start: usize, end: usize, ctx: &C
             // without its alias bits 3..9, 21 zero bits below.
             let w1 = ((ew >> 23) & slot_mask) | _pext_u64(uw, !((0x1F8u64 << 24) | 0x7));
 
-            // ---- ts and ingest.
+            // ---- ts and ingest, with no branch on the form of ts.
             let p2 = a0.add(r2 + 1 + q2);
-            let n2 = r3 - r2 - 1 - 2 * q2;
+            // (A lone quote for a field gives -1: 63, which no form has.)
+            let n2 = (r3 - r2 - 1 - 2 * q2) & 63;
             let p3 = a0.add(r3 + 1 + q3);
-            let t: i64;
-            let ing: i64;
-            if n2 == 20 {
-                if *p2.add(19) != b'Z' {
-                    break 'fast;
-                }
-                let Some(dt) = dates.date(p2) else { break 'fast };
-                let Some(di) = dates.date(p3) else { break 'fast };
-                let Some((tt, ti)) = tod2(p2.add(11), p3.add(11)) else { break 'fast };
-                t = (dt + tt as i64) * 1000;
-                ing = di + ti as i64;
-            } else if n2 == 13 {
-                let Some(v) = digits13(p2) else { break 'fast };
-                let Some(di) = dates.date(p3) else { break 'fast };
-                let Some((_, ti)) = tod2(p3.add(11), p3.add(11)) else { break 'fast };
-                t = v;
-                ing = di + ti as i64;
-            } else if n2 == 25 {
-                let Some(off) = utc_offset(p2.add(19)) else { break 'fast };
-                let Some(dt) = dates.date(p2) else { break 'fast };
-                let Some(di) = dates.date(p3) else { break 'fast };
-                let Some((tt, ti)) = tod2(p2.add(11), p3.add(11)) else { break 'fast };
-                t = (dt + tt as i64 - off) * 1000;
-                ing = di + ti as i64;
-            } else {
+            // The form: by length, with `Z` or the offset where they would be.
+            let fk = (std::ptr::read_unaligned(p2.add(19) as *const u64) & *FORM_MASK.0.get_unchecked(n2)) | *FORM_TAG.0.get_unchecked(n2);
+            let fi = _pext_u64(fk, FORM_BITS) as usize;
+            if *memo.fkey.get_unchecked(fi) != fk && !memo.form_miss(fk, fi, n2) {
                 break 'fast;
             }
+            // The date and time code reads ts when it has them, and ingest
+            // again (to no effect) when ts is 13 digits.
+            let pt = std::hint::select_unpredictable(n2 == 13, p3, p2);
+            let Some(dt) = memo.date(pt) else { break 'fast };
+            let day = *memo.ms.get_unchecked(dt);
+            // Ingest nearly always has the date of ts. (Its own date may take
+            // the slot of the first: `day` is read before.)
+            let mut di = dt;
+            if std::ptr::read_unaligned(p3 as *const u64) != *memo.key8.get_unchecked(dt) || std::ptr::read_unaligned(p3.add(7) as *const u32) != *memo.key4.get_unchecked(dt) {
+                let Some(d) = memo.date(p3) else { break 'fast };
+                di = d;
+            }
+            let (tv, wrong) = times(pt.add(11), p3.add(11), p2);
+            if _mm256_testz_si256(wrong, _mm256_loadu_si256(T_COUNTS.as_ptr().add(n2 * 8) as *const __m256i)) == 0 {
+                break 'fast;
+            }
+            let iso = day + _mm_cvtsi128_si64(_mm256_castsi256_si128(tv)) - *memo.fval.get_unchecked(fi);
+            let ing = *memo.sec.get_unchecked(di) + _mm_extract_epi64(_mm256_castsi256_si128(tv), 1);
+            let t = std::hint::select_unpredictable(n2 == 13, _mm_cvtsi128_si64(_mm256_extracti128_si256(tv, 1)), iso);
 
             // ---- the rest of the line, from comma 4: type, product, price.
             // Ingest is 20 bytes; `Z,` or `Z",` must follow its first 19.
