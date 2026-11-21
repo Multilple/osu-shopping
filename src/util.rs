@@ -110,58 +110,29 @@ pub fn hash_pair(k: Key) -> (u64, u64) {
 
 // ---------------------------------------------------------------- map
 
-/// Open-addressing map from a key (never 0) to a small copyable value.
+/// Open-addressing map from a key (never 0) to a small copyable value. Key
+/// and value share a slot, so a lookup touches one cache line.
 pub struct KMap<V: Copy> {
-    keys: Vec<Key>,
-    vals: Vec<V>,
+    slots: Vec<(Key, V)>,
     mask: usize,
     len: usize,
     dflt: V,
 }
 
 impl<V: Copy> KMap<V> {
+    /// Room for `n` entries at no more than 3/4 full.
     pub fn with_capacity(n: usize, dflt: V) -> Self {
-        let cap = (n.max(4) * 2).next_power_of_two();
-        KMap {
-            keys: vec![0; cap],
-            vals: vec![dflt; cap],
-            mask: cap - 1,
-            len: 0,
-            dflt,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn clear(&mut self) {
-        if self.len > 0 {
-            self.keys.iter_mut().for_each(|k| *k = 0);
-            self.len = 0;
-        }
-    }
-
-    /// Clear and make sure `n` entries fit without growing.
-    pub fn reset(&mut self, n: usize) {
-        let cap = (n.max(4) * 2).next_power_of_two();
-        if cap != self.keys.len() {
-            self.keys = vec![0; cap];
-            self.vals = vec![self.dflt; cap];
-            self.mask = cap - 1;
-            self.len = 0;
-        } else {
-            self.clear();
-        }
+        let cap = (n.max(4) * 4 / 3 + 1).next_power_of_two();
+        KMap { slots: vec![(0, dflt); cap], mask: cap - 1, len: 0, dflt }
     }
 
     #[inline(always)]
     pub fn get(&self, k: Key) -> Option<V> {
         let mut i = (hash64(k) as usize) & self.mask;
         loop {
-            let kk = unsafe { *self.keys.get_unchecked(i) };
+            let (kk, v) = unsafe { *self.slots.get_unchecked(i) };
             if kk == k {
-                return Some(unsafe { *self.vals.get_unchecked(i) });
+                return Some(v);
             }
             if kk == 0 {
                 return None;
@@ -171,60 +142,35 @@ impl<V: Copy> KMap<V> {
     }
 
     fn grow(&mut self) {
-        let cap = self.keys.len() * 2;
-        let old_keys = std::mem::replace(&mut self.keys, vec![0; cap]);
-        let old_vals = std::mem::replace(&mut self.vals, vec![self.dflt; cap]);
+        let cap = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![(0, self.dflt); cap]);
         self.mask = cap - 1;
-        for (k, v) in old_keys.into_iter().zip(old_vals) {
+        for (k, v) in old {
             if k != 0 {
                 let mut i = (hash64(k) as usize) & self.mask;
-                while self.keys[i] != 0 {
+                while self.slots[i].0 != 0 {
                     i = (i + 1) & self.mask;
                 }
-                self.keys[i] = k;
-                self.vals[i] = v;
+                self.slots[i] = (k, v);
             }
         }
     }
 
     /// Returns the value already stored for `k`, or stores and returns `v`.
-    #[inline(always)]
     pub fn get_or_insert(&mut self, k: Key, v: V) -> V {
-        if (self.len + 1) * 2 > self.keys.len() {
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
             self.grow();
         }
         let mut i = (hash64(k) as usize) & self.mask;
         loop {
-            let kk = unsafe { *self.keys.get_unchecked(i) };
+            let (kk, vv) = self.slots[i];
             if kk == k {
-                return unsafe { *self.vals.get_unchecked(i) };
+                return vv;
             }
             if kk == 0 {
-                self.keys[i] = k;
-                self.vals[i] = v;
+                self.slots[i] = (k, v);
                 self.len += 1;
                 return v;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-
-    pub fn set(&mut self, k: Key, v: V) {
-        if (self.len + 1) * 2 > self.keys.len() {
-            self.grow();
-        }
-        let mut i = (hash64(k) as usize) & self.mask;
-        loop {
-            let kk = self.keys[i];
-            if kk == k {
-                self.vals[i] = v;
-                return;
-            }
-            if kk == 0 {
-                self.keys[i] = k;
-                self.vals[i] = v;
-                self.len += 1;
-                return;
             }
             i = (i + 1) & self.mask;
         }

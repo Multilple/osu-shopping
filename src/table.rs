@@ -1,7 +1,6 @@
 //! Shared structures: the concurrent ID table (which is also the union-find
 //! over linked IDs), and arena-backed append-only buckets.
 
-use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 
 use crate::util::*;
@@ -27,8 +26,8 @@ pub fn map_anon(bytes: usize) -> *mut u8 {
 pub const RBITS: usize = 12;
 pub const RSIZE: usize = 1 << RBITS;
 const RMASK: usize = RSIZE - 1;
-/// A region holding more IDs than this is treated as overflowing.
-const RLIMIT: u16 = (RSIZE * 13 / 16) as u16;
+/// In a slot's high key word: the slot is being written.
+const BUSY: u64 = u64::MAX;
 
 #[repr(C, align(32))]
 pub struct Slot {
@@ -39,20 +38,11 @@ pub struct Slot {
 }
 
 /// Every user ID seen, each in a fixed slot. The table is split into regions
-/// of 4096 slots; an ID hashes to a region and probes inside it. Lookups are
-/// lock-free; inserts take the region's lock.
-/// A region's insert lock and fill count, on a cache line of their own so
-/// threads inserting into different regions do not contend.
-#[repr(align(64))]
-struct Region {
-    lock: AtomicBool,
-    count: UnsafeCell<u16>,
-}
-
+/// of 4096 slots; an ID hashes to a region and probes inside it. Lookups and
+/// inserts are lock-free.
 pub struct IdTable {
     slots: *mut Slot,
     pub nregions: usize,
-    regions: Vec<Region>,
     pub overflow: AtomicBool,
 }
 
@@ -65,14 +55,13 @@ impl IdTable {
         IdTable {
             slots: map_anon(nregions * RSIZE * std::mem::size_of::<Slot>()) as *mut Slot,
             nregions,
-            regions: (0..nregions).map(|_| Region { lock: AtomicBool::new(false), count: UnsafeCell::new(0) }).collect(),
             overflow: AtomicBool::new(false),
         }
     }
 
-    /// IDs in the table (call between stages only).
+    /// IDs in the table (diagnostics; call between stages only).
     pub fn len(&self) -> usize {
-        self.regions.iter().map(|r| unsafe { *r.count.get() } as usize).sum()
+        (0..self.nregions * RSIZE).filter(|&i| self.slot(i).hi.load(Relaxed) != 0).count()
     }
 
     #[inline(always)]
@@ -107,47 +96,49 @@ impl IdTable {
             if hi == khi && s.lo.load(Relaxed) == klo {
                 return (base | pos) as u32;
             }
-            if hi == 0 {
-                break;
+            if hi == 0 || hi == BUSY {
+                return self.insert(klo, khi, base, pos, start);
             }
             pos = (pos + 1) & RMASK;
         }
-        self.insert(klo, khi, base, start)
     }
 
+    /// Continue a probe at an empty or half-written slot. A slot is claimed by
+    /// swapping BUSY into the key's high word (which is never 0 or BUSY for a
+    /// real key); the real high word goes in last, so a reader that sees it
+    /// sees the whole slot. No locks: a thread that stalls mid-insert holds up
+    /// only readers of that one slot.
     #[cold]
     #[inline(never)]
-    fn insert(&self, klo: u64, khi: u64, base: usize, start: usize) -> u32 {
-        let region = base >> RBITS;
-        let lock = &self.regions[region].lock;
-        while lock.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
-            std::hint::spin_loop();
-        }
-        let mut pos = start;
-        let found = loop {
+    fn insert(&self, klo: u64, khi: u64, base: usize, mut pos: usize, start: usize) -> u32 {
+        loop {
             let s = self.slot(base | pos);
-            let hi = s.hi.load(Relaxed);
-            if hi == khi && s.lo.load(Relaxed) == klo {
-                break (base | pos) as u32;
-            }
+            let mut hi = s.hi.load(Acquire);
             if hi == 0 {
-                let count = unsafe { &mut *self.regions[region].count.get() };
-                if *count >= RLIMIT {
-                    self.overflow.store(true, Relaxed);
-                    break base as u32;
+                match s.hi.compare_exchange(0, BUSY, Acquire, Acquire) {
+                    Ok(_) => {
+                        s.root.store((base | pos) as u32, Relaxed);
+                        s.lo.store(klo, Relaxed);
+                        s.hi.store(khi, Release);
+                        return (base | pos) as u32;
+                    }
+                    Err(now) => hi = now,
                 }
-                *count += 1;
-                // The key's high word (never 0: it holds the length) goes
-                // last: a reader that sees it sees the rest.
-                s.root.store((base | pos) as u32, Relaxed);
-                s.lo.store(klo, Relaxed);
-                s.hi.store(khi, Release);
-                break (base | pos) as u32;
+            }
+            while hi == BUSY {
+                std::hint::spin_loop();
+                hi = s.hi.load(Acquire);
+            }
+            if hi == khi && s.lo.load(Relaxed) == klo {
+                return (base | pos) as u32;
             }
             pos = (pos + 1) & RMASK;
-        };
-        lock.store(false, Release);
-        found
+            // A probe this long means the table was sized far too small.
+            if pos.wrapping_sub(start) & RMASK >= RSIZE / 4 {
+                self.overflow.store(true, Relaxed);
+                return base as u32;
+            }
+        }
     }
 
     #[inline(always)]

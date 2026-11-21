@@ -31,7 +31,6 @@ use util::*;
 
 const DEAD: u64 = u64::MAX;
 const TAG: u64 = 1 << 63;
-const FLAG: u64 = 1 << 62;
 const H2_SHIFT: u32 = 42;
 const H2_MASK: u64 = 0xF_FFFF;
 const IDX_BITS: u32 = 26;
@@ -299,14 +298,12 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     let next = AtomicUsize::new(0);
     par(threads, |_| {
         let mut table: Vec<u64> = Vec::new();
-        let mut dups: Vec<Slim> = Vec::new();
-        let mut members: Vec<(u32, u64)> = Vec::new();
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
             if p >= 1 << ctx.pbits {
                 break;
             }
-            dedup_bucket(p, &outs_ref, &mut table, &mut dups, &mut members);
+            dedup_bucket(p, &outs_ref, &mut table);
         }
     });
     lap("dedup");
@@ -468,7 +465,7 @@ fn load_aux(data: &Path) -> Aux {
     }
 
     let campaigns_raw = read_file(&data.join("campaigns.csv"));
-    let mut campaigns = KMap::with_capacity(4096, 0u32);
+    let mut campaigns = KMap::with_capacity(2048, 0u32);
     let mut camp_names = Vec::new();
     let mut camp_channel = Vec::new();
     for line in data_lines(&campaigns_raw) {
@@ -559,11 +556,10 @@ fn parse_links(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Threa
 #[derive(Clone, Copy)]
 struct PendE {
     user: Key,
-    uh: u64,
     ev: u64,
     h: u64,
-    h2: u64,
-    ingest: u32,
+    /// The extra hash bits in place, and the ingest time in the low 32 bits.
+    x: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -604,9 +600,8 @@ fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev
     let ingest = ingest32(ctx, ing);
     match ev {
         Some(ev) => {
-            let uh = hash64(user);
-            ctx.ids.prefetch(uh);
-            out.pend_e.push(PendE { user, uh, ev, h, h2, ingest });
+            ctx.ids.prefetch(hash64(user));
+            out.pend_e.push(PendE { user, ev, h, x: (h2 << H2_SHIFT) | ingest as u64 });
             if out.pend_e.len() == PEND {
                 flush_events(ctx, out, tid);
             }
@@ -622,13 +617,13 @@ fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev
 #[cfg_attr(not(feature = "prof"), inline(always))]
 fn flush_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
     for i in 0..out.pend_e.len() {
-        let pe = out.pend_e[i];
-        let person = ctx.ids.root(ctx.ids.get_or_insert(pe.user, pe.uh));
+        let pe = unsafe { *out.pend_e.get_unchecked(i) };
+        let person = ctx.ids.root(ctx.ids.get_or_insert(pe.user, hash64(pe.user)));
         let q = (person >> ctx.qshift) as usize;
-        let idx = out.ev.push(q, Ev { ev: pe.ev, person, ingest: pe.ingest }, &mut out.arena);
+        let idx = out.ev.push(q, Ev { ev: pe.ev, person, ingest: pe.x as u32 }, &mut out.arena);
         assert!(idx < 1 << IDX_BITS, "bucket too large");
         let p = (pe.h >> (64 - ctx.pbits)) as usize;
-        let x = (pe.h2 << H2_SHIFT) | ((tid as u64) << (IDX_BITS + Q_BITS)) | ((q as u64) << IDX_BITS) | idx as u64;
+        let x = (pe.x & (H2_MASK << H2_SHIFT)) | ((tid as u64) << (IDX_BITS + Q_BITS)) | ((q as u64) << IDX_BITS) | idx as u64;
         out.slim.push(p, Slim { h: pe.h, x }, &mut out.arena);
     }
     out.pend_e.clear();
@@ -801,7 +796,7 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
 
 // ====================================================================== dedup
 
-fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>, dups: &mut Vec<Slim>, members: &mut Vec<(u32, u64)>) {
+fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
     const EMPTY: u64 = u64::MAX;
     let n: usize = outs.iter().map(|o| o.slim.len(p)).sum();
     if n < 2 {
@@ -811,9 +806,21 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>, dups: &mut 
     table.clear();
     table.resize(cap, EMPTY);
     let mask = cap - 1;
-    dups.clear();
-    // The table holds 32 bits of each hash and where its line's note is.
+    // The table holds, per event ID seen so far, 32 bits of its hash and
+    // where the note of its kept copy (smallest ingest_ts so far) is.
     let note = |r: u32| -> *mut Slim { outs[(r >> IDX_BITS) as usize].slim.at(p, (r & ((1 << IDX_BITS) - 1)) as usize) };
+    let ev_at = |x: u64| -> *mut Ev {
+        let t = (x >> (IDX_BITS + Q_BITS)) as usize & ((1 << T_BITS) - 1);
+        let q = (x >> IDX_BITS) as usize & ((1 << Q_BITS) - 1);
+        outs[t].ev.at(q, (x & ((1 << IDX_BITS) - 1)) as usize)
+    };
+    let ingest = |x: u64| -> u32 { if x & TAG != 0 { x as u32 } else { unsafe { (*ev_at(x)).ingest } } };
+    // A copy that is not the kept one goes (invalid copies have no event to drop).
+    let drop_copy = |x: u64| {
+        if x & TAG == 0 {
+            unsafe { (*ev_at(x)).ev = DEAD };
+        }
+    };
     for (t, o) in outs.iter().enumerate() {
         let mut idx = (t as u32) << IDX_BITS;
         for (ptr, len) in o.slim.pieces(p) {
@@ -828,16 +835,18 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>, dups: &mut 
                         break;
                     }
                     if (v >> 32) as u32 == tag {
-                        let first = note(v as u32);
-                        unsafe {
-                            if (*first).h == s.h {
-                                if (*first).x & FLAG == 0 {
-                                    dups.push(*first);
-                                    (*first).x |= FLAG;
-                                }
-                                dups.push(s);
-                                break;
+                        let kept = unsafe { *note(v as u32) };
+                        // Copies of one event share the hash and the 20 extra hash bits.
+                        if kept.h == s.h && ((kept.x ^ s.x) >> H2_SHIFT) & H2_MASK == 0 {
+                            // The copy with the smallest ingest_ts is kept, valid or
+                            // not; copies with equal ingest_ts are identical.
+                            if ingest(s.x) < ingest(kept.x) {
+                                drop_copy(kept.x);
+                                unsafe { *table.get_unchecked_mut(i) = ((tag as u64) << 32) | idx as u64 };
+                            } else {
+                                drop_copy(s.x);
                             }
+                            break;
                         }
                     }
                     i = (i + 1) & mask;
@@ -845,39 +854,6 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>, dups: &mut 
                 idx += 1;
             }
         }
-    }
-    if dups.is_empty() {
-        return;
-    }
-    // Copies of one event share the hash and the 20 extra hash bits.
-    let id = |s: &Slim| (s.h, (s.x >> H2_SHIFT) & H2_MASK);
-    dups.sort_unstable_by_key(id);
-    let ev_at = |x: u64| -> *mut Ev {
-        let t = (x >> (IDX_BITS + Q_BITS)) as usize & ((1 << T_BITS) - 1);
-        let q = (x >> IDX_BITS) as usize & ((1 << Q_BITS) - 1);
-        outs[t].ev.at(q, (x & ((1 << IDX_BITS) - 1)) as usize)
-    };
-    let mut i = 0;
-    while i < dups.len() {
-        let mut j = i + 1;
-        while j < dups.len() && id(&dups[j]) == id(&dups[i]) {
-            j += 1;
-        }
-        // (ingest, x) for every copy of this event.
-        members.clear();
-        for s in &dups[i..j] {
-            let ingest = if s.x & TAG != 0 { s.x as u32 } else { unsafe { (*ev_at(s.x)).ingest } };
-            members.push((ingest, s.x));
-        }
-        // The copy with the smallest ingest_ts is the kept one: every other
-        // valid copy goes, and if the kept copy is invalid nothing survives.
-        let keep = (0..members.len()).min_by_key(|&m| members[m].0).unwrap();
-        for (m, &(_, x)) in members.iter().enumerate() {
-            if m != keep && x & TAG == 0 {
-                unsafe { (*ev_at(x)).ev = DEAD };
-            }
-        }
-        i = j;
     }
 }
 
@@ -931,6 +907,9 @@ struct Tl {
     nd: usize,
     day0: i32,
     organic: usize,
+    /// Per campaign: the last session (by serial number) it was counted for.
+    stamp: Vec<u32>,
+    serial: u32,
     prof: [f64; 12],
 }
 
@@ -956,6 +935,8 @@ impl Tl {
             nd: ctx.nd,
             day0: ctx.day0 as i32,
             organic: ctx.aux.camp_names.len(),
+            stamp: vec![0; ctx.aux.camp_names.len() + 1],
+            serial: 0,
             prof: [0.0; 12],
         }
     }
@@ -1121,6 +1102,38 @@ fn person(who: Key, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
         }
     }
     let cks = &cks[..nc];
+    if tl.sess.len() * nc <= 4096 {
+        // The common, small case: per session, walk the clicks in the 7 days
+        // up to its start. The latest credits it; each campaign among them
+        // assists it once (`stamp` remembers which were already counted).
+        let (sess, stamp, cells) = (&tl.sess, &mut tl.stamp, &mut tl.cells);
+        let mut serial = tl.serial;
+        let (mut lo, mut hi) = (0usize, 0usize);
+        for s in sess {
+            while hi < nc && cks[hi].ts <= s.start {
+                hi += 1;
+            }
+            while lo < hi && s.start - cks[lo].ts > WEEK {
+                lo += 1;
+            }
+            let day = s.day as usize;
+            let camp = if lo < hi { cks[hi - 1].camp as usize } else { organic };
+            let cell = camp * nd + day;
+            cells.sessions[cell] += 1;
+            cells.purch[cell] += s.purch as u32;
+            cells.rev[cell] += s.rev;
+            serial += 1;
+            for c in &cks[lo..hi] {
+                let camp = c.camp as usize;
+                if stamp[camp] != serial {
+                    stamp[camp] = serial;
+                    cells.assisted[camp * nd + day] += 1;
+                }
+            }
+        }
+        tl.serial = serial;
+        return;
+    }
     let mut hi = 0;
     for s in &tl.sess {
         while hi < nc && cks[hi].ts <= s.start {
@@ -1133,23 +1146,15 @@ fn person(who: Key, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
         tl.cells.rev[cell] += s.rev;
     }
 
-    // ---- assists: per campaign, the union of [click, click + 7 days] over
-    // its clicks; every session starting inside is assisted once.
+    // ---- assists for a person with many sessions and clicks: per campaign,
+    // the union of [click, click + 7 days] over its clicks; every session
+    // starting inside is assisted once.
     tl.tmp.clear();
     tl.tmp.extend(cks.iter().map(|c| ((c.camp as u64) << 32) | c.ts as u64));
-    if nc > 1 {
-        tl.tmp.sort_unstable();
-    }
+    tl.tmp.sort_unstable();
     let sess = &tl.sess;
     let assisted = &mut tl.cells.assisted;
-    let few = sess.len() <= 12;
     let mut flush = |camp: usize, a: u32, b: u32| {
-        if few {
-            for s in sess.iter() {
-                assisted[camp * nd + s.day as usize] += (s.start.wrapping_sub(a) <= b - a) as u32;
-            }
-            return;
-        }
         let lo = sess.partition_point(|s| s.start < a);
         let hi = lo + sess[lo..].partition_point(|s| s.start <= b);
         if hi - lo <= 8 {
