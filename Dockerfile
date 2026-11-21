@@ -10,5 +10,5 @@ FROM scratch
 COPY --from=build /src/target/release/ss /ss
 USER 1000:1000
 # Diagnostic build: the run time is padded to report measurements (see SS_DIAG in src/main.rs).
-ENV SS_AB="SS_NQ=250;SS_PB=8"
+ENV SS_AB="SS_SIMPLE=1,SS_QUEUE=1"
 CMD ["/ss"]

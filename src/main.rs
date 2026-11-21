@@ -117,6 +117,7 @@ struct ThreadOut {
     slim: SlimStreams,
     dates: fast::Dates,
     reader: input::Reader,
+    simple: bool,
     /// How far ahead of the line being parsed to ask for input bytes
     /// (0: the input is in a buffer that is in cache already).
     ahead: usize,
@@ -347,6 +348,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
                 dates: fast::Dates::new(),
                 reader: input::Reader::new(chunk),
                 ahead: 0,
+                simple: std::env::var_os("SS_SIMPLE").is_some(),
                 pend_e: vec![PendE::default(); 2 * HALF].into_boxed_slice(),
                 cur: 0,
                 npe: 0,
@@ -981,6 +983,30 @@ fn flush_half(ctx: &Ctx, out: &mut ThreadOut, tid: usize, h: usize, last: bool) 
             acc = acc.wrapping_add(pe.first as u64 + pe.h + pe.x + pe.ev);
         }
         std::hint::black_box(acc);
+        out.cnt[h] = 0;
+        return;
+    }
+    if out.simple {
+        // Experiment (SS_SIMPLE=1): no second chance for a lookup that
+        // misses its first line; it is finished at once.
+        for i in 0..n {
+            let pe = unsafe { &mut *pend.add(i) };
+            pe.first = match ctx.ids.peek(pe.ulo, pe.uhi, pe.first) {
+                Some(slot) => ctx.ids.root(slot),
+                None => ctx.ids.root(ctx.ids.get_or_insert_at(pe.ulo, pe.uhi, pe.first)),
+            };
+        }
+        for i in 0..n {
+            let pe = unsafe { *pend.add(i) };
+            let person = pe.first;
+            let q = (person >> ctx.qshift) as usize;
+            let idx = out.ev.push16(q, pe.ev, person as u64 | (pe.x << 32), &mut out.arena);
+            assert!(idx < 1 << IDX_BITS, "bucket too large");
+            let p = (pe.h >> (64 - ctx.pbits)) as usize;
+            let x = (pe.x & (H2_MASK << H2_SHIFT)) | here | ((q as u64) << IDX_BITS) | idx as u64;
+            out.slim.push16(p, pe.h, x, &mut out.arena_slim);
+        }
+        out.held[h] = 0;
         out.cnt[h] = 0;
         return;
     }
