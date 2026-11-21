@@ -148,6 +148,7 @@ impl Pool {
     }
 
     fn work(&self, tid: usize) -> ! {
+        crate::alloc::pregrow();
         let mut seen = 0u32;
         loop {
             if !spin(|| self.gen.load(Acquire) != seen, self.budget) {

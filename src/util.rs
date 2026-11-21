@@ -211,6 +211,8 @@ pub mod sys {
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
     pub const MADV_DONTNEED: i32 = 4;
     pub const MADV_HUGEPAGE: i32 = 14;
+    pub const M_TRIM_THRESHOLD: i32 = -1;
+    pub const M_TOP_PAD: i32 = -2;
     pub const M_MMAP_THRESHOLD: i32 = -3;
     extern "C" {
         pub fn mallopt(param: i32, value: i32) -> i32;

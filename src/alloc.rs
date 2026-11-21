@@ -2,11 +2,16 @@
 //!
 //! The system allocator takes a big block from the kernel in 4 KB pages (a
 //! fault for each on first use) and hands it back when it is freed, so that
-//! the next one pays again. Here, blocks of 64 KB and more are cut from
-//! 64 MB stretches the kernel is asked to back with 2 MB pages, in
-//! power-of-two sizes; a freed block waits in its size's list for the next
-//! request. The biggest ones (over 32 MB) are mapped on their own and given
-//! back when freed. Everything smaller goes to the system allocator.
+//! the next one pays again. Here, blocks of 64 KB and more are cut, in
+//! power-of-two sizes, from one stretch of address space that the kernel is
+//! asked for once, to be backed with 2 MB pages as it is touched; a freed
+//! block waits in its size's list for the next request. Everything smaller
+//! goes to the system allocator.
+//!
+//! The arenas and tables take their memory from the same stretch (`region`).
+//! So once the run is under way no thread asks the kernel to map or unmap
+//! anything, except the one that gives the input files back: such calls
+//! wait for one another, and that one is long.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::UnsafeCell;
@@ -18,18 +23,22 @@ use crate::util::sys;
 /// Requests of this size and more are served here.
 const MIN: usize = 1 << 16;
 const MIN_BITS: u32 = 16;
-/// The sizes blocks come in: `MIN << c` for `c` below this.
-const CLASSES: usize = 10;
+/// The sizes blocks come in: `MIN << c` for `c` below this (up to 1 GB).
+const CLASSES: usize = 15;
 /// The biggest of them.
 const TOP: usize = MIN << (CLASSES - 1);
 const HUGE: usize = 2 << 20;
-/// What is asked of the kernel at a time for the blocks.
+/// The address space asked of the kernel at the start, and what is asked
+/// for at a time should that be used up (or refused).
+const RESERVE: usize = 32 << 30;
 const STRETCH: usize = 64 << 20;
 
 struct State {
     /// The unused rest of the current stretch.
     cur: usize,
     end: usize,
+    /// The reservation has been asked for.
+    asked: bool,
     /// By size class: the freed blocks, each holding the address of the next.
     free: [usize; CLASSES],
 }
@@ -70,8 +79,36 @@ unsafe fn map(bytes: usize) -> usize {
     if tail > 0 {
         sys::munmap((a + bytes) as *mut c_void, tail);
     }
-    sys::madvise(a as *mut c_void, bytes, sys::MADV_HUGEPAGE);
+    if std::env::var_os("SS_NOHUGE").is_none() {
+        sys::madvise(a as *mut c_void, bytes, sys::MADV_HUGEPAGE);
+    }
     a
+}
+
+/// `bytes` of never used (zero) memory at a multiple of `align`, from the
+/// stretch in use; with the lock held. 0 if the kernel gives none.
+unsafe fn carve(st: &mut State, bytes: usize, align: usize) -> usize {
+    if !st.asked {
+        st.asked = true;
+        let r = map(RESERVE);
+        if r != 0 {
+            st.cur = r;
+            st.end = r + RESERVE;
+        }
+    }
+    let at = (st.cur + align - 1) & !(align - 1);
+    if st.cur != 0 && at + bytes <= st.end {
+        st.cur = at + bytes;
+        return at;
+    }
+    // Used up (or never given): another stretch, which starts on a 2 MB boundary.
+    let size = whole(bytes).max(STRETCH);
+    let s = map(size);
+    if s != 0 {
+        st.cur = s + bytes;
+        st.end = s + size;
+    }
+    s
 }
 
 #[inline(always)]
@@ -81,7 +118,7 @@ fn whole(size: usize) -> usize {
 
 impl Big {
     pub const fn new() -> Big {
-        Big { busy: AtomicBool::new(false), st: UnsafeCell::new(State { cur: 0, end: 0, free: [0; CLASSES] }) }
+        Big { busy: AtomicBool::new(false), st: UnsafeCell::new(State { cur: 0, end: 0, asked: false, free: [0; CLASSES] }) }
     }
 
     #[inline(always)]
@@ -111,19 +148,18 @@ impl Big {
             self.unlock();
             return (p as *mut u8, false);
         }
-        if st.cur + bytes > st.end {
-            let s = map(STRETCH);
-            if s == 0 {
-                self.unlock();
-                return (std::ptr::null_mut(), true);
-            }
-            st.cur = s;
-            st.end = s + STRETCH;
-        }
-        let p = st.cur;
-        st.cur += bytes;
+        let p = carve(st, bytes, MIN);
         self.unlock();
         (p as *mut u8, true)
+    }
+
+    /// `bytes` (rounded up to 2 MB) of zero memory on a 2 MB boundary, for
+    /// good: for the arenas and tables, which give pages back themselves.
+    pub fn region(&self, bytes: usize) -> *mut u8 {
+        let st = self.lock();
+        let p = unsafe { carve(st, whole(bytes), HUGE) };
+        self.unlock();
+        p as *mut u8
     }
 
     unsafe fn give(&self, p: *mut u8, size: usize) {
@@ -195,5 +231,19 @@ unsafe impl GlobalAlloc for Big {
             self.dealloc(p, l);
         }
         q
+    }
+}
+
+/// Make the calling thread's part of the system allocator big now (address
+/// space only: nothing is touched), so that its small blocks later come
+/// without a call to the kernel.
+pub fn pregrow() {
+    const AHEAD: usize = 24 << 20;
+    unsafe {
+        let l = Layout::from_size_align_unchecked(AHEAD, 16);
+        let p = System.alloc(l);
+        if !p.is_null() {
+            System.dealloc(p, l);
+        }
     }
 }

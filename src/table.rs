@@ -6,25 +6,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use crate::util::*;
 
 /// Fresh zeroed memory, starting on a 2 MB boundary so that all of it can
-/// be backed by huge pages.
+/// be backed by huge pages: cut from the address space the allocator holds
+/// (no call to the kernel, see `alloc`).
 pub fn map_anon(bytes: usize) -> *mut u8 {
-    const HUGE: usize = 2 << 20;
-    unsafe {
-        let p = sys::mmap(
-            std::ptr::null_mut(),
-            bytes + HUGE,
-            sys::PROT_READ | sys::PROT_WRITE,
-            sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
-            -1,
-            0,
-        );
-        assert!(p != sys::MAP_FAILED, "mmap of {bytes} bytes failed");
-        let p = ((p as usize + HUGE - 1) & !(HUGE - 1)) as *mut std::ffi::c_void;
-        if std::env::var_os("SS_NOHUGE").is_none() {
-            sys::madvise(p, bytes, sys::MADV_HUGEPAGE);
-        }
-        p as *mut u8
-    }
+    let p = crate::BIG.region(bytes);
+    assert!(!p.is_null(), "no memory for {bytes} bytes");
+    p
 }
 
 // ---------------------------------------------------------------- ID table

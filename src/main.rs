@@ -38,7 +38,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
 #[global_allocator]
-static BIG: alloc::Big = alloc::Big::new();
+pub(crate) static BIG: alloc::Big = alloc::Big::new();
 
 use parquet::{Column, Logical};
 use table::*;
@@ -207,14 +207,20 @@ fn main() {
     if !lab::is_child() {
         lab::main(threads);
     }
+    // The system allocator serves only the small blocks (see alloc.rs), and
+    // must not go to the kernel for them once the run is under way: its
+    // heaps never shrink, and each thread's grows far ahead at the start.
+    unsafe {
+        sys::mallopt(sys::M_MMAP_THRESHOLD, 32 << 20);
+        sys::mallopt(sys::M_TRIM_THRESHOLD, i32::MAX);
+        sys::mallopt(sys::M_TOP_PAD, 16 << 20);
+    }
+    alloc::pregrow();
     // The worker threads start now, while the setup runs.
     pool::warm(threads);
     SUM_ON.store(std::env::var_os("SS_SUM").is_some(), Relaxed);
     // The ID table is sized from the input's size; if that guess is ever too
     // small, start over with a bigger one.
-    // Large buffers always get their own mapping, so growing one remaps it
-    // instead of copying it.
-    unsafe { sys::mallopt(sys::M_MMAP_THRESHOLD, 1 << 18) };
     #[cfg(feature = "sprof")]
     sprof::start();
     // SS_AB="NAME=value,...[;NAME=value,...]": do the whole job as usual (A)
