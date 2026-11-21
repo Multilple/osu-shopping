@@ -394,9 +394,17 @@ impl Arena {
     }
 }
 
+/// How many cache lines of each stream's items wait before they are moved
+/// out together. (The move is a branch that cannot be predicted: with two
+/// lines it comes half as often as with one.)
+#[cfg(not(feature = "stage1"))]
+const SL: usize = 2;
+#[cfg(feature = "stage1")]
+const SL: usize = 1;
+
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct Line([u8; 64]);
+struct Line([u8; 64 * SL]);
 
 /// Many append-only lists of `T` (a power-of-two size dividing 64), each
 /// stored in chunks of `1 << CB` items. Items are staged one cache line at a
@@ -417,9 +425,9 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
     const PER_LINE: usize = 64 / std::mem::size_of::<T>();
 
     pub fn new(streams: usize) -> Self {
-        assert!(64 % std::mem::size_of::<T>() == 0 && (1usize << CB) % Self::PER_LINE == 0);
+        assert!(64 % std::mem::size_of::<T>() == 0 && (1usize << CB) % (Self::PER_LINE * SL) == 0);
         Streams {
-            lines: vec![Line([0; 64]); streams],
+            lines: vec![Line([0; 64 * SL]); streams],
             n: vec![0; streams],
             dst: vec![std::ptr::null_mut(); streams],
             chunks: (0..streams).map(|_| Vec::new()).collect(),
@@ -453,21 +461,24 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
         debug_assert!(std::mem::size_of::<T>() == 16);
         unsafe {
             use core::arch::x86_64::*;
+            const PER: usize = 4 * SL;
             let n = *self.n.get_unchecked(s) as usize;
-            let r = n & 3;
+            let r = n & (PER - 1);
             let line = self.lines.as_mut_ptr().add(s) as *mut u64;
             *self.n.get_unchecked_mut(s) = (n + 1) as u32;
-            if r == 3 {
-                if (n - 3) & ((1 << CB) - 1) == 0 {
+            if r == PER - 1 {
+                if (n + 1 - PER) & ((1 << CB) - 1) == 0 {
                     self.new_chunk(s, arena);
                 }
                 let d = *self.dst.get_unchecked(s) as *mut __m256i;
-                let lo = _mm256_load_si256(line as *const __m256i);
-                let third = _mm_load_si128(line.add(4) as *const __m128i);
+                let src = line as *const __m256i;
+                for k in 0..2 * SL - 1 {
+                    _mm256_stream_si256(d.add(k), _mm256_load_si256(src.add(k)));
+                }
+                let third = _mm_load_si128(line.add(2 * PER - 4) as *const __m128i);
                 let hi = _mm256_inserti128_si256(_mm256_castsi128_si256(third), _mm_set_epi64x(b as i64, a as i64), 1);
-                _mm256_stream_si256(d, lo);
-                _mm256_stream_si256(d.add(1), hi);
-                *self.dst.get_unchecked_mut(s) = d.add(2) as *mut T;
+                _mm256_stream_si256(d.add(2 * SL - 1), hi);
+                *self.dst.get_unchecked_mut(s) = d.add(2 * SL) as *mut T;
             } else {
                 *line.add(2 * r) = a;
                 *line.add(2 * r + 1) = b;
@@ -509,7 +520,9 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
     pub fn finish(&mut self, arena: &mut Arena) {
         for s in 0..self.n.len() {
             let n = self.n[s] as usize;
-            let r = n & (Self::PER_LINE - 1);
+            // (16-byte items wait `SL` lines at a time, the others one.)
+            let per = if std::mem::size_of::<T>() == 16 { Self::PER_LINE * SL } else { Self::PER_LINE };
+            let r = n & (per - 1);
             for k in 0..r {
                 let v = unsafe { *(self.lines.as_ptr().add(s) as *const T).add(k) };
                 let d = self.dest(s, n - r + k, arena);
