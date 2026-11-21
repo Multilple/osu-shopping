@@ -725,7 +725,10 @@ fn build_ctx(data: &Path, event_bytes: usize, click_bytes: usize, link_bytes: us
     // (see `main`).
     let event_lines = event_bytes / 64 + 1;
     let ids_guess = event_lines / 8 + click_bytes / 512 + link_bytes / 64 + 1024;
-    let nregions = ((ids_guess * scale).div_ceil(RSIZE)).max(4);
+    // SS_SCALE_DIV=n (to test that route): the first table is n times too
+    // small, down to a single region.
+    let div = env_usize("SS_SCALE_DIV", 1).max(1);
+    let nregions = ((ids_guess * scale / div).div_ceil(RSIZE)).max(if div > 1 { 1 } else { 4 });
     // Person buckets: up to 640, or more for very large inputs so that a
     // bucket stays under roughly 100k events (it should fit a core's share
     // of the cache while its people are put together).
