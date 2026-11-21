@@ -32,6 +32,10 @@ pub fn map_anon(bytes: usize) -> *mut u8 {
 pub const RBITS: usize = 12;
 pub const RSIZE: usize = 1 << RBITS;
 const RMASK: usize = RSIZE - 1;
+/// How far from its home slot an ID may be put, or looked for. At the load
+/// the table is sized for, an ID is a few slots from home; a walk this long
+/// means the table is too small for the input (see `IdTable::overflow`).
+const REACH: usize = RSIZE / 4;
 /// In a slot's high key word: the slot is being written.
 const BUSY: u64 = u64::MAX;
 
@@ -49,6 +53,10 @@ pub struct Slot {
 pub struct IdTable {
     slots: *mut Slot,
     pub nregions: usize,
+    /// Set once an ID has found no place in its region. From then on a
+    /// lookup may answer with a slot that is not the ID's: whoever fills
+    /// the table must look at this flag, stop, and start over with a bigger
+    /// table before anything read from this one is used.
     pub overflow: AtomicBool,
 }
 
@@ -181,12 +189,20 @@ impl IdTable {
         self.probe(klo, khi, base, start)
     }
 
+    /// Look for the key from `start` on, slot by slot, and insert it at the
+    /// first free one. The walk ends `REACH` slots from `start` at the
+    /// latest: a region with no free slot left would otherwise be walked
+    /// round and round for ever by a key that is not in it.
     #[cold]
     #[inline(never)]
     fn probe(&self, klo: u64, khi: u64, base: usize, start: usize) -> u32 {
+        // (`base` is a multiple of RSIZE and `pos` stays below RSIZE: slot
+        // `base | pos` is the region's slot number `pos`.)
+        let region = unsafe { self.slots.add(base) };
+        let stop = (start + REACH) & RMASK;
         let mut pos = start;
         loop {
-            let s = self.slot(base | pos);
+            let s = unsafe { &*region.add(pos) };
             let hi = s.hi.load(Acquire);
             if hi == khi && s.lo.load(Relaxed) == klo {
                 return (base | pos) as u32;
@@ -195,7 +211,20 @@ impl IdTable {
                 return self.insert(klo, khi, base, pos, start);
             }
             pos = (pos + 1) & RMASK;
+            if pos == stop {
+                return self.full(base);
+            }
         }
+    }
+
+    /// The key has no place within `REACH` slots of its home: the table was
+    /// sized far too small. The run that owns the table must be given up
+    /// (it checks `overflow`); what is returned is only some slot's number.
+    #[cold]
+    #[inline(never)]
+    fn full(&self, base: usize) -> u32 {
+        self.overflow.store(true, Relaxed);
+        base as u32
     }
 
     /// Continue a probe at an empty or half-written slot. A slot is claimed by
@@ -228,10 +257,8 @@ impl IdTable {
                 return (base | pos) as u32;
             }
             pos = (pos + 1) & RMASK;
-            // A probe this long means the table was sized far too small.
-            if pos.wrapping_sub(start) & RMASK >= RSIZE / 4 {
-                self.overflow.store(true, Relaxed);
-                return base as u32;
+            if pos.wrapping_sub(start) & RMASK >= REACH {
+                return self.full(base);
             }
         }
     }
