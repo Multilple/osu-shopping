@@ -419,6 +419,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(task) = tasks.get(i) else { break };
+                // (A table that has overflowed is not filled any further.)
+                if ctx.ids.overflowed() {
+                    break;
+                }
                 let (start, end) = out.reader.load(&link_files[task.file], task.a, task.b);
                 let buf = std::mem::take(&mut out.reader.buf);
                 parse_links(&buf[..end + 64], start, end, &ctx, out);
@@ -430,7 +434,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         let next = AtomicUsize::new(0);
         par(threads, |_| loop {
             let r = next.fetch_add(1, Ordering::Relaxed);
-            if r >= ctx.ids.nregions {
+            if r >= ctx.ids.nregions || ctx.ids.overflowed() {
                 break;
             }
             ctx.ids.flatten_region(r);
@@ -438,8 +442,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         lap("  links: flatten");
         aux.join().unwrap()
     });
-    if ctx.ids.overflow.load(Ordering::Relaxed) {
-        return false;
+    if ctx.ids.overflowed() {
+        return give_up(&ctx, &outs, threads, &event_files, &click_files, log);
     }
     ctx.aux = aux;
     lap("links");
@@ -466,6 +470,12 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(task) = tasks.get(i) else { break };
+            // Once the ID table has overflowed the run is lost: lookups
+            // answer with slots that are not the users', so stop here
+            // rather than append the rest of the input to the wrong people.
+            if ctx.ids.overflowed() {
+                return;
+            }
             let src = if task.events { &event_files[task.file] } else { &click_files[task.file] };
             if src.mapped() {
                 let (buf, start, end) = src.view(task.a, task.b);
@@ -493,8 +503,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         out.ck.finish(&mut out.arena);
         out.slim.finish(&mut out.arena_slim);
     });
-    if ctx.ids.overflow.load(Ordering::Relaxed) {
-        return false;
+    if ctx.ids.overflowed() {
+        return give_up(&ctx, &outs, threads, &event_files, &click_files, log);
     }
     if log {
         eprintln!("    ids {} in {} slots, nq {}, pbits {}", ctx.ids.len(), ctx.ids.nregions * RSIZE, ctx.nq, ctx.pbits);
@@ -636,6 +646,25 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     true
 }
 
+/// Abandon a run whose ID table proved too small (nothing has been written
+/// yet). Its big buffers go back to the system first, since the next run
+/// asks for more than this one had. Returns false, as `run` then does.
+fn give_up(ctx: &Ctx, outs: &Outs, threads: usize, event_files: &[input::Src], click_files: &[input::Src], log: bool) -> bool {
+    par(threads, |tid| {
+        let out = out_mut(outs, tid);
+        out.arena.release();
+        out.arena_slim.release();
+        ctx.ids.release_part(tid, threads);
+    });
+    for src in event_files.iter().chain(click_files) {
+        src.unmap();
+    }
+    if log {
+        eprintln!("    the ID table ({} slots) is too small for this input: starting over with a bigger one", ctx.ids.nregions * RSIZE);
+    }
+    false
+}
+
 // ====================================================================== setup
 
 fn read_file(path: &Path) -> Vec<u8> {
@@ -690,6 +719,10 @@ fn build_ctx(data: &Path, event_bytes: usize, click_bytes: usize, link_bytes: us
 
     // Size the ID table from the input. Generated data has about one distinct
     // ID per 14 event lines; this leaves room for about twice that.
+    // It is only a guess from the files' sizes (nothing short of reading the
+    // input tells how many distinct IDs it holds): a run whose table proves
+    // too small is given up, and repeated with `scale` four times as large
+    // (see `main`).
     let event_lines = event_bytes / 64 + 1;
     let ids_guess = event_lines / 8 + click_bytes / 512 + link_bytes / 64 + 1024;
     let nregions = ((ids_guess * scale).div_ceil(RSIZE)).max(4);
@@ -830,6 +863,12 @@ fn flush_links(ctx: &Ctx, out: &mut ThreadOut) {
         let (ia, ib) = (ctx.ids.get_or_insert(l.0, l.1), ctx.ids.get_or_insert(l.2, l.3));
         l.1 = ia as u64;
         l.3 = ib as u64;
+    }
+    // Once the table has overflowed, a slot it answers with need not be the
+    // ID's, nor hold any ID at all: join nothing more (the run is given up).
+    if ctx.ids.overflowed() {
+        out.pend_l.clear();
+        return;
     }
     for l in &out.pend_l {
         ctx.ids.prefetch_at(ctx.ids.root(l.1 as u32));

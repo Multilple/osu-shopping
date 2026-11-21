@@ -73,6 +73,12 @@ impl IdTable {
         }
     }
 
+    /// Whether an ID has found no place (see `overflow`).
+    #[inline(always)]
+    pub fn overflowed(&self) -> bool {
+        self.overflow.load(Relaxed)
+    }
+
     /// Give back the pages of part `i` of `n` of the table.
     pub fn release_part(&self, i: usize, n: usize) {
         let bytes = self.nregions * RSIZE * std::mem::size_of::<Slot>();
