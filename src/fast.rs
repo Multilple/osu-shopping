@@ -176,7 +176,8 @@ impl Dates {
     }
 
     /// `YYYY-MM-DDTHH:MM:SS` at `p` (19+ readable bytes) to ms, as if UTC.
-    #[inline(always)]
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
     pub unsafe fn civil(&mut self, p: *const u8) -> Option<i64> {
         let k8 = std::ptr::read_unaligned(p as *const u64);
         let k2 = std::ptr::read_unaligned(p.add(8) as *const u16);
@@ -199,7 +200,8 @@ impl Dates {
     }
 
     /// A `ts` field in any form; 32 readable bytes at `base + s`.
-    #[inline(always)]
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
     pub unsafe fn ts(&mut self, base: *const u8, s: usize, e: usize) -> Option<i64> {
         let n = e - s;
         let p = base.add(s);

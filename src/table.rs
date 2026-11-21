@@ -88,7 +88,8 @@ impl IdTable {
     }
 
     /// The slot of `k` (whose hash is `h`), inserting it as its own root if new.
-    #[inline(always)]
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
     pub fn get_or_insert(&self, k: Key, h: u64) -> u32 {
         let (base, start) = self.home(h);
         let (klo, khi) = (k as u64, (k >> 64) as u64);
@@ -224,63 +225,88 @@ impl Arena {
     }
 }
 
-/// An append-only list of `T` stored in fixed-size chunks of `1 << CB` items.
-pub struct Bucket<T, const CB: usize> {
-    cur: *mut T,
-    end: *mut T,
-    pub chunks: Vec<*mut T>,
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line([u8; 64]);
+
+/// Many append-only lists of `T` (a power-of-two size dividing 64), each
+/// stored in chunks of `1 << CB` items. Items are staged one cache line at a
+/// time and moved out with non-temporal stores, so appending to hundreds of
+/// lists does not drag their tails through the cache.
+pub struct Streams<T, const CB: usize> {
+    lines: Vec<Line>,
+    n: Vec<u32>,
+    chunks: Vec<Vec<*mut T>>,
 }
 
-unsafe impl<T, const CB: usize> Sync for Bucket<T, CB> {}
-unsafe impl<T, const CB: usize> Send for Bucket<T, CB> {}
+unsafe impl<T, const CB: usize> Sync for Streams<T, CB> {}
+unsafe impl<T, const CB: usize> Send for Streams<T, CB> {}
 
-impl<T: Copy, const CB: usize> Bucket<T, CB> {
-    pub fn new() -> Self {
-        Bucket { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), chunks: Vec::new() }
+impl<T: Copy, const CB: usize> Streams<T, CB> {
+    const PER_LINE: usize = 64 / std::mem::size_of::<T>();
+
+    pub fn new(streams: usize) -> Self {
+        assert!(64 % std::mem::size_of::<T>() == 0 && (1usize << CB) % Self::PER_LINE == 0);
+        Streams { lines: vec![Line([0; 64]); streams], n: vec![0; streams], chunks: (0..streams).map(|_| Vec::new()).collect() }
     }
 
-    #[cold]
-    #[inline(never)]
-    fn grow(&mut self, arena: &mut Arena) {
-        let p = arena.alloc(std::mem::size_of::<T>() << CB) as *mut T;
-        self.chunks.push(p);
-        self.cur = p;
-        self.end = unsafe { p.add(1 << CB) };
-    }
-
-    /// Append and return the item's index.
+    /// Where item `idx` of stream `s` lives, allocating its chunk if needed.
     #[inline(always)]
-    pub fn push(&mut self, v: T, arena: &mut Arena) -> usize {
-        if self.cur == self.end {
-            self.grow(arena);
+    fn dest(&mut self, s: usize, idx: usize, arena: &mut Arena) -> *mut T {
+        let off = idx & ((1 << CB) - 1);
+        if off == 0 && self.chunks[s].len() == idx >> CB {
+            self.chunks[s].push(arena.alloc(std::mem::size_of::<T>() << CB) as *mut T);
         }
+        unsafe { self.chunks.get_unchecked(s).get_unchecked(idx >> CB).add(off) }
+    }
+
+    /// Append to stream `s` and return the item's index.
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
+    pub fn push(&mut self, s: usize, v: T, arena: &mut Arena) -> usize {
         unsafe {
-            self.cur.write(v);
-            self.cur = self.cur.add(1);
-            (self.chunks.len() << CB) - (self.end.offset_from(self.cur) as usize) - 1
+            let n = *self.n.get_unchecked(s) as usize;
+            let r = n & (Self::PER_LINE - 1);
+            let line = self.lines.as_mut_ptr().add(s);
+            (line as *mut T).add(r).write(v);
+            *self.n.get_unchecked_mut(s) = (n + 1) as u32;
+            if r == Self::PER_LINE - 1 {
+                use core::arch::x86_64::*;
+                let d = self.dest(s, n + 1 - Self::PER_LINE, arena) as *mut __m256i;
+                let src = line as *const __m256i;
+                _mm256_stream_si256(d, _mm256_load_si256(src));
+                _mm256_stream_si256(d.add(1), _mm256_load_si256(src.add(1)));
+            }
+            n
         }
     }
 
-    pub fn len(&self) -> usize {
-        if self.chunks.is_empty() {
-            0
-        } else {
-            (self.chunks.len() << CB) - unsafe { self.end.offset_from(self.cur) as usize }
+    /// Move every partly filled staging line out. Call once, when done appending.
+    pub fn finish(&mut self, arena: &mut Arena) {
+        for s in 0..self.n.len() {
+            let n = self.n[s] as usize;
+            let r = n & (Self::PER_LINE - 1);
+            for k in 0..r {
+                let v = unsafe { *(self.lines.as_ptr().add(s) as *const T).add(k) };
+                let d = self.dest(s, n - r + k, arena);
+                unsafe { d.write(v) };
+            }
         }
+        unsafe { core::arch::x86_64::_mm_sfence() };
+    }
+
+    pub fn len(&self, s: usize) -> usize {
+        self.n[s] as usize
     }
 
     #[inline(always)]
-    pub fn at(&self, idx: usize) -> *mut T {
-        unsafe { self.chunks.get_unchecked(idx >> CB).add(idx & ((1 << CB) - 1)) }
+    pub fn at(&self, s: usize, idx: usize) -> *mut T {
+        unsafe { self.chunks.get_unchecked(s).get_unchecked(idx >> CB).add(idx & ((1 << CB) - 1)) }
     }
 
-    /// The filled part of every chunk.
-    pub fn slices(&self) -> impl Iterator<Item = &mut [T]> + '_ {
-        let n = self.chunks.len();
-        let last = if n == 0 { 0 } else { (1usize << CB) - unsafe { self.end.offset_from(self.cur) as usize } };
-        self.chunks
-            .iter()
-            .enumerate()
-            .map(move |(i, &p)| unsafe { std::slice::from_raw_parts_mut(p, if i + 1 == n { last } else { 1 << CB }) })
+    /// Stream `s` as (pointer, length) pieces.
+    pub fn pieces(&self, s: usize) -> impl Iterator<Item = (*mut T, usize)> + '_ {
+        let n = self.n[s] as usize;
+        self.chunks[s].iter().enumerate().map(move |(i, &p)| (p, (n - (i << CB)).min(1 << CB)))
     }
 }

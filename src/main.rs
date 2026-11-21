@@ -71,9 +71,9 @@ struct Slim {
     x: u64,
 }
 
-type EvBucket = Bucket<Ev, 12>;
-type SlimBucket = Bucket<Slim, 12>;
-type CkBucket = Bucket<Ck, 10>;
+type EvStreams = Streams<Ev, 12>;
+type SlimStreams = Streams<Slim, 12>;
+type CkStreams = Streams<Ck, 10>;
 
 struct Ctx {
     ws: i64,
@@ -100,9 +100,9 @@ struct Ctx {
 
 struct ThreadOut {
     arena: Arena,
-    ev: Vec<EvBucket>,
-    ck: Vec<CkBucket>,
-    slim: Vec<SlimBucket>,
+    ev: EvStreams,
+    ck: CkStreams,
+    slim: SlimStreams,
     dates: fast::Dates,
     pend_e: Vec<PendE>,
     pend_c: Vec<PendC>,
@@ -185,9 +185,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         .map(|_| {
             Shared(UnsafeCell::new(ThreadOut {
                 arena: Arena::new(),
-                ev: (0..ctx.nq).map(|_| Bucket::new()).collect(),
-                ck: (0..ctx.nq).map(|_| Bucket::new()).collect(),
-                slim: (0..1usize << ctx.pbits).map(|_| Bucket::new()).collect(),
+                ev: Streams::new(ctx.nq),
+                ck: Streams::new(ctx.nq),
+                slim: Streams::new(1 << ctx.pbits),
                 dates: fast::Dates::new(),
                 pend_e: Vec::with_capacity(PEND),
                 pend_c: Vec::with_capacity(PEND),
@@ -247,6 +247,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         }
         flush_events(&ctx, out, tid);
         flush_clicks(&ctx, out);
+        out.ev.finish(&mut out.arena);
+        out.ck.finish(&mut out.arena);
+        out.slim.finish(&mut out.arena);
     });
     if ctx.ids.overflow.load(Ordering::Relaxed) {
         return false;
@@ -290,8 +293,13 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             }
             person_bucket(q, &outs_ref, &ctx, &mut tl);
         }
+        let t_w = Instant::now();
         if tid == 0 || !tl.rows.person.is_empty() {
             write_user_daily(&user_dir.join(format!("part-{tid:03}.parquet")), &tl.rows, &ctx);
+        }
+        if log {
+            eprintln!("    t{tid}: count {:.0} place {:.0} persons {:.0} write {:.0} ms | Mcycles sort {:.0} sess {:.0} attr {:.0}", tl.prof[0] * 1e3, tl.prof[1] * 1e3, tl.prof[2] * 1e3, t_w.elapsed().as_secs_f64() * 1e3, tl.prof[3] / 1e6, tl.prof[4] / 1e6, tl.prof[5] / 1e6);
+            eprintln!("       attr: cksort {:.0} credit {:.0} tmpsort {:.0} flush {:.0} Mcycles; persons_with_clicks {:.0} flushes {:.0}", tl.prof[6] / 1e6, tl.prof[7] / 1e6, tl.prof[8] / 1e6, tl.prof[9] / 1e6, tl.prof[10], tl.prof[11]);
         }
         unsafe { *cells[tid].0.get() = Some(tl.cells) };
     });
@@ -547,7 +555,8 @@ fn ingest32(ctx: &Ctx, ing: i64) -> u32 {
 }
 
 /// Record one parsed event line: `ev` is `Some` when the copy is valid.
-#[inline(always)]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev: Option<u64>, ing: i64) {
     let h = hash64(ek);
     let h2 = (hash64b(ek) >> 40) & H2_MASK;
@@ -563,27 +572,29 @@ fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev
         }
         None => {
             let p = (h >> (64 - ctx.pbits)) as usize;
-            out.slim[p].push(Slim { h, x: TAG | (h2 << H2_SHIFT) | ingest as u64 }, &mut out.arena);
+            out.slim.push(p, Slim { h, x: TAG | (h2 << H2_SHIFT) | ingest as u64 }, &mut out.arena);
         }
     }
 }
 
-#[inline(always)]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 fn flush_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
     for i in 0..out.pend_e.len() {
         let pe = out.pend_e[i];
         let person = ctx.ids.root(ctx.ids.get_or_insert(pe.user, pe.uh));
         let q = (person >> ctx.qshift) as usize;
-        let idx = out.ev[q].push(Ev { ev: pe.ev, person, ingest: pe.ingest }, &mut out.arena);
+        let idx = out.ev.push(q, Ev { ev: pe.ev, person, ingest: pe.ingest }, &mut out.arena);
         assert!(idx < 1 << IDX_BITS, "bucket too large");
         let p = (pe.h >> (64 - ctx.pbits)) as usize;
         let x = (pe.h2 << H2_SHIFT) | ((tid as u64) << (IDX_BITS + Q_BITS)) | ((q as u64) << IDX_BITS) | idx as u64;
-        out.slim[p].push(Slim { h: pe.h, x }, &mut out.arena);
+        out.slim.push(p, Slim { h: pe.h, x }, &mut out.arena);
     }
     out.pend_e.clear();
 }
 
-#[inline(always)]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 fn emit_click(ctx: &Ctx, out: &mut ThreadOut, user: Key, cid: Key, ts: u32, camp: u32) {
     let uh = hash64(user);
     ctx.ids.prefetch(uh);
@@ -593,13 +604,14 @@ fn emit_click(ctx: &Ctx, out: &mut ThreadOut, user: Key, cid: Key, ts: u32, camp
     }
 }
 
-#[inline(always)]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 fn flush_clicks(ctx: &Ctx, out: &mut ThreadOut) {
     for i in 0..out.pend_c.len() {
         let c = out.pend_c[i];
         let person = ctx.ids.root(ctx.ids.get_or_insert(c.user, c.uh));
         let q = (person >> ctx.qshift) as usize;
-        out.ck[q].push(Ck { cid: c.cid, person, ts: c.ts, camp: c.camp, _pad: 0 }, &mut out.arena);
+        out.ck.push(q, Ck { cid: c.cid, person, ts: c.ts, camp: c.camp, _pad: 0 }, &mut out.arena);
     }
     out.pend_c.clear();
 }
@@ -737,7 +749,7 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
 
 fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>, dups: &mut Vec<Slim>, members: &mut Vec<(u32, u64)>) {
     const EMPTY: u64 = u64::MAX;
-    let n: usize = outs.iter().map(|o| o.slim[p].len()).sum();
+    let n: usize = outs.iter().map(|o| o.slim.len(p)).sum();
     if n < 2 {
         return;
     }
@@ -747,11 +759,10 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>, dups: &mut 
     let mask = cap - 1;
     dups.clear();
     // The table holds 32 bits of each hash and where its line's note is.
-    let note = |r: u32| -> *mut Slim { outs[(r >> IDX_BITS) as usize].slim[p].at((r & ((1 << IDX_BITS) - 1)) as usize) };
+    let note = |r: u32| -> *mut Slim { outs[(r >> IDX_BITS) as usize].slim.at(p, (r & ((1 << IDX_BITS) - 1)) as usize) };
     for (t, o) in outs.iter().enumerate() {
         let mut idx = (t as u32) << IDX_BITS;
-        for chunk in o.slim[p].slices() {
-            let (ptr, len) = (chunk.as_mut_ptr(), chunk.len());
+        for (ptr, len) in o.slim.pieces(p) {
             for k in 0..len {
                 let s = unsafe { *ptr.add(k) };
                 let tag = (s.h >> 24) as u32;
@@ -790,7 +801,7 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>, dups: &mut 
     let ev_at = |x: u64| -> *mut Ev {
         let t = (x >> (IDX_BITS + Q_BITS)) as usize & ((1 << T_BITS) - 1);
         let q = (x >> IDX_BITS) as usize & ((1 << Q_BITS) - 1);
-        outs[t].ev[q].at((x & ((1 << IDX_BITS) - 1)) as usize)
+        outs[t].ev.at(q, (x & ((1 << IDX_BITS) - 1)) as usize)
     };
     let mut i = 0;
     while i < dups.len() {
@@ -863,6 +874,7 @@ struct Tl {
     cells: Cells,
     nd: usize,
     organic: usize,
+    prof: [f64; 12],
 }
 
 impl Tl {
@@ -886,6 +898,7 @@ impl Tl {
             },
             nd: ctx.nd,
             organic: ctx.camp_names.len(),
+            prof: [0.0; 12],
         }
     }
 }
@@ -896,20 +909,21 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
     let smask = (bslots - 1) as u32;
 
     // Pass 1: count each person's rows. A person's index is their slot in this bucket.
+    let t_a = Instant::now();
     tl.cnt_e.iter_mut().for_each(|c| *c = 0);
     tl.cnt_c.iter_mut().for_each(|c| *c = 0);
     let (mut ne, mut ncl) = (0u32, 0u32);
     for o in outs {
-        for chunk in o.ev[q].slices() {
-            for e in chunk.iter() {
+        for (ptr, len) in o.ev.pieces(q) {
+            for e in unsafe { std::slice::from_raw_parts(ptr, len) } {
                 if e.ev != DEAD {
                     tl.cnt_e[(e.person & smask) as usize] += 1;
                     ne += 1;
                 }
             }
         }
-        for chunk in o.ck[q].slices() {
-            for c in chunk.iter() {
+        for (ptr, len) in o.ck.pieces(q) {
+            for c in unsafe { std::slice::from_raw_parts(ptr, len) } {
                 tl.cnt_c[(c.person & smask) as usize] += 1;
                 ncl += 1;
             }
@@ -919,6 +933,8 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
         return;
     }
     // Counts become start offsets.
+    let t_b = Instant::now();
+    tl.prof[0] += (t_b - t_a).as_secs_f64();
     let (mut se, mut sc) = (0u32, 0u32);
     for i in 0..bslots {
         let (ce, cc) = (tl.cnt_e[i], tl.cnt_c[i]);
@@ -933,8 +949,8 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
     tl.cks.clear();
     tl.cks.resize(ncl as usize, Ckl::default());
     for o in outs {
-        for chunk in o.ev[q].slices() {
-            for e in chunk.iter() {
+        for (ptr, len) in o.ev.pieces(q) {
+            for e in unsafe { std::slice::from_raw_parts(ptr, len) } {
                 if e.ev != DEAD {
                     let slot = (e.person & smask) as usize;
                     let at = tl.cnt_e[slot];
@@ -943,8 +959,8 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
                 }
             }
         }
-        for chunk in o.ck[q].slices() {
-            for c in chunk.iter() {
+        for (ptr, len) in o.ck.pieces(q) {
+            for c in unsafe { std::slice::from_raw_parts(ptr, len) } {
                 let slot = (c.person & smask) as usize;
                 let at = tl.cnt_c[slot];
                 tl.cnt_c[slot] = at + 1;
@@ -953,6 +969,8 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
         }
     }
     // cnt_* now hold each person's end offset.
+    let t_c = Instant::now();
+    tl.prof[1] += (t_c - t_b).as_secs_f64();
     let mut evs = std::mem::take(&mut tl.evs);
     let mut cks = std::mem::take(&mut tl.cks);
     let (mut pe, mut pc) = (0usize, 0usize);
@@ -966,11 +984,15 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
     }
     tl.evs = evs;
     tl.cks = cks;
+    tl.prof[2] += t_c.elapsed().as_secs_f64();
 }
 
 /// One person: sessions, their user_daily rows, attribution and assists.
 fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
+    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     evs.sort_unstable();
+    let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+    tl.prof[3] += (t1 - t0) as f64;
     let n = evs.len();
     let nd = tl.nd;
 
@@ -1020,6 +1042,8 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
     flush_row(who, cur_day, d_sessions, d_events, d_rev, tl);
 
     // ---- attribution
+    let t2 = unsafe { core::arch::x86_64::_rdtsc() };
+    tl.prof[4] += (t2 - t1) as f64;
     let organic = tl.organic;
     if cks.is_empty() {
         for s in &tl.sess {
@@ -1041,6 +1065,9 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
         }
     }
     let cks = &cks[..nc];
+    let t3 = unsafe { core::arch::x86_64::_rdtsc() };
+    tl.prof[6] += (t3 - t2) as f64;
+    tl.prof[10] += 1.0;
     let mut hi = 0;
     for s in &tl.sess {
         while hi < nc && cks[hi].ts <= s.start {
@@ -1055,12 +1082,18 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
 
     // ---- assists: per campaign, the union of [click, click + 7 days] over
     // its clicks; every session starting inside is assisted once.
+    let t4 = unsafe { core::arch::x86_64::_rdtsc() };
+    tl.prof[7] += (t4 - t3) as f64;
     tl.tmp.clear();
     tl.tmp.extend(cks.iter().map(|c| ((c.camp as u64) << 32) | c.ts as u64));
     tl.tmp.sort_unstable();
+    let t5 = unsafe { core::arch::x86_64::_rdtsc() };
+    tl.prof[8] += (t5 - t4) as f64;
+    let mut nflush = 0u64;
     let sess = &tl.sess;
     let assisted = &mut tl.cells.assisted;
     let mut flush = |camp: usize, a: u32, b: u32| {
+        nflush += 1;
         let lo = sess.partition_point(|s| s.start < a);
         let hi = lo + sess[lo..].partition_point(|s| s.start <= b);
         if hi - lo <= 8 {
@@ -1090,6 +1123,9 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
         b = ts + WEEK;
     }
     flush(cur_camp as usize, a, b);
+    tl.prof[11] += nflush as f64;
+    tl.prof[9] += (unsafe { core::arch::x86_64::_rdtsc() } - t5) as f64;
+    tl.prof[5] += (unsafe { core::arch::x86_64::_rdtsc() } - t2) as f64;
 }
 
 #[inline(always)]
