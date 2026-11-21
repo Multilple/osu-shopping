@@ -628,8 +628,9 @@ fn ahead() -> usize {
 /// code alone, stream by stream and in order. Returns how many lines' worth
 /// of streams differ (and says so on stderr).
 pub(crate) fn check(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn) -> usize {
-    use crate::table::{Arena, Plain};
-    let fresh = || DOut { arena: Arena::new(), ev: Plain::new(dn.nb), ck: Plain::new(1), reader: crate::input::Reader::new(1 << 10), pend_l: Vec::new() };
+    use crate::dense::Lists;
+    use crate::table::Arena;
+    let fresh = || DOut { arena: Arena::new(), ev: Lists::new(dn.nb), ck: Lists::new(1), reader: crate::input::Reader::new(1 << 10), pend_l: Vec::new() };
     let (mut a, mut b) = (fresh(), fresh());
     let rest = unsafe { events_dense(file, start, end, ctx, dn, &mut a) };
     for line in crate::lines(&file[rest..end]) {

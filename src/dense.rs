@@ -32,7 +32,14 @@ use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use crate::input::Src;
-use crate::table::{map_anon, release, Arena, Plain};
+use crate::table::{map_anon, release, Arena};
+
+/// The record lists of the parse stage. Measured on the scoring machine
+/// (Cascade Lake, two threads to a core): records staged a cache line at a
+/// time and moved out with non-temporal stores (`table::Streams`) cost 15%
+/// less per record than plain stores (`table::Plain`) with 600 lists and
+/// 27% less with 1800, and do not get dearer as the lists multiply.
+pub(crate) type Lists = crate::table::Streams<[u64; 2], 10>;
 use crate::util::*;
 use crate::{
     build_ctx, env_usize, fast, grid_tasks, input, lines, load_aux, par, person_grid, person_sorted,
@@ -483,10 +490,10 @@ pub(crate) struct DOut {
     /// in the second word and is followed by `[price | category << 24, EXT]`.
     /// (The first word orders the copies of an event: smallest ingest time
     /// first.)
-    pub(crate) ev: Plain<[u64; 2], 10>,
+    pub(crate) ev: Lists,
     /// Valid clicks by their user's person bucket (interned users: bucket
     /// `nq`): `[ts << 32 | campaign, node | click << 32]`.
-    pub(crate) ck: Plain<[u64; 2], 10>,
+    pub(crate) ck: Lists,
     pub(crate) reader: input::Reader,
     pub(crate) pend_l: Vec<(u32, u32)>,
 }
@@ -1755,8 +1762,8 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         .map(|_| {
             Shared(UnsafeCell::new(DOut {
                 arena: Arena::new(),
-                ev: Plain::new(nb),
-                ck: Plain::new(nq + 1),
+                ev: Lists::new(nb),
+                ck: Lists::new(nq + 1),
                 reader: input::Reader::new(chunk),
                 pend_l: Vec::with_capacity(PEND),
             }))
@@ -1823,7 +1830,8 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     grid_tasks(&event_files, true, piece, &mut tasks);
     grid_tasks(&click_files, false, piece, &mut tasks);
     let next = AtomicUsize::new(0);
-    let populate = env_usize("SS_POP", 1) != 0;
+    // (Asking for a piece's pages in one call costs more than their faults on the scoring machine.)
+    let populate = env_usize("SS_POP", 0) != 0;
     {
         let (dn, ctx) = (&dn, &ctx);
         par(threads, |tid| {
