@@ -39,13 +39,13 @@ const fn inverse(a: u64) -> u64 {
     }
     x
 }
-const A_INV: u64 = inverse(0x9E37_79B9_7F4B);
-const B_INV: u64 = inverse(0xD6E8_FEB8_6659);
+pub(crate) const A_INV: u64 = inverse(0x9E37_79B9_7F4B);
+pub(crate) const B_INV: u64 = inverse(0xD6E8_FEB8_6659);
 
 /// In a user number shifted up by 24: the bits of the ID's number within
 /// its person above 7, and everything but those.
-const ALIAS_HI_TOP: u64 = 0x1F8 << 24;
-const NODE_MASK_TOP: u64 = (M40 & !0x1F8) << 24;
+pub(crate) const ALIAS_HI_TOP: u64 = 0x1F8 << 24;
+pub(crate) const NODE_MASK_TOP: u64 = (M40 & !0x1F8) << 24;
 
 /// How far ahead of the line being parsed the loop asks for input bytes. (A
 /// constant, mapped input or not: as a variable it costs the loop a register.)
@@ -181,8 +181,8 @@ unsafe impl Send for Cx {}
 /// in 2500, fails its row and goes to the plain code.) A row for a length no
 /// dense ID has routes the lane's last byte to the prefix and the quote
 /// slots, which cannot both hold.
-fn id_row(r: usize) -> [u8; 16] {
-    if !(2..=11).contains(&r) {
+pub(crate) const fn id_row(r: usize) -> [u8; 16] {
+    if r < 2 || r > 11 {
         return [15; 16];
     }
     let q = (r >= 10) as usize;
@@ -190,8 +190,10 @@ fn id_row(r: usize) -> [u8; 16] {
     let f = 15 - r;
     let (prefix, last) = if q == 1 { (f + 1, 13) } else { (f, 14) };
     let mut row = [0x80u8; 16];
-    for j in 0..n {
+    let mut j = 0;
+    while j < n {
         row[7 - j] = (last - j) as u8;
+        j += 1;
     }
     row[8] = prefix as u8;
     row[9] = if q == 1 { f as u8 } else { 15 };
@@ -591,9 +593,9 @@ unsafe fn cold_line<S: Sink>(env: &Env<S>, s: usize) -> usize {
 // ====================================================================== constants
 
 #[repr(C, align(32))]
-struct V32([u8; 32]);
+pub(crate) struct V32(pub(crate) [u8; 32]);
 
-const fn both(lane: [u8; 16]) -> V32 {
+pub(crate) const fn both(lane: [u8; 16]) -> V32 {
     let mut v = [0u8; 32];
     let mut i = 0;
     while i < 16 {
@@ -614,12 +616,12 @@ static ID_EXP: V32 = {
     v
 };
 /// The most a slot may hold when it is not above 0x30 (a digit), and when it is (a letter).
-static ID_LIM0: V32 = both([9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF]);
-static ID_LIM1: V32 = both([0x4A, 0x4A, 0x4A, 0x4A, 0x4A, 0x4A, 0x4A, 0x4A, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+pub(crate) static ID_LIM0: V32 = both([9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF]);
+pub(crate) static ID_LIM1: V32 = both([0x4A, 0x4A, 0x4A, 0x4A, 0x4A, 0x4A, 0x4A, 0x4A, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
 /// What turns a letter into its digit value.
-static ID_ADJ: V32 = both([0x27, 0x27, 0x27, 0x27, 0x27, 0x27, 0x27, 0x27, 0, 0, 0, 0, 0, 0, 0, 0]);
-static ID_W1: V32 = both([36, 1, 36, 1, 36, 1, 36, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
-static ID_W2: V32 = both([0x10, 0x05, 1, 0, 0x10, 0x05, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+pub(crate) static ID_ADJ: V32 = both([0x27, 0x27, 0x27, 0x27, 0x27, 0x27, 0x27, 0x27, 0, 0, 0, 0, 0, 0, 0, 0]);
+pub(crate) static ID_W1: V32 = both([36, 1, 36, 1, 36, 1, 36, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+pub(crate) static ID_W2: V32 = both([0x10, 0x05, 1, 0, 0x10, 0x05, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
 // ====================================================================== off the fast path
 
@@ -698,12 +700,12 @@ unsafe fn user_slow(p: *const u8, dn: &Dn) -> (u64, u64) {
 }
 
 #[inline(always)]
-unsafe fn ld128<T>(p: *const T) -> __m128i {
+pub(crate) unsafe fn ld128<T>(p: *const T) -> __m128i {
     _mm_loadu_si128(p as *const __m128i)
 }
 
 #[inline(always)]
-unsafe fn ld256(v: &V32) -> __m256i {
+pub(crate) unsafe fn ld256(v: &V32) -> __m256i {
     _mm256_load_si256(v.0.as_ptr() as *const __m256i)
 }
 
@@ -711,7 +713,7 @@ unsafe fn ld256(v: &V32) -> __m256i {
 /// the count replaces its operand: the compiler's own form first clears the
 /// register the count goes to.
 #[inline(always)]
-fn tz64(x: u64) -> usize {
+pub(crate) fn tz64(x: u64) -> usize {
     let mut y = x;
     unsafe {
         core::arch::asm!("tzcnt {0}, {0}", inout(reg) y, options(pure, nomem, nostack));
@@ -741,7 +743,7 @@ unsafe fn be_at_5(p: *const u8) -> u64 {
 
 /// `unscramble(id, key) << 24`.
 #[inline(always)]
-fn unscramble_top(id: u64, key: u64, binv24: u64, ainv24: u64) -> u64 {
+pub(crate) fn unscramble_top(id: u64, key: u64, binv24: u64, ainv24: u64) -> u64 {
     // With m the 40 bits at the top of x: m ^ m >> 17 ^ m >> 34, in two
     // steps. (The low 24 bits of x are zero, so the rotation is a shift
     // that leaves x in place.)
