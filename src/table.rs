@@ -602,3 +602,95 @@ impl<T: Copy, const CB: usize> Plain<T, CB> {
         self.chunks[s].iter().enumerate().map(move |(i, &p)| (p, (n - (i << CB)).min(1 << CB)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(i: u64) -> Key {
+        pack(format!("u{i}").as_bytes())
+    }
+
+    /// A region with no free slot left: the IDs in it are still found, and
+    /// one that is not in it is refused. (That walk used to go round the
+    /// region for ever.)
+    #[test]
+    fn full_region() {
+        let t = IdTable::new(1);
+        // Slot i gets an ID whose home is the even slot at or before it: no
+        // walk is longer than two slots, so nothing overflows on the way.
+        let hi = 9u64 << 56;
+        for i in 0..RSIZE as u32 {
+            assert_eq!(t.get_or_insert_at(i as u64 + 1, hi, i & !1), i);
+        }
+        assert!(!t.overflowed());
+        assert_eq!(t.len(), RSIZE);
+        for i in 0..RSIZE as u32 {
+            assert_eq!(t.peek(i as u64 + 1, hi, i & !1), Some(i));
+            assert_eq!(t.get_or_insert_at(i as u64 + 1, hi, i & !1), i);
+        }
+        assert!(!t.overflowed());
+        t.get_or_insert_at(u64::MAX, hi, 0);
+        assert!(t.overflowed());
+    }
+
+    /// More IDs than slots: the table says so, and what went in before that
+    /// is still found where it was put.
+    #[test]
+    fn too_small_a_table() {
+        let t = IdTable::new(1);
+        let mut slots = Vec::new();
+        for i in 0..2 * RSIZE as u64 {
+            let s = t.get_or_insert(id(i), hash64(id(i)));
+            if t.overflowed() {
+                break;
+            }
+            assert_eq!(t.key(s), id(i));
+            slots.push(s);
+        }
+        assert!(t.overflowed() && slots.len() <= RSIZE);
+        assert_eq!(t.len(), slots.len());
+        for (i, &s) in slots.iter().enumerate() {
+            assert_eq!(t.get_or_insert(id(i as u64), hash64(id(i as u64))), s);
+        }
+    }
+
+    /// Threads that insert the same IDs at once agree on every ID's slot.
+    #[test]
+    fn threads_agree() {
+        let t = IdTable::new(8);
+        let n = 12_000u64;
+        let run = || (0..n).map(|i| t.get_or_insert(id(i), hash64(id(i)))).collect::<Vec<u32>>();
+        let got: Vec<Vec<u32>> = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..4).map(|_| s.spawn(&run)).collect();
+            threads.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(!t.overflowed());
+        assert_eq!(t.len(), n as usize);
+        for g in &got {
+            assert_eq!(g, &got[0]);
+        }
+        for (i, &s) in got[0].iter().enumerate() {
+            assert_eq!(t.key(s), id(i as u64));
+        }
+    }
+
+    /// Threads that overfill a table all come back, with the overflow flagged.
+    #[test]
+    fn too_small_a_table_and_threads() {
+        let t = IdTable::new(1);
+        std::thread::scope(|s| {
+            for w in 0..4u64 {
+                let t = &t;
+                s.spawn(move || {
+                    for i in 0..2 * RSIZE as u64 {
+                        let k = id(w << 32 | i);
+                        t.get_or_insert(k, hash64(k));
+                    }
+                });
+            }
+        });
+        assert!(t.overflowed());
+        assert!(t.len() <= RSIZE);
+    }
+}
