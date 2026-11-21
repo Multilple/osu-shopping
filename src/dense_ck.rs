@@ -765,7 +765,8 @@ pub(crate) fn unscramble_top(id: u64, key: u64, binv24: u64, ainv24: u64) -> u64
 /// the fast path can go. Returns where the unhandled rest starts.
 #[inline(always)]
 unsafe fn kernel<S: Sink>(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, sink: &mut S) -> usize {
-    let cx = &dn.ckx;
+    // (Set before any click is parsed: see `dense::run`.)
+    let cx = dn.ckx.get().unwrap();
     let t: &Tables = cx.t.as_deref().unwrap_unchecked();
     let base = file.as_ptr();
     // Past the last line that ends before `end`; the loop reads up to 128
@@ -943,7 +944,7 @@ pub(crate) unsafe fn plain_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn slow_line(file: &[u8], s: usize, end: usize, a2: usize, a3: usize, r3: usize, camp: Option<u64>, ms32: Option<u64>, date_only: bool, tc: u64, tu: u64, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
-    let t: &Tables = dn.ckx.t.as_deref().unwrap_unchecked();
+    let t: &Tables = dn.ckx.get().unwrap().t.as_deref().unwrap_unchecked();
     let p = file.as_ptr().add(s);
     let next = s + a3 + r3 + 3;
     let camp = match camp {
@@ -1011,7 +1012,7 @@ unsafe fn verified(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, ou
 /// starts (see `kernel`).
 #[inline(never)]
 pub(crate) unsafe fn clicks_dense(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
-    if dn.ckx.verify {
+    if dn.ckx.get().unwrap().verify {
         return verified(file, start, end, ctx, dn, out);
     }
     kernel(file, start, end, ctx, dn, out)

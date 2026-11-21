@@ -280,7 +280,7 @@ impl KC {
     /// The tables for a run, or `None` when the run is one the pass was not
     /// made for (then the Rust kernel takes it).
     pub(crate) fn new(ctx: &Ctx, dn: &Dn) -> Option<&'static KC> {
-        let (cmask, cbase, cpm) = dn.ckx.camp_rows()?;
+        let (cmask, cbase, cpm) = dn.ckx.get()?.camp_rows()?;
         let cws = ctx.cws;
         let span = (ctx.we - cws).max(0);
         // Times are compared modulo 2^32 (and may be up to three days off the window:
@@ -414,7 +414,7 @@ unsafe fn user_line(p: *const u8, w0: u64, tc: u64, dn: &Dn, out: &mut DOut) {
 /// where the rest starts, or `None` when this kernel cannot take the run.
 #[inline(never)]
 pub(crate) unsafe fn clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> Option<usize> {
-    let kc: &KC = dn.cka?;
+    let kc: &KC = (*dn.cka.get()?)?;
     let pos = out.ck.pointers()?;
     let base = file.as_ptr();
     // Past the last line that ends before `end`; a pass reads up to 100
