@@ -414,12 +414,18 @@ macro_rules! define_events {
             // (rdx) of the first 64. A pass finds them for the next line (`nhead`), this for the first.
             $($head,)*
             "tzcnt r15, r15",
+            "mov qword ptr [rdi + {n_c}], rax",
+            "mov qword ptr [rdi + {n_q}], rdx",
+            "mov qword ptr [rdi + {n_nl}], r15",
             "2:",
-            "prefetcht0 byte ptr [rsi + {ahead}]",
-            "prefetcht0 byte ptr [rsi + {ahead} + 64]",
+            "mov rax, qword ptr [rdi + {n_c}]",
+            "mov rdx, qword ptr [rdi + {n_q}]",
+            "mov r15, qword ptr [rdi + {n_nl}]",
             "mov rbx, rsi",             // rbx: the newline before the line
             "cmp r15d, 63",
             "ja 88f",                   // no newline in sight
+            "prefetcht0 byte ptr [rsi + {ahead}]",
+            "prefetcht0 byte ptr [rsi + {ahead} + 64]",
             "add r15, rsi",             // r15: the newline that ends the line, less 41
             "vpcmpeqb ymm4, ymm12, ymmword ptr [r15 + 9]",           // commas and quotes of the 32 bytes before it
             "vpcmpeqb ymm5, ymm13, ymmword ptr [r15 + 9]",
@@ -643,9 +649,6 @@ macro_rules! define_events {
             "mov qword ptr [r8 + rax + 16], rdx",
             "mov qword ptr [r8 + rax + 24], rcx",
             "71:",
-            "mov rax, qword ptr [rdi + {n_c}]",
-            "mov rdx, qword ptr [rdi + {n_q}]",
-            "mov r15, qword ptr [rdi + {n_nl}]",
             "cmp rsi, qword ptr [rdi + {limit}]",
             "jb 2b",
             "mov eax, 7",               // no line may start here
