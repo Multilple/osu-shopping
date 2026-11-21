@@ -2025,7 +2025,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         }
     };
     let event_files = input::list_dir(&data_dir.join("events"));
-    let mut click_files = input::list_dir(&data_dir.join("clicks"));
+    let click_files = input::list_dir(&data_dir.join("clicks"));
     let link_files = input::list_dir(&data_dir.join("links"));
     let Some(plan) = plan(&event_files, &click_files) else { return false };
     if log {
@@ -2033,7 +2033,10 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     }
     let mut ctx = build_ctx(data_dir, 0, 0, 0, 1);
 
-    let kb = env_usize("SS_KB", 15) as u32;
+    // Events to a bucket: 2^15 up to about 33M events, twice that above (measured on
+    // the scoring machine: at 60M events 2^16 is 2.5% faster, at 20M it makes no difference).
+    let bits = 64 - plan.max_event.max(1).leading_zeros();
+    let kb = env_usize("SS_KB", (bits as usize).saturating_sub(10).clamp(15, 17)) as u32;
     let ku = env_usize("SS_KU", 10) as u32;
     let nq = (plan.max_user as usize).div_ceil(1 << ku);
     let d = nq << (ku + 3);
