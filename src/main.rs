@@ -12,6 +12,7 @@
 //!   4. persons per person bucket: group by person, sort, sessionize,
 //!              attribute, aggregate, and write Parquet.
 
+mod alloc;
 mod dense;
 #[cfg(feature = "lab")]
 mod lab;
@@ -34,6 +35,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
+
+#[global_allocator]
+static BIG: alloc::Big = alloc::Big::new();
 
 use parquet::{Column, Logical};
 use table::*;

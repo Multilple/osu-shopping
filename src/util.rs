@@ -216,6 +216,7 @@ pub mod sys {
         pub fn mallopt(param: i32, value: i32) -> i32;
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        pub fn munmap(addr: *mut c_void, len: usize) -> i32;
         pub fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
         pub fn getppid() -> i32;
         pub fn clock_gettime(clock: i32, t: *mut [i64; 2]) -> i32;
