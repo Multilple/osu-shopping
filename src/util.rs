@@ -228,6 +228,13 @@ pub mod sys {
         t[0] as f64 + t[1] as f64 / 1e9
     }
 
+    /// CPU time (user, kernel; ms) of the child processes waited for so far.
+    pub fn usage_children() -> (f64, f64) {
+        let mut r = [0i64; 18];
+        unsafe { getrusage(-1, &mut r) };
+        (r[0] as f64 * 1e3 + r[1] as f64 / 1e3, r[2] as f64 * 1e3 + r[3] as f64 / 1e3)
+    }
+
     /// CPU time in user mode and in the kernel (ms), and page faults so far.
     pub fn usage() -> (f64, f64, i64) {
         let mut r = [0i64; 18];

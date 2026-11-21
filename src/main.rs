@@ -13,6 +13,7 @@
 //!              attribute, aggregate, and write Parquet.
 
 mod dense;
+mod lab;
 mod dense_ck;
 mod dense_ev;
 mod diag;
@@ -28,6 +29,7 @@ mod util;
 use std::cell::UnsafeCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
 use parquet::{Column, Logical};
@@ -192,6 +194,10 @@ fn main() {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .min(MAX_THREADS);
+    if std::env::var_os("SS_LAB").is_some() {
+        lab::main(threads);
+    }
+    SUM_ON.store(std::env::var_os("SS_SUM").is_some(), Relaxed);
     // The ID table is sized from the input's size; if that guess is ever too
     // small, start over with a bigger one.
     // Large buffers always get their own mapping, so growing one remaps it
@@ -287,8 +293,24 @@ fn main() {
     }
     #[cfg(feature = "sprof")]
     sprof::dump();
+    if SUM_ON.load(Relaxed) {
+        let hwm = std::fs::read_to_string("/proc/self/status").unwrap_or_default().lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| l.split_whitespace().nth(1).map(|v| v.to_string())).unwrap_or_default();
+        eprintln!("SUM {:016x}.{} {:016x}.{}\nHWM {hwm}", SUMS[0].load(Relaxed), SUMS[1].load(Relaxed), SUMS[2].load(Relaxed), SUMS[3].load(Relaxed));
+    }
     // Skip destructors: the process is done.
     std::process::exit(0);
+}
+
+/// SS_SUM: sums over the rows written (user_daily: a sum of row hashes and
+/// the row count; campaign_daily the same), to compare two runs' tables
+/// whatever order their rows are in.
+static SUM_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SUMS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[inline]
+fn mix(h: u64, v: u64) -> u64 {
+    let x = (h ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^ (x >> 29)
 }
 
 /// With SS_TIMING=2: resident and huge-page-backed memory right now, in MB.
@@ -2305,6 +2327,24 @@ fn plain_bytes<'a>(out: &mut Vec<u8>, values: impl Iterator<Item = &'a [u8]>) {
 
 fn write_user_daily(path: &Path, rows: &mut Rows, ctx: &Ctx) {
     let n = rows.n;
+    if SUM_ON.load(Relaxed) {
+        let (mut at, mut sum) = (0usize, 0u64);
+        for i in 0..n {
+            let len = u32::from_le_bytes(rows.user[at..at + 4].try_into().unwrap()) as usize;
+            let mut h = len as u64;
+            for &b in &rows.user[at + 4..at + 4 + len] {
+                h = mix(h, b as u64);
+            }
+            at += 4 + len;
+            let w = |v: &Vec<u8>| u32::from_le_bytes(v[4 * i..4 * i + 4].try_into().unwrap()) as u64;
+            for v in [w(&rows.day), w(&rows.sessions), w(&rows.events), u64::from_le_bytes(rows.rev[8 * i..8 * i + 8].try_into().unwrap()), rows.cat[i] as u64] {
+                h = mix(h, v);
+            }
+            sum = sum.wrapping_add(h);
+        }
+        SUMS[0].fetch_add(sum, Relaxed);
+        SUMS[1].fetch_add(n as u64, Relaxed);
+    }
     let mut dict = Vec::new();
     plain_bytes(&mut dict, ctx.aux.cat_names.iter().map(|c| c.as_slice()));
     let width = parquet::bit_width(ctx.aux.cat_names.len() as u32 - 1).max(1);
@@ -2346,6 +2386,14 @@ fn write_campaign_daily(path: &Path, cells: &[Cells], ctx: &Ctx) {
             let r: u64 = cells.iter().map(|x| x.rev[cell]).sum();
             let (name, chan): (&[u8], &[u8]) =
                 if c == ncamp { (b"organic", b"organic") } else { (&ctx.aux.camp_names[c], &ctx.aux.camp_channel[c]) };
+            if SUM_ON.load(Relaxed) {
+                let mut h = 7u64;
+                for v in [c as u64, d as u64, s, p, r, a] {
+                    h = mix(h, v);
+                }
+                SUMS[2].fetch_add(h, Relaxed);
+                SUMS[3].fetch_add(1, Relaxed);
+            }
             plain_bytes(&mut id, std::iter::once(name));
             plain_bytes(&mut channel, std::iter::once(chan));
             day.extend_from_slice(&((ctx.day0 + d as i64) as i32).to_le_bytes());
