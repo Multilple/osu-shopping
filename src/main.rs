@@ -118,6 +118,7 @@ struct ThreadOut {
     dates: fast::Dates,
     reader: input::Reader,
     simple: bool,
+    two_part: bool,
     /// How far ahead of the line being parsed to ask for input bytes
     /// (0: the input is in a buffer that is in cache already).
     ahead: usize,
@@ -349,6 +350,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
                 reader: input::Reader::new(chunk),
                 ahead: 0,
                 simple: std::env::var_os("SS_SIMPLE").is_some(),
+                two_part: std::env::var_os("SS_EV2").is_some(),
                 pend_e: vec![PendE::default(); 2 * HALF].into_boxed_slice(),
                 cur: 0,
                 npe: 0,
@@ -1241,11 +1243,118 @@ unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
     s
 }
 
+/// `events_fast` taking the line in two parts: everything the first window
+/// gives (event ID, user, time) is worked out and put away before the second
+/// window is looked at, so fewer values are alive at once. What it puts in
+/// the pending slot only counts once the whole line has proved sound.
+#[inline(never)]
+unsafe fn events_fast2(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) -> usize {
+    const VIEW: u32 = u32::from_le_bytes(*b"view");
+    const CART: u32 = u32::from_le_bytes(*b"cart");
+    const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+    let base = file.as_ptr();
+    let len = file.len();
+    let span = (ctx.we - ctx.ws) as u64;
+    let origin_s = ctx.origin / 1000;
+    let ahead = out.ahead;
+    let mut s = start;
+    while s < end {
+        if s + 128 > len {
+            break;
+        }
+        if ahead != 0 {
+            core::arch::x86_64::_mm_prefetch(base.wrapping_add(s + ahead) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+            core::arch::x86_64::_mm_prefetch(base.wrapping_add(s + ahead + 64) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        }
+        let a = fast::cut_a::<3, 4>(base, s);
+        if !a.shape {
+            // An unusual line: the plain code decides.
+            let Some(i) = memchr(b'\n', &file[s..end]) else { break };
+            event_line(&file[s..s + i], ctx, out, tid);
+            s += i + 1;
+            continue;
+        }
+        let n = out.npe;
+        let pe = out.pend_e.as_mut_ptr().add(out.cur + n);
+        let (s0, n0) = a.field(0);
+        let (h, hb) = hash_pair(fast::pack_at(base, s0, s0 + n0));
+        (*pe).h = h;
+        let (s1, n1) = a.field(1);
+        let user = fast::pack_at(base, s1, s1 + n1);
+        let first = ctx.ids.first(hash64(user));
+        ctx.ids.prefetch_at(first);
+        (*pe).ulo = user as u64;
+        (*pe).uhi = (user >> 64) as u64;
+        (*pe).first = first;
+        let (s2, n2) = a.field(2);
+        let t = out.dates.ts(base.add(s2), n2);
+        let sound_a = a.quotes & (n0 != 0);
+        let has_user = n1 != 0;
+
+        let b = fast::cut_b::<3, 5>(base, a.p[3]);
+        if !b.shape {
+            let Some(i) = memchr(b'\n', &file[s..end]) else { break };
+            event_line(&file[s..s + i], ctx, out, tid);
+            s += i + 1;
+            continue;
+        }
+        let e = b.p[4];
+        if e >= end {
+            break;
+        }
+        s = e + 1;
+        if !(sound_a & b.quotes) {
+            continue;
+        }
+        let (s3, n3) = b.field(0);
+        let ing = out.dates.f1(base.add(s3), n3);
+        let x = (((hb >> 20) & H2_MASK) << H2_SHIFT) | ingest32_s(origin_s, ing) as u64;
+        (*pe).x = x;
+        let (s4, n4) = b.field(1);
+        let (s5, n5) = b.field(2);
+        let tp = base.add(s4);
+        let w = std::ptr::read_unaligned(tp as *const u32);
+        let browse = (n4 == 4) & ((w == VIEW) | (w == CART));
+        // A user, a product, a time in the window, and not ingested more than 24 hours late.
+        let fresh = fast::good(ing) & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY);
+        let ok = has_user & (n5 != 0) & ((t.wrapping_sub(ctx.ws) as u64) < span) & fresh;
+        let mut ev = (t.wrapping_sub(ctx.origin) as u64) << 33;
+        let mut valid = ok & browse;
+        if opaque((ok & !browse) as u64) != 0 && n4 == 8 && std::ptr::read_unaligned(tp as *const u64) == PURCHASE {
+            let (s6, n6) = b.field(3);
+            if let Some(p) = parse_price(std::slice::from_raw_parts(base.add(s6), n6)) {
+                let prod = fast::pack_at(base, s5, s5 + n5);
+                ctx.aux.products.prefetch(prod);
+                out.pend_p[(out.cur != 0) as usize].push((n as u32, prod));
+                valid = true;
+                ev |= p as u64;
+            }
+        }
+        (*pe).ev = ev;
+        if valid {
+            out.npe = n + 1;
+            if n + 1 == HALF {
+                turn_events(ctx, out, tid);
+            }
+        } else {
+            let p = (h >> (64 - ctx.pbits)) as usize;
+            out.slim.push16(p, h, TAG | x, &mut out.arena_slim);
+        }
+    }
+    s
+}
+
 fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
     if exp() == 3 {
         return;
     }
-    let rest = if slow_only() { start } else { unsafe { events_fast(file, start, end, ctx, out, tid) } };
+    let rest = if slow_only() {
+        start
+    } else if out.two_part {
+        unsafe { events_fast2(file, start, end, ctx, out, tid) }
+    } else {
+        unsafe { events_fast(file, start, end, ctx, out, tid) }
+    };
     for line in lines(&file[rest..end]) {
         event_line(line, ctx, out, tid);
     }
