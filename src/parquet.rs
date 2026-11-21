@@ -254,48 +254,149 @@ pub fn write_file(path: &std::path::Path, columns: &[Column], num_rows: usize) -
 
 // ------------------------------------------------------------ encoders
 
-/// Bit-packs `values` (each below 2^width) as one RLE-hybrid bit-packed run.
-pub fn bitpack_run(out: &mut Vec<u8>, values: impl ExactSizeIterator<Item = u32>, width: u32) {
-    let n = values.len();
-    let groups = n.div_ceil(8);
-    let mut header = ((groups as u64) << 1) | 1;
-    while header >= 0x80 {
-        out.push((header as u8) | 0x80);
-        header >>= 7;
-    }
-    out.push(header as u8);
-    if width == 0 {
-        return;
-    }
-    let start = out.len();
-    let mut acc: u64 = 0;
-    let mut bits: u32 = 0;
-    for v in values {
-        acc |= (v as u64) << bits;
-        bits += width;
-        while bits >= 8 {
-            out.push(acc as u8);
-            acc >>= 8;
-            bits -= 8;
-        }
-    }
-    // Pad the last group of 8 values with zeros.
-    let want = groups * width as usize;
-    while out.len() - start < want {
-        out.push(acc as u8);
-        acc >>= 8;
-    }
-}
-
-/// Definition levels for a data page v1: a 4-byte length, then the levels.
-pub fn def_levels(out: &mut Vec<u8>, present: impl ExactSizeIterator<Item = bool>) {
+/// Definition levels for a data page v1: a 4-byte length, then the levels
+/// (`present(i)` for i in 0..n) as one bit-packed run.
+#[inline(always)]
+pub fn def_levels(out: &mut Vec<u8>, n: usize, present: impl Fn(usize) -> bool) {
     let at = out.len();
     out.extend_from_slice(&[0; 4]);
-    bitpack_run(out, present.map(|p| p as u32), 1);
+    pack_run(out, n, 1, |i| present(i) as u32);
     let len = (out.len() - at - 4) as u32;
     out[at..at + 4].copy_from_slice(&len.to_le_bytes());
 }
 
 pub fn bit_width(max: u32) -> u32 {
     32 - max.leading_zeros()
+}
+
+
+/// One RLE/bit-packed hybrid bit-packed run of `n` values `idx(0..n)`, each
+/// below 2^width (width 1..=16): the run header (number of groups of 8),
+/// then the groups, the last one padded with zeros.
+#[inline(always)]
+pub fn pack_run(out: &mut Vec<u8>, n: usize, width: u32, idx: impl Fn(usize) -> u32) {
+    debug_assert!((1..=16).contains(&width));
+    let groups = n.div_ceil(8);
+    let w = width as usize;
+    out.reserve(16 + groups * w + 16);
+    let mut header = ((groups as u64) << 1) | 1;
+    while header >= 0x80 {
+        out.push((header as u8) | 0x80);
+        header >>= 7;
+    }
+    out.push(header as u8);
+    let full = n / 8;
+    let rest = n - full * 8;
+    // Values k of a group as one integer (k in 0..m, at most 4 when w > 8).
+    let word = |at: usize, m: usize| {
+        let mut acc = 0u64;
+        for k in 0..m {
+            acc |= (idx(at + k) as u64) << (k * w);
+        }
+        acc
+    };
+    unsafe {
+        let base = out.as_mut_ptr().add(out.len());
+        let mut p = base;
+        if w <= 8 {
+            for g in 0..full {
+                (p as *mut u64).write_unaligned(word(g * 8, 8));
+                p = p.add(w);
+            }
+            if rest > 0 {
+                (p as *mut u64).write_unaligned(word(full * 8, rest));
+                p = p.add(w);
+            }
+        } else {
+            // Two halves of 4 values (4w bits each); the second starts at
+            // byte w/2, 4 bits in when w is odd.
+            let (q, r) = (w / 2, 4 * (w & 1));
+            let put = |p: *mut u8, lo: u64, hi: u64| {
+                (p as *mut u64).write_unaligned(lo);
+                let keep = (lo >> ((8 * q) & 63)) & ((1u64 << r) - 1);
+                (p.add(q) as *mut u64).write_unaligned((hi << r) | keep);
+            };
+            for g in 0..full {
+                put(p, word(g * 8, 4), word(g * 8 + 4, 4));
+                p = p.add(w);
+            }
+            if rest > 0 {
+                let lo = word(full * 8, rest.min(4));
+                let hi = if rest > 4 { word(full * 8 + 4, rest - 4) } else { 0 };
+                put(p, lo, hi);
+                p = p.add(w);
+            }
+        }
+        let len = out.len() + (p as usize - base as usize);
+        out.set_len(len);
+    }
+}
+
+/// The data page body of a required dictionary-encoded column: the bit
+/// width, then the indices as one bit-packed run.
+#[inline(always)]
+pub fn dict_indices(out: &mut Vec<u8>, n: usize, width: u32, idx: impl Fn(usize) -> u32) {
+    out.push(width as u8);
+    pack_run(out, n, width, idx);
+}
+
+/// Dictionary encoding of an INT32 column given in PLAIN layout, when its
+/// values span a range below 2^20 and it comes out smaller: (dictionary
+/// page body, dictionary size, data page body). The dictionary holds the
+/// values in ascending order: every value of the range when it is short,
+/// else the distinct ones.
+pub fn dict_i32(plain: &[u8]) -> Option<(Vec<u8>, usize, Vec<u8>)> {
+    let n = plain.len() / 4;
+    if n == 0 {
+        return None;
+    }
+    let get = |i: usize| unsafe { (plain.as_ptr().add(4 * i) as *const i32).read_unaligned() };
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for i in 0..n {
+        let v = get(i);
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let range = (hi as i64 - lo as i64) as usize;
+    if range >= 1 << 20 {
+        return None;
+    }
+    let off = |v: i32| v.wrapping_sub(lo) as u32;
+    let mut dict = Vec::new();
+    let mut data = Vec::new();
+    let d;
+    if range < 4096 {
+        d = range as u32 + 1;
+        for k in 0..d {
+            dict.extend_from_slice(&lo.wrapping_add(k as i32).to_le_bytes());
+        }
+        let width = bit_width(d - 1).max(1);
+        dict_indices(&mut data, n, width, |i| off(get(i)));
+    } else {
+        let mut map = vec![0u32; range + 1];
+        for i in 0..n {
+            unsafe { *map.get_unchecked_mut(off(get(i)) as usize) = 1 };
+        }
+        let mut m = 0u32;
+        for (k, x) in map.iter_mut().enumerate() {
+            if *x != 0 {
+                *x = m;
+                m += 1;
+                dict.extend_from_slice(&lo.wrapping_add(k as i32).to_le_bytes());
+            }
+        }
+        d = m;
+        if d > 1 << 16 {
+            return None;
+        }
+        let width = bit_width(d - 1).max(1);
+        if dict.len() + 16 + n * width as usize / 8 >= plain.len() {
+            return None;
+        }
+        dict_indices(&mut data, n, width, |i| unsafe { *map.get_unchecked(off(get(i)) as usize) });
+    }
+    if dict.len() + data.len() >= plain.len() {
+        return None;
+    }
+    Some((dict, d as usize, data))
 }

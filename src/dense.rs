@@ -43,7 +43,7 @@ pub(crate) type Lists = crate::table::Streams<[u64; 2], 10>;
 use crate::util::*;
 use crate::{
     build_ctx, env_usize, fast, grid_tasks, input, lines, load_aux, par, person_grid, person_sorted,
-    slow_only, write_campaign_daily, write_user_daily, Cells, Click, Ctx, Rows, Sess, Shared, Tl, DAY_MS, GAP, NOCAT, WEEK,
+    slow_only, write_campaign_daily, write_user_daily, user_run, Cells, Click, Ctx, Rows, Sess, Shared, Tl, DAY_MS, GAP, NOCAT, WEEK,
 };
 
 // ---------------------------------------------------------------- the ID code
@@ -1167,17 +1167,10 @@ fn reserve_rows(rows: &mut Rows, n: usize) {
 
 /// One user_daily row, for a short name and columns with room (see `reserve_rows`).
 #[inline(always)]
-unsafe fn push_row(who: Key, day: u32, sessions: u32, events: u32, rev: u64, best: u16, tl: &mut Tl) {
+unsafe fn push_row(day: u32, sessions: u32, events: u32, rev: u64, best: u16, tl: &mut Tl) {
     let rows = &mut tl.rows;
     let n = rows.n;
     rows.n = n + 1;
-    // A 4-byte length, then the ID: write all 16 key bytes and keep `len`.
-    let len = (who >> 120) as usize;
-    let at = rows.user.len();
-    let p = rows.user.as_mut_ptr().add(at);
-    (p as *mut u32).write_unaligned(len as u32);
-    (p.add(4) as *mut u128).write_unaligned(who);
-    rows.user.set_len(at + 4 + len);
     (rows.day.as_mut_ptr().add(n * 4) as *mut i32).write_unaligned(tl.day0 + day as i32);
     rows.day.set_len(n * 4 + 4);
     (rows.sessions.as_mut_ptr().add(n * 4) as *mut u32).write_unaligned(sessions);
@@ -1274,6 +1267,7 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
         // One row per day with a session.
         reserve_rows(&mut tl.rows, tl.nd);
         let mut i = 0;
+        let n0 = tl.rows.n;
         while i < ns {
             let day = (*sess.add(i)).day;
             let (mut d_sessions, mut d_events, mut d_rev) = (0u32, 0u32, 0u64);
@@ -1286,7 +1280,11 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
             let best = tl.best[day as usize];
             tl.best[day as usize] = NOCAT;
             tl.best_sum[day as usize] = 0;
-            push_row(who, day, d_sessions, d_events, d_rev, best, tl);
+            push_row(day, d_sessions, d_events, d_rev, best, tl);
+        }
+        let k = (tl.rows.n - n0) as u32;
+        if k > 0 {
+            user_run(&mut tl.rows, who, k);
         }
     }
     true
