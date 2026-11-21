@@ -13,6 +13,7 @@
 //!              attribute, aggregate, and write Parquet.
 
 mod dense;
+mod dense_ck;
 mod dense_ev;
 mod diag;
 mod fast;
