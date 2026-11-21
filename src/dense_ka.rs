@@ -246,7 +246,8 @@ impl K {
         self.ukey = dn.keys.user & M40;
         self.ev_top = dn.max_event << 24;
         self.us_top = dn.vbound << 24;
-        self.m_stream = !0u64 << (24 + dn.kb);
+        // (Bits 0..6 of an event's number are 0: the stream's number times 128.)
+        self.m_stream = !0u64 << (24 + dn.kb) | 0x7F;
         self.m_slot2 = ((1u64 << (dn.kb + 1)) - 1) << 23;
         self.ws = ctx.ws;
         self.wso = wso;
@@ -544,7 +545,7 @@ macro_rules! define_events {
             "imul r14, qword ptr [rdi + {ainv}]",                   // the user's
             "cmp r9, qword ptr [rdi + {ev_top}]",
             "jae 88f",                  // not a dense event
-            "pext r8, r9, qword ptr [rdi + {m_stream}]",            // r8: stream
+            "pext r8, r9, qword ptr [rdi + {m_stream}]",            // r8: stream, times 128
             "pext rcx, r9, qword ptr [rdi + {m_slot2}]",
             "pext r9, r14, qword ptr [rdi + {m_node}]",
             "or rcx, r9",               // rcx: twice the slot | node << 21
@@ -561,13 +562,13 @@ macro_rules! define_events {
             "jne 83f",
             "vmovq xmm6, qword ptr [rdi + r10*8 + {ms}]",
             "vpsubq xmm9, xmm6, xmm9",
-            "mov r14, r10",             // ingest's date: nearly always the same bytes
+            // (ingest's date: nearly always the same bytes)
             "cmp rdx, qword ptr [r13 + 1]",
             "jne 62f",
             "cmp eax, dword ptr [r13 + 8]",
             "jne 62f",
             "63:",
-            "vpinsrq xmm9, xmm9, qword ptr [rdi + r14*8 + {sec}], 1", // (date of ts - form's offset, ingest's date)
+            "vpinsrq xmm9, xmm9, qword ptr [rdi + r10*8 + {sec}], 1", // (date of ts - form's offset, ingest's date)
             "vpand xmm9, xmm9, xmm11",                               // (ts by date and time only)
             "vpaddq xmm9, xmm9, xmmword ptr [rdi + {c_bias}]",       // (less the window's start, plus the record field's bias)
             "mov eax, dword ptr [r13 + 20]",
@@ -618,11 +619,10 @@ macro_rules! define_events {
             "vextracti128 xmm3, ymm1, 1",
             "vpaddq xmm1, xmm1, xmm9",                               // with the dates, less the form's offset
             "vpaddq xmm1, xmm1, xmm3",                               // (ts in ms - window start, ingest in s + bias)
-            "or r12, r9",
             // ---- A valid view or cart?
             "vmovq rax, xmm1",          // rax: ts less the window's start, ms
             "vpextrq rdx, xmm1, 1",     // rdx: ingest, s, plus the record field's bias
-            "test r12, r12",
+            "or r12, r9",
             "jnz 85f",
             "cmp rax, qword ptr [rdi + {span}]",
             "jae 86f",                  // outside the window
@@ -634,7 +634,6 @@ macro_rules! define_events {
             "shl rdx, 33",
             "lea rdx, [rdx + rax*4]",   // rdx: ingest31 << 33 | ts offset << 2
             // ---- The record goes to its stream, whose count, write pointer and waiting items are one 128-byte block.
-            "shl r8, 7",
             "add r8, qword ptr [rdi + {streams}]",
             "mov eax, dword ptr [r8]",
             "lea r9d, [rax + 1]",
@@ -657,10 +656,10 @@ macro_rules! define_events {
             "62:",
             "mov rdx, qword ptr [r13 + 1]",
             "mov eax, dword ptr [r13 + 8]",
-            "pext r14d, eax, dword ptr [rdi + {date_bits}]",
-            "cmp rdx, qword ptr [rdi + r14*8 + {key8}]",
+            "pext r10d, eax, dword ptr [rdi + {date_bits}]",
+            "cmp rdx, qword ptr [rdi + r10*8 + {key8}]",
             "jne 84f",
-            "cmp eax, dword ptr [rdi + r14*4 + {key4}]",
+            "cmp eax, dword ptr [rdi + r10*4 + {key4}]",
             "jne 84f",
             "jmp 63b",
             "82:",
@@ -678,7 +677,7 @@ macro_rules! define_events {
             "84:",
             "inc r13",
             "mov qword ptr [rdi + {s_ptr}], r13",
-            "mov qword ptr [rdi + {s_idx}], r14",
+            "mov qword ptr [rdi + {s_idx}], r10",
             "mov eax, 3",
             "jmp 99b",
             "85:",
@@ -688,6 +687,7 @@ macro_rules! define_events {
             "mov qword ptr [rdi + {s_t}], rax",
             "mov qword ptr [rdi + {s_ing}], rdx",
             "mov qword ptr [rdi + {s_w1}], rcx",
+            "shr r8, 7",
             "mov qword ptr [rdi + {s_stream}], r8",
             "mov qword ptr [rdi + {s_next}], rsi",
             "mov qword ptr [rdi + {s_indirect}], r9",
