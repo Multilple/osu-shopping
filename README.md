@@ -1,6 +1,6 @@
 # Shopping Sessions (Builders Buildathon, Databricks track)
 
-One static Rust binary, no dependencies. `rules.md` is the spec it implements.
+One static Rust binary, no dependencies. Implements the track's rules.md.
 
     docker build -t shopping-sessions .
 
