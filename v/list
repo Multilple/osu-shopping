@@ -1,8 +1,9 @@
 a a
-h h
 n n
-ap ap
-hp hp
-b14 b14
-hpf h XL_PF=1
-hnr h XL_REL=0
+n4 n NCPU=4
+n6 n NCPU=6
+n12 n NCPU=12
+nr n XL_REL=0
+ub11 ub11
+ub13 ub13
+r16 r16
