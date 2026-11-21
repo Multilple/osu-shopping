@@ -1485,6 +1485,9 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
             let from = a.max(e[1] & seen) as usize;
             *e = [serial, b as u32];
             let n = b - from;
+            if me.timed {
+                NHIST[n.min(15)].fetch_add(1, Relaxed);
+            }
             // The first two sessions without a branch (see the two spare sessions above).
             let row = assist.add(c * nd);
             *row.add((*sess.add(from)).day as usize) += (n > 0) as u32;
@@ -1533,6 +1536,8 @@ fn person_run(p: u32, evs: &mut [u64], keys: &mut [u64], cids: &[u32], dn: &Dn, 
     }
     attribute(keys, cids, dn, me);
 }
+
+static NHIST: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
 /// (Statistics: persons whose single run of events was not in time order.)
 static UNORDERED: AtomicUsize = AtomicUsize::new(0);
@@ -1902,6 +1907,18 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     let dn = dn;
     CURRENT.store(&dn as *const Dn as *mut Dn, Relaxed);
     let outs_ref: Vec<&DOut> = (0..threads).map(|t| &*mine(&outs, t)).collect();
+    // The input text is done with (every name kept was copied): one more
+    // thread gives its pages back while the stages below run, so that this
+    // is neither left for the end nor for the exit.
+    let unmapper = {
+        let files: Vec<Src> = event_files.into_iter().chain(click_files).collect();
+        std::thread::spawn(move || {
+            for f in &files {
+                f.unmap();
+            }
+            std::mem::forget(files);
+        })
+    };
 
     // ------------------------------------------------------------ dedup
     let aouts: Vec<Cell<AOut>> =
@@ -2018,26 +2035,20 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         let v: Vec<usize> = STATS.iter().map(|x| x.swap(0, Relaxed)).collect();
         eprintln!("    persons with clicks by clicks x sessions (<=64, <=256, <=1024, more): {:?}; pairs {:?}; clicks {:?}", &v[..4], &v[4..8], &v[8..]);
         eprintln!("    one-run persons not in time order (or with a long name): {}", UNORDERED.swap(0, Relaxed));
+        eprintln!("    sessions newly assisted per click (0..14, 15+): {:?}", NHIST.iter().map(|x| x.swap(0, Relaxed)).collect::<Vec<_>>());
     }
 
     // The last table is small: write it while the other threads give the big
     // buffers back, which is quicker than leaving it all to process exit.
     let cells: Vec<Cells> = cells.into_iter().map(|c| c.0.into_inner().unwrap()).collect();
-    let next = AtomicUsize::new(0);
     par(threads, |tid| {
         if tid == 0 {
             write_campaign_daily(&camp_dir.join("part-000.parquet"), &cells, &ctx);
         }
         outs_ref[tid].arena.release();
         aouts_ref[tid].arena.release();
-        loop {
-            let i = next.fetch_add(1, Relaxed);
-            match event_files.get(i).or_else(|| click_files.get(i.wrapping_sub(event_files.len()))) {
-                Some(src) => src.unmap(),
-                None => break,
-            }
-        }
     });
+    let _ = unmapper.join();
     release(dn.r8, d + XCAP);
     release(dn.runs, d);
     CURRENT.store(std::ptr::null_mut(), Relaxed);

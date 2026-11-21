@@ -89,6 +89,7 @@ struct Run {
     sum: String,
     hwm_gb: f64,
     laps: String,
+    subs: String,
 }
 
 fn one(exe: &Path, data: &Path, out: &Path, threads: usize, env: &[(&str, &str)]) -> Run {
@@ -103,12 +104,13 @@ fn one(exe: &Path, data: &Path, out: &Path, threads: usize, env: &[(&str, &str)]
     let res = cmd.spawn().and_then(|c| c.wait_with_output());
     let wall = t.elapsed().as_secs_f64() * 1e3;
     let (u1, s1) = sys::usage_children();
-    let mut r = Run { wall, user: u1 - u0, sys: s1 - s0, dense: false, ok: false, sum: String::new(), hwm_gb: 0.0, laps: String::new() };
+    let mut r = Run { wall, user: u1 - u0, sys: s1 - s0, dense: false, ok: false, sum: String::new(), hwm_gb: 0.0, laps: String::new(), subs: String::new() };
     let Ok(o) = res else { return r };
     r.ok = o.status.success();
     let text = String::from_utf8_lossy(&o.stderr);
     let (mut w, mut u, mut s) = (0.0f64, 0.0f64, 0.0f64);
     let mut laps = Vec::new();
+    let mut subs: Vec<String> = Vec::new();
     for l in text.lines() {
         if l.contains("dense: keys") {
             r.dense = true;
@@ -117,8 +119,10 @@ fn one(exe: &Path, data: &Path, out: &Path, threads: usize, env: &[(&str, &str)]
         } else if let Some(x) = l.strip_prefix("HWM ") {
             r.hwm_gb = x.trim().parse::<f64>().unwrap_or(0.0) / 1048576.0;
         } else if let Some((ms, rest)) = l.split_once(" ms  ") {
-            // A stage (not a part of one: those are indented).
+            // A stage (not a part of one: those are indented; of them just when they ended).
             if rest.starts_with(' ') {
+                let name: String = rest.trim_start().chars().filter(|c| !c.is_whitespace() && *c != ':').take(7).collect();
+                subs.push(format!("{name}@{:.0}", ms.trim().parse::<f64>().unwrap_or(0.0)));
                 continue;
             }
             let f: Vec<&str> = rest.split_whitespace().collect();
@@ -129,6 +133,7 @@ fn one(exe: &Path, data: &Path, out: &Path, threads: usize, env: &[(&str, &str)]
         }
     }
     r.laps = laps.join(" ");
+    r.subs = subs.join(" ");
     r
 }
 
@@ -220,6 +225,7 @@ pub fn main(threads: usize) -> ! {
         page.push(line);
         if let (Some(g), Some(d)) = (&best[0], &best[1]) {
             page.push(format!("Ld {}", d.laps));
+            page.push(format!("Ls {}", d.subs));
             page.push(format!("Lg {}", g.laps));
             page.push(format!("sum {} [{}] hwm d{:.1} g{:.1}", if !d.sum.is_empty() && d.sum == g.sum { "SAME" } else { "DIFFERENT" }, d.sum, d.hwm_gb, g.hwm_gb));
         }
