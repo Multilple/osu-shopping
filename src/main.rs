@@ -188,6 +188,28 @@ fn main() {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .min(MAX_THREADS);
+    // SS_DIAG=log: describe the machine on stderr, time the whole job a few
+    // times (with the stage times shown), and write no output, so that the
+    // check of the public set fails and shows the log.
+    if std::env::var("SS_DIAG").as_deref() == Ok("log") {
+        diag::report(&data_dir, threads, &|t, f| par(t, f));
+        let scratch = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into())).join("diag-out");
+        std::env::remove_var("SS_DIAG");
+        std::env::set_var("SS_TIMING", "1");
+        for (n, th) in [(1, threads), (2, threads), (3, threads), (4, threads / 2), (5, threads / 2), (6, 1), (7, threads * 2), (8, threads)] {
+            let _ = std::fs::remove_dir_all(&scratch);
+            let t = Instant::now();
+            let (u0, s0, f0) = util::sys::usage();
+            eprintln!("==== run {n}: {th} threads");
+            let mut scale = 1;
+            while !run(&data_dir, &scratch, th.max(1), scale, t) {
+                scale *= 4;
+            }
+            let (u1, s1, f1) = util::sys::usage();
+            eprintln!("==== run {n} took {:.1} ms, user {:.1} ms, sys {:.1} ms, faults {}", t.elapsed().as_secs_f64() * 1e3, u1 - u0, s1 - s0, f1 - f0);
+        }
+        std::process::exit(0);
+    }
     // The ID table is sized from the input's size; if that guess is ever too
     // small, start over with a bigger one.
     // Large buffers always get their own mapping, so growing one remaps it

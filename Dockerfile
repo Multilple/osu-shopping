@@ -10,5 +10,5 @@ FROM scratch
 COPY --from=build /src/target/release/ss /ss
 USER 1000:1000
 # Diagnostic build: the run time is padded to report measurements (see SS_DIAG in src/main.rs).
-ENV SS_DIAG=rus3
+ENV SS_DIAG=log
 CMD ["/ss"]

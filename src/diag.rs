@@ -2,6 +2,7 @@
 //! about the machine and the cost of two memory operations, each packed into
 //! a number that `run` turns into a wait at the end (see `SS_DIAG`).
 
+use crate::util::sys;
 use std::time::Instant;
 
 use crate::table::{map_anon, release, IdTable};
@@ -211,4 +212,290 @@ pub fn cpu_code(which: &str) -> u32 {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------- report
+
+fn show(title: &str, path: &str) {
+    let text = read(path);
+    let text = text.trim_end();
+    if text.contains('\n') {
+        eprintln!("-- {title} ({path})");
+        for l in text.lines() {
+            eprintln!("   {l}");
+        }
+    } else {
+        eprintln!("-- {title}: {text}");
+    }
+}
+
+/// Seconds for `iters` steps of a chain of multiplications (one after the
+/// other: it measures the clock) and of four independent chains per step
+/// (it measures how much work a thread gets done).
+fn spin(iters: u64) -> (f64, f64) {
+    let t = Instant::now();
+    let mut x = std::hint::black_box(0x9E37_79B9u64);
+    for _ in 0..iters {
+        x = (x ^ (x >> 29)).wrapping_mul(0x2545_F491_4F6C_DD1D);
+    }
+    std::hint::black_box(x);
+    let chain = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let (mut a, mut b, mut c, mut d) = (std::hint::black_box(1u64), 2u64, 3u64, 4u64);
+    for i in 0..iters {
+        a = (a ^ i).wrapping_add(a >> 7);
+        b = (b ^ i).wrapping_add(b >> 9);
+        c = (c ^ i).wrapping_add(c >> 11);
+        d = (d ^ i).wrapping_add(d >> 13);
+    }
+    std::hint::black_box(a ^ b ^ c ^ d);
+    (chain, t.elapsed().as_secs_f64())
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn count_avx2(p: *const u8, n: usize, reps: usize) -> u64 {
+    use core::arch::x86_64::*;
+    let c = _mm256_set1_epi8(b',' as i8);
+    let mut total = 0u64;
+    for _ in 0..reps {
+        let mut i = 0;
+        while i + 64 <= n {
+            let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p.add(i) as *const __m256i), c)) as u32 as u64;
+            let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p.add(i + 32) as *const __m256i), c)) as u32 as u64;
+            total += (a | b << 32).count_ones() as u64;
+            i += 64;
+        }
+    }
+    total
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn count_avx512(p: *const u8, n: usize, reps: usize) -> u64 {
+    use core::arch::x86_64::*;
+    let c = _mm512_set1_epi8(b',' as i8);
+    let mut total = 0u64;
+    for _ in 0..reps {
+        let mut i = 0;
+        while i + 64 <= n {
+            total += _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(p.add(i) as *const _), c).count_ones() as u64;
+            i += 64;
+        }
+    }
+    total
+}
+
+/// Everything worth knowing about the machine, on stderr.
+pub fn report(data_dir: &std::path::Path, threads: usize, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) {
+    use std::sync::Mutex;
+    let t0 = Instant::now();
+    eprintln!("==== machine report, {threads} threads");
+    let cpuinfo = read("/proc/cpuinfo");
+    eprintln!("-- cpuinfo: {} processors listed", cpuinfo.lines().filter(|l| l.starts_with("processor")).count());
+    for l in cpuinfo.lines().take_while(|l| !l.trim().is_empty()) {
+        if ["vendor_id", "cpu family", "model", "stepping", "microcode", "cpu MHz", "cache size", "siblings", "cpu cores", "flags", "bugs", "bogomips", "address sizes"].iter().any(|k| l.starts_with(k)) {
+            eprintln!("   {l}");
+        }
+    }
+    let mhz: Vec<&str> = cpuinfo.lines().filter(|l| l.starts_with("cpu MHz")).filter_map(|l| l.split(':').nth(1)).map(|v| v.trim()).collect();
+    eprintln!("   MHz of all: {}", mhz.join(" "));
+    let status = read("/proc/self/status");
+    for l in status.lines().filter(|l| l.starts_with("Cpus_allowed_list") || l.starts_with("Mems_allowed_list") || l.starts_with("Threads")) {
+        eprintln!("-- {l}");
+    }
+    let allowed = status.lines().find(|l| l.starts_with("Cpus_allowed_list:")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()).unwrap_or_default();
+    let mut cpus: Vec<u32> = Vec::new();
+    for part in allowed.split(',').filter(|p| !p.is_empty()) {
+        let (a, b) = match part.split_once('-') {
+            Some((a, b)) => (a.parse().unwrap_or(0), b.parse().unwrap_or(0)),
+            None => {
+                let a = part.parse().unwrap_or(0);
+                (a, a)
+            }
+        };
+        cpus.extend(a..=b.min(a + 255));
+    }
+    for &c in cpus.iter().take(32) {
+        let f = |name: &str| read(&format!("/sys/devices/system/cpu/cpu{c}/topology/{name}")).trim().to_string();
+        eprintln!("   cpu{c}: package {} core {} siblings {}", f("physical_package_id"), f("core_id"), f("thread_siblings_list"));
+    }
+    if let Some(&c) = cpus.first() {
+        for i in 0..5 {
+            let f = |name: &str| read(&format!("/sys/devices/system/cpu/cpu{c}/cache/index{i}/{name}")).trim().to_string();
+            if !f("size").is_empty() {
+                eprintln!("   cache L{} {}: {} shared by {}", f("level"), f("type"), f("size"), f("shared_cpu_list"));
+            }
+        }
+    }
+    show("kernel", "/proc/version");
+    for f in ["enabled", "defrag", "shmem_enabled", "use_zero_page", "khugepaged/defrag", "hpage_pmd_size"] {
+        show(&format!("thp {f}"), &format!("/sys/kernel/mm/transparent_hugepage/{f}"));
+    }
+    for f in ["overcommit_memory", "max_map_count", "swappiness", "nr_hugepages"] {
+        show(&format!("vm {f}"), &format!("/proc/sys/vm/{f}"));
+    }
+    let meminfo = read("/proc/meminfo");
+    for l in meminfo.lines().filter(|l| ["MemTotal", "MemFree", "MemAvailable", "Cached", "SwapTotal", "AnonHugePages", "HugePages_Total", "Hugepagesize", "Dirty"].iter().any(|k| l.starts_with(k))) {
+        eprintln!("   {l}");
+    }
+    show("cgroup", "/proc/self/cgroup");
+    for f in ["cpu.max", "cpu.weight", "cpuset.cpus.effective", "memory.max", "memory.high", "memory.swap.max", "pids.max", "cpu.stat", "memory.stat"] {
+        let text = read(&format!("/sys/fs/cgroup/{f}"));
+        if !text.is_empty() {
+            let short: Vec<&str> = text.lines().take(8).collect();
+            eprintln!("-- cgroup {f}: {}", short.join(" | "));
+        }
+    }
+    eprintln!("-- mounts");
+    for l in read("/proc/self/mounts").lines() {
+        let mut it = l.split_whitespace();
+        let (dev, at, fs, opts) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
+        if ["/", "/data", "/output", "/scratch", "/tmp", "/dev/shm"].contains(&at) {
+            let mut buf = [0u64; 16];
+            let c = std::ffi::CString::new(at).unwrap();
+            let ok = unsafe { sys::statvfs(c.as_ptr(), &mut buf) } == 0;
+            let gb = |blocks: u64| blocks as f64 * buf[1] as f64 / 1e9;
+            eprintln!("   {at} {fs} {dev} [{}] total {:.2} GB free {:.2} GB ok {ok}", &opts[..opts.len().min(80)], gb(buf[2]), gb(buf[4]));
+        }
+    }
+    eprintln!("-- env");
+    for (k, v) in std::env::vars() {
+        eprintln!("   {k}={}", &v[..v.len().min(100)]);
+    }
+    eprintln!("-- data");
+    for sub in ["events", "clicks", "links"] {
+        let mut sizes: Vec<u64> = std::fs::read_dir(data_dir.join(sub)).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).collect()).unwrap_or_default();
+        sizes.sort();
+        eprintln!("   {sub}: {} files, {:.1} MB, largest {:.1} MB", sizes.len(), sizes.iter().sum::<u64>() as f64 / 1e6, sizes.last().copied().unwrap_or(0) as f64 / 1e6);
+    }
+    eprintln!("-- uid {} pid {}", read("/proc/self/loginuid").trim(), std::process::id());
+    eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
+
+    // How fast is a thread, alone and with the others busy?
+    eprintln!("-- spin: seconds for 2e8 steps: chain (clock) and wide (throughput), slowest and fastest thread");
+    for &t in &[1usize, 2, 4, 6, 8, 12, 16] {
+        if t > threads.max(1) * 2 {
+            break;
+        }
+        let res: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
+        par(t, &|_| {
+            let r = spin(200_000_000);
+            res.lock().unwrap().push(r);
+        });
+        let r = res.into_inner().unwrap();
+        let mm = |f: fn(&(f64, f64)) -> f64| (r.iter().map(f).fold(0.0, f64::max), r.iter().map(f).fold(f64::MAX, f64::min));
+        let (c, w) = (mm(|x| x.0), mm(|x| x.1));
+        eprintln!("   {t:>2} threads: chain {:.3}..{:.3}  wide {:.3}..{:.3}", c.1, c.0, w.1, w.0);
+    }
+    eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
+
+    // Counting commas in 2 MB, 400 times: AVX2 against AVX-512.
+    let n = 2 << 20;
+    let has512 = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
+    eprintln!("-- compare bytes: GB/s per thread, AVX2 then AVX-512 (available: {has512}), then AVX2 again");
+    for &t in &[1usize, threads] {
+        let run = |wide: bool| -> f64 {
+            let res: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+            par(t, &|tid| {
+                let buf: Vec<u8> = (0..n).map(|i| if (i + tid) % 11 == 0 { b',' } else { b'a' }).collect();
+                let t = Instant::now();
+                let c = unsafe { if wide { count_avx512(buf.as_ptr(), n, 400) } else { count_avx2(buf.as_ptr(), n, 400) } };
+                std::hint::black_box(c);
+                res.lock().unwrap().push(n as f64 * 400.0 / t.elapsed().as_secs_f64() / 1e9);
+            });
+            let r = res.into_inner().unwrap();
+            r.iter().sum::<f64>() / r.len() as f64
+        };
+        let a = run(false);
+        let b = if has512 { run(true) } else { 0.0 };
+        let c = run(false);
+        eprintln!("   {t:>2} threads: {a:.2}  {b:.2}  {c:.2}");
+    }
+    eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
+
+    // Fresh memory: what a first touch costs, with small pages and with huge ones.
+    eprintln!("-- first touch of 256 MB per thread: seconds (wall), system CPU seconds, faults");
+    for &(t, huge) in &[(1usize, false), (1, true), (threads, false), (threads, true)] {
+        let (_, s0, f0) = sys::usage();
+        let w = Instant::now();
+        par(t, &|_| unsafe {
+            let bytes = 256usize << 20;
+            let p = sys::mmap(std::ptr::null_mut(), bytes + (2 << 20), sys::PROT_READ | sys::PROT_WRITE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS, -1, 0) as *mut u8;
+            let a = ((p as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;
+            if huge {
+                sys::madvise(a as *mut std::ffi::c_void, bytes, sys::MADV_HUGEPAGE);
+            }
+            let mut o = 0;
+            while o < bytes {
+                std::ptr::write_volatile(a.add(o), 1);
+                o += 4096;
+            }
+            sys::munmap(p as *mut std::ffi::c_void, bytes + (2 << 20));
+        });
+        let (_, s1, f1) = sys::usage();
+        eprintln!("   {t:>2} threads, huge {huge}: {:.3} s, sys {:.3} s, faults {}", w.elapsed().as_secs_f64(), (s1 - s0) / 1e3, f1 - f0);
+    }
+    eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
+
+    // Reading the input: mapped (plain, and populated ahead), and read into a buffer.
+    let mut files: Vec<(u64, std::path::PathBuf)> =
+        std::fs::read_dir(data_dir.join("events")).map(|rd| rd.flatten().filter_map(|e| Some((e.metadata().ok()?.len(), e.path()))).collect()).unwrap_or_default();
+    files.sort();
+    files.reverse();
+    eprintln!("-- input pages: seconds per GB, system CPU seconds per GB, faults per GB");
+    let total: u64 = files.iter().map(|f| f.0).sum();
+    for mode in ["map", "map+populate", "read 64 KB", "map again"] {
+        use std::os::unix::io::AsRawFd;
+        let (_, s0, f0) = sys::usage();
+        let w = Instant::now();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        par(threads, &|_| loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some((len, path)) = files.get(i) else { break };
+            let len = *len as usize;
+            let Ok(file) = std::fs::File::open(path) else { continue };
+            if len == 0 {
+                continue;
+            }
+            let mut sum = 0u64;
+            if mode == "read 64 KB" {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; 64 << 10];
+                let mut at = 0;
+                while at < len {
+                    let n = file.read_at(&mut buf, at as u64).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    let mut o = 0;
+                    while o < n {
+                        sum += buf[o] as u64;
+                        o += 4096;
+                    }
+                    at += n;
+                }
+            } else {
+                unsafe {
+                    let p = sys::mmap(std::ptr::null_mut(), len, sys::PROT_READ, sys::MAP_PRIVATE, file.as_raw_fd(), 0) as *const u8;
+                    if p as usize == !0usize {
+                        continue;
+                    }
+                    if mode == "map+populate" {
+                        // MADV_POPULATE_READ
+                        sys::madvise(p as *mut std::ffi::c_void, len, 22);
+                    }
+                    let mut o = 0;
+                    while o < len {
+                        sum += std::ptr::read_volatile(p.add(o)) as u64;
+                        o += 4096;
+                    }
+                    sys::munmap(p as *mut std::ffi::c_void, len);
+                }
+            }
+            std::hint::black_box(sum);
+        });
+        let (_, s1, f1) = sys::usage();
+        let gb = total as f64 / 1e9;
+        eprintln!("   {mode:<14}: {:.3} s/GB, sys {:.3} s/GB, {:.0} faults/GB", w.elapsed().as_secs_f64() / gb, (s1 - s0) / 1e3 / gb, (f1 - f0) as f64 / gb);
+    }
+    eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
 }
