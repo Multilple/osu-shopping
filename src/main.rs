@@ -204,9 +204,22 @@ fn par<F: Fn(usize) + Sync>(threads: usize, f: F) {
 
 fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instant) -> bool {
     let log = std::env::var_os("SS_TIMING").is_some();
+    // SS_PAD=<stage>: at the end, wait until the whole run has taken 2 s plus
+    // ten times what that stage took (a way to read one stage's time off a
+    // total measured from outside). SS_PAD=none waits until 2 s exactly.
+    let pad = std::env::var("SS_PAD").ok();
+    let last = std::cell::Cell::new(0.0f64);
+    let padded = std::cell::Cell::new(0.0f64);
     let lap = |what: &str| {
+        let now = t0.elapsed().as_secs_f64();
         if log {
-            eprintln!("{:>8.1} ms  {}", t0.elapsed().as_secs_f64() * 1e3, what);
+            eprintln!("{:>8.1} ms  {}", now * 1e3, what);
+        }
+        if !what.starts_with(' ') {
+            if pad.as_deref() == Some(what) {
+                padded.set(now - last.get());
+            }
+            last.set(now);
         }
     };
 
@@ -371,6 +384,13 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         ctx.ids.release_part(tid, threads);
     });
     lap("campaign_daily");
+    if pad.is_some() {
+        let until = 2.0 + 10.0 * padded.get();
+        let now = t0.elapsed().as_secs_f64();
+        if until > now {
+            std::thread::sleep(std::time::Duration::from_secs_f64(until - now));
+        }
+    }
     true
 }
 
