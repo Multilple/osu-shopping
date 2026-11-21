@@ -161,39 +161,38 @@ pub fn main(threads: usize) -> ! {
             continue;
         }
         let big = tag == "60";
-        let mut variants: Vec<(&str, usize, Vec<(&str, &str)>)> = vec![("g", threads, vec![("SS_DENSE", "0")]), ("d", threads, vec![])];
+        // (label, threads, settings, which binary: "" is this one, "2" is /ss2 and so on, where present)
+        let mut variants: Vec<(&str, usize, Vec<(&str, &str)>, &str)> = vec![("g", threads, vec![("SS_DENSE", "0")], ""), ("d", threads, vec![], "")];
         if !big {
             variants.extend([
-                ("d6", threads * 3 / 4, vec![]),
-                ("d4", threads / 2, vec![]),
-                ("d12", threads * 3 / 2, vec![]),
-                ("d16", threads * 2, vec![]),
-                ("a0", threads, vec![("SS_AHEAD", "0")]),
-                ("a1k", threads, vec![("SS_AHEAD", "1024")]),
-                ("a16k", threads, vec![("SS_AHEAD", "16384")]),
-                ("p1", threads, vec![("SS_POP", "1")]),
-                ("pc.25", threads, vec![("SS_PIECE", "262144")]),
-                ("pc1", threads, vec![("SS_PIECE", "1048576")]),
-                ("pc16", threads, vec![("SS_PIECE", "16777216")]),
-                ("nh", threads, vec![("SS_NOHUGE", "1")]),
-                ("kb13", threads, vec![("SS_KB", "13")]),
-                ("kb14", threads, vec![("SS_KB", "14")]),
-                ("kb16", threads, vec![("SS_KB", "16")]),
-                ("kb17", threads, vec![("SS_KB", "17")]),
-                ("ku10", threads, vec![("SS_KU", "10")]),
-                ("ku12", threads, vec![("SS_KU", "12")]),
-                ("m0", threads, vec![("SS_MMAP", "0")]),
+                ("rs", threads, vec![("SS_KERNEL", "rs")], ""),
+                ("pgo", threads, vec![], "2"),
+                ("pgors", threads, vec![("SS_KERNEL", "rs")], "2"),
+                ("clx", threads, vec![], "3"),
+                ("clxp", threads, vec![], "4"),
+                ("d6", threads * 3 / 4, vec![], ""),
+                ("d4", threads / 2, vec![], ""),
+                ("a1k", threads, vec![("SS_AHEAD", "1024")], ""),
+                ("a2k", threads, vec![("SS_AHEAD", "2048")], ""),
+                ("nh", threads, vec![("SS_NOHUGE", "1")], ""),
+                ("kb14", threads, vec![("SS_KB", "14")], ""),
+                ("kb16", threads, vec![("SS_KB", "16")], ""),
+                ("ku8", threads, vec![("SS_KU", "8")], ""),
+                ("ku9", threads, vec![("SS_KU", "9")], ""),
+                ("ku11", threads, vec![("SS_KU", "11")], ""),
             ]);
         } else {
             variants.extend([
-                ("d16", threads * 2, vec![]),
-                ("kb14", threads, vec![("SS_KB", "14")]),
-                ("kb16", threads, vec![("SS_KB", "16")]),
-                ("kb17", threads, vec![("SS_KB", "17")]),
-                ("ku12", threads, vec![("SS_KU", "12")]),
-                ("ku13", threads, vec![("SS_KU", "13")]),
+                ("pgo", threads, vec![], "2"),
+                ("clx", threads, vec![], "3"),
+                ("clxp", threads, vec![], "4"),
+                ("kb16", threads, vec![("SS_KB", "16")], ""),
+                ("ku8", threads, vec![("SS_KU", "8")], ""),
+                ("ku9", threads, vec![("SS_KU", "9")], ""),
+                ("ku11", threads, vec![("SS_KU", "11")], ""),
             ]);
         }
+        variants.retain(|v| v.3.is_empty() || Path::new(&format!("{}{}", exe.display(), v.3)).exists());
         let mut best: Vec<Option<Run>> = variants.iter().map(|_| None).collect();
         let rounds = if big { 2 } else { 3 };
         'rounds: for round in 0..rounds {
@@ -202,8 +201,9 @@ pub fn main(threads: usize) -> ! {
                 if t0.elapsed().as_secs_f64() > limit - 12.0 {
                     break 'rounds;
                 }
-                let (_, n, env) = &variants[i];
-                let r = one(&exe, &data, &out, (*n).max(1), env);
+                let (_, n, env, which) = &variants[i];
+                let bin = PathBuf::from(format!("{}{}", exe.display(), which));
+                let r = one(&bin, &data, &out, (*n).max(1), env);
                 if best[i].as_ref().is_none_or(|b| !b.ok || (r.ok && r.wall < b.wall)) {
                     best[i] = Some(r);
                 }
