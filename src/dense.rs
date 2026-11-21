@@ -2221,6 +2221,44 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             out.ev.finish(&mut out.arena);
             out.ck.finish(&mut out.arena);
         });
+        // SS_KBENCH=N (measuring only): the event pieces N more times, then the
+        // click pieces N more times, each pass timed (wall/user/kernel ms), with
+        // every input page already in; then the run stops without an answer.
+        if let Some(n) = std::env::var("SS_KBENCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+            if let Some(ctx) = ready.get() {
+                for what in [true, false] {
+                    let bytes: usize = tasks[n_link..].iter().filter(|t| t.events == what).map(|t| t.b - t.a).sum();
+                    let mut line = format!("KB{threads}{} {}MB", if what { "e" } else { "c" }, bytes >> 20);
+                    for _ in 0..n {
+                        next.store(n_link, Relaxed);
+                        let (u0, s0, _) = sys::usage();
+                        let t = Instant::now();
+                        par(threads, |tid| {
+                            let out = mine(&outs, tid);
+                            loop {
+                                let i = next.fetch_add(1, Relaxed);
+                                let Some(task) = tasks.get(i) else { break };
+                                if task.events != what {
+                                    continue;
+                                }
+                                let src = if task.events { &event_files[task.file] } else { &click_files[task.file] };
+                                let (buf, start, end) = src.view(task.a, task.b);
+                                if task.events {
+                                    parse_events(buf, start, end, ctx, dn, out);
+                                } else {
+                                    parse_clicks(buf, start, end, ctx, dn, out);
+                                }
+                            }
+                        });
+                        let w = t.elapsed().as_secs_f64() * 1e3;
+                        let (u1, s1, _) = sys::usage();
+                        line += &format!(" {:.0}/{:.0}/{:.0}", w, u1 - u0, s1 - s0);
+                    }
+                    eprintln!("{line}");
+                }
+            }
+            std::process::exit(0);
+        }
     }
     drop(to_map);
     if let Some(e) = aux_panic.into_inner().unwrap() {

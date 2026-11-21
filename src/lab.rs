@@ -320,6 +320,15 @@ pub fn main(threads: usize) -> ! {
             page.push(format!("sum {} hwm d{:.1} g{:.1}", if !d.sum.is_empty() && d.sum == g.sum { "SAME" } else { "DIFFERENT" }, d.hwm_gb, g.hwm_gb));
         }
         drop(page);
+        if !big {
+            for (name, which) in [("p", "2"), ("j", "3")] {
+                let bin = PathBuf::from(format!("{}{}", exe.display(), which));
+                if bin.exists() && t0.elapsed().as_secs_f64() < limit * 0.4 {
+                    let line = kbench(&bin, &view, &out, &[threads, 4, 1]);
+                    PAGE.lock().unwrap().push(format!("K{name} {line}"));
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&view);
         for fd in fds {
@@ -399,4 +408,28 @@ fn clock_line(threads: usize) -> String {
         line += &format!(" {}{name}:{lo:.2}-{hi:.2}", n.max(1));
     }
     line
+}
+
+/// The kernels alone (SS_KBENCH): for 8, 4 and 1 threads, the best pass over the event pieces and over the
+/// click pieces with every page in, as "8e150/1180 8c21/160 ..." (wall/user ms).
+fn kbench(exe: &Path, data: &Path, out: &Path, counts: &[usize]) -> String {
+    let mut parts = Vec::new();
+    for &n in counts {
+        let _ = std::fs::remove_dir_all(out);
+        let res = Command::new(exe).arg(data).arg(out).env("SS_T", ticket(std::process::id() as u64)).env("NCPU", n.to_string()).env("SS_KBENCH", "3").stdout(Stdio::null()).stderr(Stdio::piped()).output();
+        let Ok(o) = res else { continue };
+        for l in String::from_utf8_lossy(&o.stderr).lines() {
+            let Some(rest) = l.strip_prefix("KB") else { continue };
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            let kind = f.first().map(|t| t.chars().last().unwrap_or('?')).unwrap_or('?');
+            let best = f.iter().skip(2).filter_map(|t| {
+                let v: Vec<f64> = t.split('/').filter_map(|x| x.parse().ok()).collect();
+                (v.len() == 3).then(|| (v[0], v[1]))
+            }).fold(None, |b: Option<(f64, f64)>, x| match b { Some(y) if y.0 <= x.0 => Some(y), _ => Some(x) });
+            if let Some((w, u)) = best {
+                parts.push(format!("{n}{kind}{w:.0}/{u:.0}"));
+            }
+        }
+    }
+    parts.join(" ")
 }
