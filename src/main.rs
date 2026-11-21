@@ -12,6 +12,7 @@
 //!   4. persons per person bucket: group by person, sort, sessionize,
 //!              attribute, aggregate, and write Parquet.
 
+mod dense;
 mod diag;
 mod fast;
 mod input;
@@ -241,9 +242,11 @@ fn main() {
                     }
                 }
                 let t = Instant::now();
-                let mut scale = 1;
-                while !run(&data_dir, &out_dir, th, scale, t) {
-                    scale *= 4;
+                if env_usize("SS_DENSE", 1) == 0 || !dense::run(&data_dir, &out_dir, th, t) {
+                    let mut scale = 1;
+                    while !run(&data_dir, &out_dir, th, scale, t) {
+                        scale *= 4;
+                    }
                 }
                 best[v] = best[v].min(t.elapsed().as_secs_f64());
             }
@@ -270,9 +273,14 @@ fn main() {
         }
         std::process::exit(0);
     }
-    let mut scale = 1;
-    while !run(&data_dir, &out_dir, threads, scale, t0) {
-        scale *= 4;
+    // Generated IDs are numbers in disguise: the dense pipeline uses that when
+    // a sample of the input shows it (SS_DENSE=0: never), and otherwise, or if
+    // it gives up, the general one does the job.
+    if env_usize("SS_DENSE", 1) == 0 || !dense::run(&data_dir, &out_dir, threads, t0) {
+        let mut scale = 1;
+        while !run(&data_dir, &out_dir, threads, scale, t0) {
+            scale *= 4;
+        }
     }
     #[cfg(feature = "sprof")]
     sprof::dump();
@@ -1694,6 +1702,34 @@ struct Ckl {
     camp: u32,
 }
 
+/// What attribution needs to know about a click.
+trait Click: Copy {
+    fn ts(&self) -> u32;
+    fn camp(&self) -> u32;
+    fn same_id(&self, other: &Self) -> bool;
+    /// The byte-wise order of the two click IDs.
+    fn cmp_id(a: &Self, b: &Self) -> std::cmp::Ordering;
+}
+
+impl Click for Ckl {
+    #[inline(always)]
+    fn ts(&self) -> u32 {
+        self.ts
+    }
+    #[inline(always)]
+    fn camp(&self) -> u32 {
+        self.camp
+    }
+    #[inline(always)]
+    fn same_id(&self, other: &Self) -> bool {
+        self.cid == other.cid
+    }
+    #[inline(always)]
+    fn cmp_id(a: &Self, b: &Self) -> std::cmp::Ordering {
+        cmp_key(a.cid, b.cid)
+    }
+}
+
 /// user_daily rows, already in Parquet's PLAIN encoding except `cat`.
 #[derive(Default)]
 struct Rows {
@@ -2098,7 +2134,7 @@ fn person_sorted(who: Key, evs: &mut [u64], tl: &mut Tl) {
 }
 
 /// Credit and assists for the sessions in `tl.sess` (in time order).
-fn attribute(cks: &mut [Ckl], tl: &mut Tl) {
+fn attribute<C: Click>(cks: &mut [C], tl: &mut Tl) {
     let nd = tl.nd;
     let organic = tl.organic;
     if cks.is_empty() {
@@ -2113,10 +2149,10 @@ fn attribute(cks: &mut [Ckl], tl: &mut Tl) {
     // Latest ts last; among equal ts the smallest click_id last.
     let mut nc = 1;
     if cks.len() > 1 {
-        cks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(b.cid, a.cid)));
+        cks.sort_unstable_by(|a, b| a.ts().cmp(&b.ts()).then_with(|| C::cmp_id(b, a)));
         // Copies of one click are identical, so they are neighbours now.
         for k in 1..cks.len() {
-            if cks[k].cid != cks[nc - 1].cid {
+            if !cks[k].same_id(&cks[nc - 1]) {
                 cks[nc] = cks[k];
                 nc += 1;
             }
@@ -2131,14 +2167,14 @@ fn attribute(cks: &mut [Ckl], tl: &mut Tl) {
         let mut serial = tl.serial;
         let (mut lo, mut hi) = (0usize, 0usize);
         for s in sess {
-            while hi < nc && cks[hi].ts <= s.start {
+            while hi < nc && cks[hi].ts() <= s.start {
                 hi += 1;
             }
-            while lo < hi && s.start - cks[lo].ts > WEEK {
+            while lo < hi && s.start - cks[lo].ts() > WEEK {
                 lo += 1;
             }
             let day = s.day as usize;
-            let camp = if lo < hi { cks[hi - 1].camp as usize } else { organic };
+            let camp = if lo < hi { cks[hi - 1].camp() as usize } else { organic };
             let cell = camp * nd + day;
             cells.sessions[cell] += 1;
             cells.purch[cell] += s.purch as u32;
@@ -2146,7 +2182,7 @@ fn attribute(cks: &mut [Ckl], tl: &mut Tl) {
             serial += 1;
             for c in &cks[lo..hi] {
                 // (Counted without branching on whether the campaign is new here.)
-                let camp = c.camp as usize;
+                let camp = c.camp() as usize;
                 let new = (stamp[camp] != serial) as u32;
                 stamp[camp] = serial;
                 cells.assisted[camp * nd + day] += new;
@@ -2157,10 +2193,10 @@ fn attribute(cks: &mut [Ckl], tl: &mut Tl) {
     }
     let mut hi = 0;
     for s in &tl.sess {
-        while hi < nc && cks[hi].ts <= s.start {
+        while hi < nc && cks[hi].ts() <= s.start {
             hi += 1;
         }
-        let camp = if hi > 0 && s.start - cks[hi - 1].ts <= WEEK { cks[hi - 1].camp as usize } else { organic };
+        let camp = if hi > 0 && s.start - cks[hi - 1].ts() <= WEEK { cks[hi - 1].camp() as usize } else { organic };
         let cell = camp * nd + s.day as usize;
         tl.cells.sessions[cell] += 1;
         tl.cells.purch[cell] += s.purch as u32;
@@ -2171,7 +2207,7 @@ fn attribute(cks: &mut [Ckl], tl: &mut Tl) {
     // the union of [click, click + 7 days] over its clicks; every session
     // starting inside is assisted once.
     tl.tmp.clear();
-    tl.tmp.extend(cks.iter().map(|c| ((c.camp as u64) << 32) | c.ts as u64));
+    tl.tmp.extend(cks.iter().map(|c| ((c.camp() as u64) << 32) | c.ts() as u64));
     tl.tmp.sort_unstable();
     let sess = &tl.sess;
     // dayfirst[d]: the index of the first session on day d or later.

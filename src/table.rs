@@ -333,6 +333,14 @@ impl Arena {
         self.cur += bytes;
         p as *mut u8
     }
+
+    /// Give back the tail of the latest allocation, from `p` on.
+    pub fn shrink_to(&mut self, p: *mut u8) {
+        let p = (p as usize + 63) & !63;
+        if p <= self.cur {
+            self.cur = p;
+        }
+    }
 }
 
 #[repr(C, align(64))]
