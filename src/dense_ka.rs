@@ -530,36 +530,28 @@ macro_rules! define_events {
             "sub r10, rsi",             // how far into the 32 bytes comma 4 is
             "cmp r10, 31",
             "ja 88f",                   // more than 32 bytes from comma 4 to the newline (or less than none)
-            "shrx rcx, rcx, r10",       // the commas from comma 4 on
-            "shrx r9, r9, r10",         // and the quotes
-            "mov r8d, 32",
-            "sub r8, r10",              // e: from comma 4 to the newline
-            "blsr r10d, ecx",
-            "tzcnt r11d, r10d",         // k5
-            "blsr r10d, r10d",
-            "tzcnt r14d, r10d",         // k6
-            "blsr r10d, r10d",
-            "jnz 88f",                  // more than three commas
-            "jc 88f",                   // fewer
-            "bts rcx, r8",              // separators: commas 4, 5, 6 and the newline
-            "mov r10, r9",
-            "shr r10, 1",
-            "pext r10, r10, rcx",       // qb: the fields that open with a quote
-            "pdep r15, r10, rcx",
-            "lea rax, [r10 + r10]",
-            "pdep rax, rax, rcx",
-            "add r15, r15",             // where their opening quotes are
-            "shr rax, 1",               // where their closing quotes must be
-            "test r15, rax",
-            "jnz 88f",                  // (a lone quote for a field)
-            "or r15, rax",
-            "cmp r15, r9",
-            "jne 88f",                  // a quote missing or anywhere else
-            "and r10d, 2",
-            "lea ecx, [r10 + r11 + 1]",
-            "cmp r14d, ecx",
-            "jbe 72f",                  // no product
-            "73:",
+            "shrx r8, rcx, r10",        // C: the commas from comma 4 to the newline (bit 0: comma 4)
+            "bts rcx, 32",
+            "shrx rcx, rcx, r10",       // S: and the newline
+            "shrx r9, r9, r10",         // Q: the quotes
+            "popcnt r11, r8",
+            "cmp r11, 3",
+            "jne 88f",                  // not exactly three commas
+            "lea r11, [rcx + rcx]",
+            "and r11, r9",              // O: the quotes right after a separator (a field opens with them)
+            "andn r14, r11, r9",        // the other quotes
+            "add r14, r14",
+            "mov r15, rcx",
+            "sub r15, r11",
+            "andn r15, r15, rcx",       // the separators after a field that opened (each opening carried up to the next one)
+            "cmp r15, r14",
+            "jne 88f",                  // the other quotes are not exactly those right before them
+            "lea r11, [r9 + r9]",
+            "and r11, r9",
+            "or r11, rcx",
+            "add r11, r11",
+            "and r11, r8",              // commas that end an empty value (none or `""`)
+            "or r12, r11",              // (an empty type or product: not a plain view or cart)
             // ---- The IDs' numbers; the times.
             "vpmaddubsw xmm0, xmm0, xmmword ptr [rdi + {c_36_1}]",
             "vpmaddwd xmm0, xmm0, xmmword ptr [rdi + {c_1296_1}]",
@@ -658,9 +650,6 @@ macro_rules! define_events {
             "cmp r8d, dword ptr [rdi + r14*4 + {key4}]",
             "jne 84f",
             "jmp 63b",
-            "72:",
-            "or r12, 1",
-            "jmp 73b",
             "82:",
             "mov qword ptr [rdi + {s_key}], rax",
             "mov qword ptr [rdi + {s_idx}], rcx",
