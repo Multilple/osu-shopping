@@ -195,12 +195,12 @@ fn main() {
     sprof::start();
     // SS_AB="NAME=value,...[;NAME=value,...]": do the whole job as usual (A)
     // and with each of up to three other groups of settings (B, C, D; NCPU
-    // among them sets that variant's threads), two rounds of all, and let
+    // among them sets that variant's threads), several rounds of all, and let
     // the total run time tell how each one's faster run compares with A's:
     //   one group:    ends at 8 s + 10 s x (B/A - 1)
-    //   two groups:   ends at 4.5 s + 0.25 s x (bin(B/A) + 7 bin(C/A)), bins
+    //   two groups:   ends at 7 s + 0.25 s x (bin(B/A) + 7 bin(C/A)), bins
     //                 split at 0.92, 0.96, 0.985, 1.015, 1.04 and 1.08
-    //   three groups: ends at 5.5 s + 0.4 s x (bin(B/A) + 3 bin(C/A) + 9 bin(D/A)),
+    //   three groups: ends at 8 s + 0.4 s x (bin(B/A) + 3 bin(C/A) + 9 bin(D/A)),
     //                 bins split at 0.985 and 1.015
     if let Ok(spec) = std::env::var("SS_AB") {
         let groups: Vec<Vec<(String, String)>> = spec
@@ -210,8 +210,11 @@ fn main() {
             .collect();
         let n = groups.len() + 1;
         let mut best = vec![f64::MAX; n];
-        for _ in 0..2 {
-            for v in 0..n {
+        // Four rounds of two, three rounds of more; every other round runs
+        // them in reverse order, so none always follows the same one.
+        for round in 0..(if n == 2 { 4 } else { 3 }) {
+            for i in 0..n {
+                let v = if round % 2 == 0 { i } else { n - 1 - i };
                 // Only this variant's settings are in force.
                 for g in &groups {
                     for (k, _) in g {
@@ -249,11 +252,11 @@ fn main() {
             1 => 8.0 + 10.0 * (ratio[0] - 1.0).clamp(-0.45, 1.1),
             2 => {
                 let e = [0.92, 0.96, 0.985, 1.015, 1.04, 1.08];
-                4.5 + 0.25 * (bin(ratio[0], &e) + 7.0 * bin(ratio[1], &e))
+                7.0 + 0.25 * (bin(ratio[0], &e) + 7.0 * bin(ratio[1], &e))
             }
             _ => {
                 let e = [0.985, 1.015];
-                5.5 + 0.4 * (bin(ratio[0], &e) + 3.0 * bin(ratio[1], &e) + 9.0 * bin(ratio[2], &e))
+                8.0 + 0.4 * (bin(ratio[0], &e) + 3.0 * bin(ratio[1], &e) + 9.0 * bin(ratio[2], &e))
             }
         };
         if std::env::var_os("SS_TIMING").is_some() {
