@@ -1164,6 +1164,8 @@ fn dedup_bucket(b: usize, outs: &[&DOut], dn: &Dn, me: &mut AOut) {
         let mut cur_p = 0x7FFF_FFFFu32;
         let mut e = w;
         let wend = e.add(2 * ns);
+        // (Kept in a register rather than set for every event.)
+        let ctl = std::hint::black_box(0x1F02u64);
         loop {
             // The open run's events (no calls here: the run's state stays in registers).
             let (mut w0, mut w1, mut p) = (0u64, 0u64, 0u32);
@@ -1204,15 +1206,14 @@ fn dedup_bucket(b: usize, outs: &[&DOut], dn: &Dn, me: &mut AOut) {
                     "sbb {m}, {m}",
                     "and {cnt:e}, {m:e}",
                     "inc {cnt:e}",
-                    "not {m}",
-                    "and {m}, 16",
-                    "add {sp}, {m}",
+                    "and {m}, -16",
+                    "lea {sp}, [{sp} + {m} + 16]",
                     "mov dword ptr [{sp}], {cnt:e}",
                     "mov dword ptr [{sp} + 4], {start:e}",
                     "mov dword ptr [{sp} + 8], {ts:e}",
                     "mov {prev:e}, {ts:e}",
                     a0 = in(reg) a0,
-                    ctl = in(reg) 0x1F02u64,
+                    ctl = in(reg) ctl,
                     gap1 = const GAP + 1,
                     ts = out(reg) _,
                     m = out(reg) _,
