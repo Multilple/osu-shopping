@@ -736,7 +736,20 @@ pub(crate) fn event_line(line: &[u8], ctx: &Ctx, dn: &Dn, out: &mut DOut) {
 }
 
 fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) {
-    for line in lines(&file[start..end]) {
+    // SS_EVCHECK=1: also compare the kernel's records with the plain code's.
+    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *CHECK.get_or_init(|| std::env::var_os("SS_EVCHECK").is_some()) {
+        static BAD: AtomicUsize = AtomicUsize::new(0);
+        static CHUNKS: AtomicUsize = AtomicUsize::new(0);
+        let bad = crate::dense_ev::check(file, start, end, ctx, dn);
+        let (b, c) = (BAD.fetch_add(bad, Relaxed) + bad, CHUNKS.fetch_add(1, Relaxed) + 1);
+        if bad > 0 || c % 64 == 0 {
+            eprintln!("    evcheck: {c} chunks, {b} streams differ");
+        }
+    }
+    // The kernel takes the lines it can prove sound; the plain code the rest.
+    let rest = if slow_only() { start } else { unsafe { crate::dense_ev::events_dense(file, start, end, ctx, dn, out) } };
+    for line in lines(&file[rest..end]) {
         event_line(line, ctx, dn, out);
     }
 }
