@@ -660,9 +660,8 @@ fn ahead() -> usize {
 
 /// Output to throw away (for the check and for timing).
 pub(crate) fn scratch_out(dn: &Dn) -> DOut {
-    use crate::dense::Lists;
     use crate::table::Arena;
-    DOut { arena: Arena::new(), ev: crate::dense::EvLists::new(dn.nb), ck: Lists::new(1), reader: crate::input::Reader::new(1 << 10), pend_l: Vec::new() }
+    DOut { arena: Arena::new(), ev: crate::dense::EvLists::new(dn.nb), ck: crate::dense::CkLists::new(1), reader: crate::input::Reader::new(1 << 10), pend_l: Vec::new() }
 }
 
 /// SS_EVCHECK=1: for the lines of `file[start..end]`, the records the kernel

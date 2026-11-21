@@ -42,6 +42,9 @@ use crate::table::{map_anon, release, Arena};
 pub(crate) type Lists = crate::table::Streams<[u64; 2], 10>;
 /// The event streams (appended to from the assembly kernel too).
 pub(crate) type EvLists = crate::table::Stage16<10>;
+/// The click record lists: the same staging, kept by write pointers (what
+/// the click kernel's assembly appends to).
+pub(crate) type CkLists = crate::table::Stage16P<10>;
 use crate::util::*;
 use crate::{
     build_ctx, env_usize, fast, grid_tasks, input, lines, load_aux, par, person_grid, person_sorted,
@@ -224,6 +227,8 @@ pub struct Dn {
     pub(crate) obits: u32,
     /// The click kernel's tables.
     pub(crate) ckx: crate::dense_ck::Cx,
+    /// The assembly click kernel's (`None`: the run is one it was not made for).
+    pub(crate) cka: Option<&'static crate::dense_cka::KC>,
 }
 
 unsafe impl Sync for Dn {}
@@ -495,7 +500,7 @@ pub(crate) struct DOut {
     pub(crate) ev: EvLists,
     /// Valid clicks by their user's person bucket (interned users: bucket
     /// `nq`): `[ts << 32 | campaign, node | click << 32]`.
-    pub(crate) ck: Lists,
+    pub(crate) ck: CkLists,
     pub(crate) reader: input::Reader,
     pub(crate) pend_l: Vec<(u32, u32)>,
 }
@@ -962,9 +967,34 @@ pub(crate) fn click_line(line: &[u8], ctx: &Ctx, dn: &Dn, out: &mut DOut) {
     out.ck.push16(s, ((t - ctx.origin) as u64) << 32 | camp as u64, node as u64 | cidx << 32, &mut out.arena);
 }
 
+/// The click kernel: the assembly one unless SS_CKERNEL=rs (or the run is
+/// one it was not made for), then the Rust one. Returns where the lines it
+/// left start.
+pub(crate) fn click_kernel(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
+    static RS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let rs = *RS.get_or_init(|| std::env::var("SS_CKERNEL").is_ok_and(|v| v == "rs"));
+    if !rs {
+        if let Some(rest) = unsafe { crate::dense_cka::clicks(file, start, end, ctx, dn, out) } {
+            return rest;
+        }
+    }
+    unsafe { crate::dense_ck::clicks_dense(file, start, end, ctx, dn, out) }
+}
+
 fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) {
+    // SS_CKCHECK=1: also compare the kernel's records with the plain code's.
+    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *CHECK.get_or_init(|| std::env::var_os("SS_CKCHECK").is_some()) {
+        static BAD: AtomicUsize = AtomicUsize::new(0);
+        static CHUNKS: AtomicUsize = AtomicUsize::new(0);
+        let bad = crate::dense_cka::check(file, start, end, ctx, dn);
+        let (b, c) = (BAD.fetch_add(bad, Relaxed) + bad, CHUNKS.fetch_add(1, Relaxed) + 1);
+        if bad > 0 || c.is_power_of_two() {
+            eprintln!("    ckcheck: {c} chunks, {b} streams differ");
+        }
+    }
     // The kernel takes the lines it can prove sound; the plain code the rest.
-    let rest = if slow_only() { start } else { unsafe { crate::dense_ck::clicks_dense(file, start, end, ctx, dn, out) } };
+    let rest = if slow_only() { start } else { click_kernel(file, start, end, ctx, dn, out) };
     for line in lines(&file[rest..end]) {
         click_line(line, ctx, dn, out);
     }
@@ -2034,6 +2064,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         click_names: Vec::new(),
         obits: 0,
         ckx: Default::default(),
+        cka: None,
     };
     // Interned users are always looked up.
     unsafe { std::ptr::write_bytes(dn.r8.add(d), 0xFF, XCAP) };
@@ -2043,7 +2074,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             Shared(UnsafeCell::new(DOut {
                 arena: Arena::new(),
                 ev: EvLists::new(nb),
-                ck: Lists::new(nq + 1),
+                ck: CkLists::new(nq + 1),
                 reader: input::Reader::new(chunk),
                 pend_l: Vec::with_capacity(PEND),
             }))
@@ -2104,6 +2135,10 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     // low half numbers the click among its person's.
     dn.obits = (ctx.aux.camp_names.len() as u32).leading_zeros();
     dn.ckx = crate::dense_ck::Cx::new(&ctx, &dn);
+    dn.cka = crate::dense_cka::KC::new(&ctx, &dn);
+    if log {
+        eprintln!("    click kernel tables: {} (click window {:.1} days)", if dn.cka.is_some() { "assembly and Rust" } else { "Rust only" }, (ctx.we - ctx.cws) as f64 / 86_400_000.0);
+    }
     lap("links");
     if dn.overflow.load(Relaxed) {
         return give_up(&dn, &outs, nodes);

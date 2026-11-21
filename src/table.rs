@@ -651,6 +651,130 @@ impl<const CB: usize> Stage16<CB> {
     }
 }
 
+/// The most lists a `Stage16P` keeps its write pointers for at the place the
+/// click kernel's assembly expects (`STAGE_MAX` pointers after the first).
+pub const STAGE_MAX: usize = 1 << 16;
+
+#[repr(C, align(128))]
+#[derive(Clone, Copy)]
+struct Line128([u64; 16]);
+
+/// `Streams<[u64; 2], CB>` with the same staging (two cache lines of items per
+/// list, moved out with non-temporal stores when full, the item that fills
+/// them straight from the registers), kept by write pointers instead of
+/// counts: appending is a load of the list's pointer, a test of it, two
+/// stores and a store of the pointer. Staging lines sit at multiples of 128
+/// bytes, so the pointer of a full line's last slot is 112 past such a
+/// multiple; chunks sit at multiples of their size, so a moved-out pointer
+/// that is such a multiple is at the end of its chunk (or there is none yet).
+pub struct Stage16P<const CB: usize> {
+    lines: Vec<Line128>,
+    /// `st[s]`: where stream `s`'s next item goes in its staging line;
+    /// `st[off + s]`: where its staging line goes when it fills. (Addresses:
+    /// zeros come from fresh pages, and most of them are never touched.)
+    st: Vec<usize>,
+    off: usize,
+    n: Vec<u32>,
+    chunks: Vec<Vec<*mut [u64; 2]>>,
+}
+
+unsafe impl<const CB: usize> Sync for Stage16P<CB> {}
+unsafe impl<const CB: usize> Send for Stage16P<CB> {}
+
+impl<const CB: usize> Stage16P<CB> {
+    const BYTES: usize = 16 << CB;
+
+    pub fn new(streams: usize) -> Self {
+        let lines = vec![Line128([0; 16]); streams];
+        let off = STAGE_MAX.max(streams);
+        let mut st = vec![0usize; off + streams];
+        for s in 0..streams {
+            st[s] = lines[s].0.as_ptr() as usize;
+        }
+        Stage16P { lines, st, off, n: vec![0; streams], chunks: (0..streams).map(|_| Vec::new()).collect() }
+    }
+
+    /// The write pointers (for the click kernel): `STAGE_MAX` apart from the
+    /// moved-out pointers, or `None` when there are too many lists for that.
+    pub fn pointers(&mut self) -> Option<*mut *mut u64> {
+        (self.off == STAGE_MAX).then(|| self.st.as_mut_ptr() as *mut *mut u64)
+    }
+
+    /// Append an item, given as two words, to stream `s`.
+    #[inline(always)]
+    pub fn push16(&mut self, s: usize, a: u64, b: u64, arena: &mut Arena) {
+        unsafe {
+            let p = *self.st.get_unchecked(s) as *mut u64;
+            if (p as usize + 16) & 127 == 0 {
+                self.flush(s, a, b, arena);
+            } else {
+                *p = a;
+                *p.add(1) = b;
+                *self.st.get_unchecked_mut(s) = p.add(2) as usize;
+            }
+        }
+    }
+
+    /// Stream `s`'s staging line, whose last slot is to get `(a, b)`, moved out.
+    #[inline(never)]
+    pub fn flush(&mut self, s: usize, a: u64, b: u64, arena: &mut Arena) {
+        unsafe {
+            use core::arch::x86_64::*;
+            let line = (*self.st.get_unchecked(s) as *mut u64).sub(14);
+            let mut d = *self.st.get_unchecked(self.off + s) as *mut __m256i;
+            if (d as usize) & (Self::BYTES - 1) == 0 {
+                d = arena.alloc_aligned(Self::BYTES, Self::BYTES) as *mut __m256i;
+                self.chunks[s].push(d as *mut [u64; 2]);
+            }
+            let src = line as *const __m256i;
+            for k in 0..3 {
+                _mm256_stream_si256(d.add(k), _mm256_load_si256(src.add(k)));
+            }
+            let third = _mm_load_si128(line.add(12) as *const __m128i);
+            let hi = _mm256_inserti128_si256(_mm256_castsi128_si256(third), _mm_set_epi64x(b as i64, a as i64), 1);
+            _mm256_stream_si256(d.add(3), hi);
+            *self.st.get_unchecked_mut(self.off + s) = d.add(4) as usize;
+            *self.st.get_unchecked_mut(s) = line as usize;
+        }
+    }
+
+    /// Move every partly filled staging line out and count the items. Call
+    /// once, when done appending.
+    pub fn finish(&mut self, arena: &mut Arena) {
+        for s in 0..self.n.len() {
+            let line = self.lines[s].0.as_ptr();
+            let r = (self.st[s] - line as usize) / 16;
+            let moved = match self.chunks[s].last() {
+                Some(&last) => ((self.chunks[s].len() - 1) << CB) + (self.st[self.off + s] - last as usize) / 16,
+                None => 0,
+            };
+            for k in 0..r {
+                let idx = moved + k;
+                let at = idx & ((1 << CB) - 1);
+                if at == 0 && self.chunks[s].len() == idx >> CB {
+                    self.chunks[s].push(arena.alloc(Self::BYTES) as *mut [u64; 2]);
+                }
+                unsafe {
+                    let d = self.chunks[s][idx >> CB].add(at);
+                    d.write([*line.add(2 * k), *line.add(2 * k + 1)]);
+                }
+            }
+            self.n[s] = (moved + r) as u32;
+        }
+        unsafe { core::arch::x86_64::_mm_sfence() };
+    }
+
+    pub fn len(&self, s: usize) -> usize {
+        self.n[s] as usize
+    }
+
+    /// Stream `s` as (pointer, length) pieces (after `finish`).
+    pub fn pieces(&self, s: usize) -> impl Iterator<Item = (*mut [u64; 2], usize)> + '_ {
+        let n = self.n[s] as usize;
+        self.chunks[s].iter().enumerate().map(move |(i, &p)| (p, (n - (i << CB)).min(1 << CB)))
+    }
+}
+
 /// Many append-only lists of 16-byte items, each stored in chunks of
 /// `1 << CB` items, written in place with plain stores: appending is a load
 /// of the list's write pointer, two stores and a store of the pointer, with
