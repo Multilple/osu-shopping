@@ -41,68 +41,18 @@ use crate::{
 
 // ---------------------------------------------------------------- the ID code
 
-pub const M40: u64 = (1 << 40) - 1;
-const MUL_A: u64 = 0x9E37_79B9_7F4B;
-const MUL_B: u64 = 0xD6E8_FEB8_6659;
-/// Not an ID number.
-pub const NONE: u64 = u64::MAX;
+pub use crate::keys::{scramble, unscramble, Keys, NONE};
 
-/// The inverse of an odd number modulo 2^64.
-const fn inverse(a: u64) -> u64 {
-    let mut x = a;
-    let mut i = 0;
-    while i < 6 {
-        x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
-        i += 1;
-    }
-    x
-}
-const INV_A: u64 = inverse(MUL_A);
-const INV_B: u64 = inverse(MUL_B);
-
-/// The generator's bijection on 40-bit numbers.
+/// The number behind the ID `prefix + digits` under `key` (see keys.rs), or
+/// `NONE` when the ID is not a prefix and a canonical base-36 number below
+/// 2^40. (The decoder reads 8 bytes from the first digit on: every buffer
+/// an ID is read from has that much after it.)
 #[inline(always)]
-pub fn scramble(v: u64, key: u64) -> u64 {
-    let mut m = (v.wrapping_mul(MUL_A) ^ key) & M40;
-    m ^= m >> 17;
-    m.wrapping_mul(MUL_B) & M40
-}
-
-/// The first half of undoing `scramble`: what the number times `MUL_A`,
-/// xor the key, was.
-#[inline(always)]
-fn unmix(id: u64) -> u64 {
-    let m = id.wrapping_mul(INV_B) & M40;
-    m ^ (m >> 17) ^ (m >> 34)
-}
-
-#[inline(always)]
-pub fn unscramble(id: u64, key: u64) -> u64 {
-    (unmix(id) ^ key).wrapping_mul(INV_A) & M40
-}
-
-/// The number written in `b` as the generator writes one: lowercase base 36,
-/// one to eight digits, no leading zero, below 2^40. Anything else: `NONE`.
-#[inline(always)]
-pub fn decode36(b: &[u8]) -> u64 {
-    let n = b.len();
-    if n == 0 || n > 8 || (b[0] == b'0' && n > 1) {
+fn id_number(id: &[u8], prefix: u8, key: u64) -> u64 {
+    if id.len() < 2 || id.len() > 9 || id[0] != prefix {
         return NONE;
     }
-    let mut v = 0u64;
-    for &c in b {
-        let d = match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'z' => c - b'a' + 10,
-            _ => return NONE,
-        };
-        v = v * 36 + d as u64;
-    }
-    if v > M40 {
-        NONE
-    } else {
-        v
-    }
+    unsafe { crate::keys::decode36_unscramble(id.as_ptr().add(1), id.len() - 1, key) }
 }
 
 /// Every two-digit base-36 number as text (first digit in the low byte).
@@ -147,13 +97,6 @@ pub fn id_key_plain(prefix: u8, s: u64) -> Key {
     at -= 1;
     buf[at] = prefix;
     pack(&buf[at..])
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Keys {
-    pub event: u64,
-    pub user: u64,
-    pub click: u64,
 }
 
 // ---------------------------------------------------------------- shared state
@@ -237,14 +180,9 @@ unsafe impl Send for Dn {}
 impl Dn {
     #[inline(always)]
     pub(crate) fn event_index(&self, id: &[u8]) -> u64 {
-        if id[0] == b'e' {
-            let s = decode36(&id[1..]);
-            if s != NONE {
-                let i = unscramble(s, self.keys.event);
-                if i < self.max_event {
-                    return i;
-                }
-            }
+        let i = id_number(id, b'e', self.keys.event);
+        if i < self.max_event {
+            return i;
         }
         self.intern_event(id)
     }
@@ -265,14 +203,9 @@ impl Dn {
 
     #[inline(always)]
     pub(crate) fn user_node(&self, id: &[u8]) -> u32 {
-        if id[0] == b'u' {
-            let s = decode36(&id[1..]);
-            if s != NONE {
-                let v = unscramble(s, self.keys.user);
-                if v < self.vbound && v & 0x1F8 == 0 {
-                    return (((v >> 9) << 3) | (v & 7)) as u32;
-                }
-            }
+        let v = id_number(id, b'u', self.keys.user);
+        if v < self.vbound && v & 0x1F8 == 0 {
+            return (((v >> 9) << 3) | (v & 7)) as u32;
         }
         self.intern_user(id)
     }
@@ -300,14 +233,9 @@ impl Dn {
 
     #[inline(always)]
     pub(crate) fn click_index(&self, id: &[u8]) -> u32 {
-        if id[0] == b'k' {
-            let s = decode36(&id[1..]);
-            if s != NONE {
-                let i = unscramble(s, self.keys.click);
-                if i < self.max_click {
-                    return i as u32;
-                }
-            }
+        let i = id_number(id, b'k', self.keys.click);
+        if i < self.max_click {
+            return i as u32;
         }
         self.intern_click(id)
     }
@@ -543,60 +471,23 @@ fn mine<T>(all: &[Cell<T>], tid: usize) -> &mut T {
 
 // ---------------------------------------------------------------- keys
 
-/// Up to `max` bytes of whole data lines from the start of a file.
-fn head(src: &Src, max: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; src.len.min(max)];
+/// Up to `max` bytes of whole data lines from the start of a file (and some
+/// zero bytes after them, which the sampler may read).
+fn head(src: &Src, max: usize) -> (Vec<u8>, usize) {
+    let mut buf = vec![0u8; src.len.min(max) + 128];
+    let want = buf.len() - 128;
     let mut have = 0;
-    while have < buf.len() {
-        match src.file.read_at(&mut buf[have..], have as u64) {
+    while have < want {
+        match src.file.read_at(&mut buf[have..want], have as u64) {
             Ok(0) | Err(_) => break,
             Ok(n) => have += n,
         }
     }
-    buf.truncate(have);
-    let Some(first) = memchr(b'\n', &buf) else { return Vec::new() };
-    let last = buf.iter().rposition(|&c| c == b'\n').unwrap();
-    buf[first + 1..last + 1].to_vec()
-}
-
-/// The numbers of the IDs with the given prefix in field `k` of the lines.
-fn field_ids<const N: usize>(text: &[u8], k: usize, prefix: u8) -> (Vec<u64>, usize) {
-    let mut ids = Vec::new();
-    let mut n = 0;
-    for line in lines(text) {
-        n += 1;
-        if let Some(f) = split::<N>(line) {
-            if f[k].len() > 1 && f[k][0] == prefix {
-                let s = decode36(&f[k][1..]);
-                if s != NONE {
-                    ids.push(s);
-                }
-            }
-        }
-    }
-    (ids, n)
-}
-
-/// The key under which nearly all of `ids` are `step` times a number below
-/// `limit` (plus less than `step`), by trying every number for a few of them.
-fn recover(ids: &[u64], limit: u64, step: u64) -> Option<u64> {
-    let u: Vec<u64> = ids.iter().map(|&s| unmix(s)).collect();
-    let bound = limit * step;
-    let fits = |k: u64, j: usize| ((u[j] ^ k).wrapping_mul(INV_A) & M40) < bound;
-    let probe = u.len().min(64);
-    for t in 0..u.len().min(12) {
-        let other = (t + 1) % u.len();
-        for n in 0..limit {
-            let k = u[t] ^ (n.wrapping_mul(step).wrapping_mul(MUL_A) & M40);
-            if !fits(k, other) {
-                continue;
-            }
-            if (0..probe).filter(|&j| fits(k, j)).count() * 100 >= probe * 90 {
-                return Some(k);
-            }
-        }
-    }
-    None
+    let Some(first) = memchr(b'\n', &buf[..have]) else { return (buf, 0) };
+    let last = buf[..have].iter().rposition(|&c| c == b'\n').unwrap();
+    buf.copy_within(first + 1..last + 1, 0);
+    buf[last - first..].fill(0);
+    (buf, last - first)
 }
 
 struct Plan {
@@ -609,19 +500,22 @@ struct Plan {
 /// Look at the start of the biggest event and click files: are the IDs the
 /// generator's, and under which keys?
 fn plan(event_files: &[Src], click_files: &[Src]) -> Option<Plan> {
-    let biggest = |files: &[Src]| files.iter().max_by_key(|s| s.len).filter(|s| s.len > 0).map(|s| head(s, 160 << 10));
-    let ev_text = biggest(event_files)?;
-    let ck_text = biggest(click_files)?;
-    let (ev_ids, ev_n) = field_ids::<7>(&ev_text, 0, b'e');
-    let (us_ids, _) = field_ids::<7>(&ev_text, 1, b'u');
-    let (ck_ids, ck_n) = field_ids::<4>(&ck_text, 0, b'k');
+    const LINES: usize = 4096;
+    let biggest = |files: &[Src], max: usize| files.iter().max_by_key(|s| s.len).filter(|s| s.len > 0).map(|s| head(s, max));
+    let (ev_text, ev_len) = biggest(event_files, 448 << 10)?;
+    let (ck_text, ck_len) = biggest(click_files, 288 << 10)?;
+    let (mut ev_ids, mut us_ids, mut ck_ids, mut none) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let ev_used = crate::keys::sample_ids(&ev_text[..ev_len + 96], b'e', b'u', LINES, &mut ev_ids, &mut us_ids).min(ev_len);
+    let ck_used = crate::keys::sample_ids(&ck_text[..ck_len + 96], b'k', 0, LINES, &mut ck_ids, &mut none).min(ck_len);
+    let count = |text: &[u8]| text.iter().filter(|&&c| c == b'\n').count();
+    let (ev_n, ck_n) = (count(&ev_text[..ev_used]), count(&ck_text[..ck_used]));
     // Enough lines to judge, nearly all of them in the generator's form.
     if ev_n < 1000 || ck_n < 500 || ev_ids.len() * 100 < ev_n * 97 || us_ids.len() * 100 < ev_n * 97 || ck_ids.len() * 100 < ck_n * 97 {
         return None;
     }
     let total = |files: &[Src]| files.iter().map(|s| s.len).sum::<usize>();
-    let ev_lines = (total(event_files) as f64 / (ev_text.len() as f64 / ev_n as f64)) as u64;
-    let ck_lines = (total(click_files) as f64 / (ck_text.len() as f64 / ck_n as f64)) as u64;
+    let ev_lines = (total(event_files) as f64 / (ev_used as f64 / ev_n as f64)) as u64;
+    let ck_lines = (total(click_files) as f64 / (ck_used as f64 / ck_n as f64)) as u64;
     let (ev_guess, ck_guess) = (ev_lines + ev_lines / 8 + 4096, ck_lines + ck_lines / 8 + 4096);
     let us_guess = ev_guess / 24 + 4096;
 
@@ -633,7 +527,7 @@ fn plan(event_files: &[Src], click_files: &[Src]) -> Option<Plan> {
             }
             Keys { event: k[0], user: k[1], click: k[2] }
         }
-        Err(_) => Keys { event: recover(&ev_ids, ev_guess, 1)?, user: recover(&us_ids, us_guess, 512)?, click: recover(&ck_ids, ck_guess, 1)? },
+        Err(_) => crate::keys::recover_keys(&ev_ids, &us_ids, &ck_ids, ev_guess, us_guess, ck_guess)?,
     };
 
     // The sample's largest numbers bound the rest (anything above is interned).

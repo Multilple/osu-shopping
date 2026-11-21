@@ -16,6 +16,7 @@ mod dense;
 mod diag;
 mod fast;
 mod input;
+mod keys;
 mod parquet;
 #[cfg(feature = "sprof")]
 mod sprof;
