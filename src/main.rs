@@ -731,8 +731,11 @@ fn build_ctx(data: &Path, event_bytes: usize, click_bytes: usize, link_bytes: us
     let nregions = ((ids_guess * scale / div).div_ceil(RSIZE)).max(if div > 1 { 1 } else { 4 });
     // Person buckets: up to 640, or more for very large inputs so that a
     // bucket stays under roughly 100k events (it should fit a core's share
-    // of the cache while its people are put together).
-    let rpb = nregions.div_ceil(env_usize("SS_NQ", 640.max(event_lines / 100_000))).next_power_of_two();
+    // of the cache while its people are put together). A dedup note has
+    // Q_BITS bits for the bucket's number: past that many buckets (some 200M
+    // event lines) the buckets grow instead.
+    let buckets = env_usize("SS_NQ", 640.max(event_lines / 100_000)).clamp(1, 1 << Q_BITS);
+    let rpb = nregions.div_ceil(buckets).next_power_of_two();
     let qshift = (RBITS + rpb.trailing_zeros() as usize) as u32;
     let nq = nregions.div_ceil(rpb);
     assert!(nq <= 1 << Q_BITS);
@@ -1662,7 +1665,9 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
     table.resize(cap, EMPTY);
     let mask = cap - 1;
     // The table holds, per event ID seen so far, 32 bits of its hash and
-    // where the note of its kept copy (smallest ingest_ts so far) is.
+    // where the note of its kept copy (smallest ingest_ts so far) is: the
+    // thread, and the note's number in that thread's list in IDX_BITS bits.
+    assert!(outs.iter().all(|o| o.slim.len(p) <= 1 << IDX_BITS), "dedup bucket too large");
     let note = |r: u32| -> *mut Slim { outs[(r >> IDX_BITS) as usize].slim.at(p, (r & ((1 << IDX_BITS) - 1)) as usize) };
     let ev_at = |x: u64| -> *mut Ev {
         let t = (x >> (IDX_BITS + Q_BITS)) as usize & ((1 << T_BITS) - 1);
