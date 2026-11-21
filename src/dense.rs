@@ -159,20 +159,20 @@ pub struct Keys {
 // ---------------------------------------------------------------- shared state
 
 /// Interned events: at most this many (their numbers follow the dense ones).
-const EV_EXTRA: u64 = 1 << 20;
+pub(crate) const EV_EXTRA: u64 = 1 << 20;
 /// Interned users: at most this many.
-const XCAP: usize = 1 << 20;
+pub(crate) const XCAP: usize = 1 << 20;
 /// Links waiting for their parents' cache lines.
 const PEND: usize = 32;
 /// The low bits of an event record's second word: twice the slot.
-const LOW21: u64 = 0x1F_FFFF;
+pub(crate) const LOW21: u64 = 0x1F_FFFF;
 /// In an event record's second word: a purchase (its price follows in a
 /// record of its own, marked `EXT`).
-const PURCHASE: u64 = 1 << 63;
-const EXT: u64 = 3 << 62;
+pub(crate) const PURCHASE: u64 = 1 << 63;
+pub(crate) const EXT: u64 = 3 << 62;
 /// The largest ingest time an event record can hold (31 bits; all ones is
 /// kept free so that no record is all ones).
-const INGEST_TOP: u64 = (1 << 31) - 2;
+pub(crate) const INGEST_TOP: u64 = (1 << 31) - 2;
 
 struct Names {
     map: HashMap<Key, u32>,
@@ -192,43 +192,43 @@ unsafe impl Sync for Seg {}
 unsafe impl Send for Seg {}
 
 pub struct Dn {
-    keys: Keys,
+    pub(crate) keys: Keys,
     /// Event numbers below this come straight from the ID; interned ones follow.
-    max_event: u64,
-    max_click: u64,
+    pub(crate) max_event: u64,
+    pub(crate) max_click: u64,
     /// User numbers (512 x person + ID) below this are direct when the ID's
     /// number within its person is under 8.
-    vbound: u64,
+    pub(crate) vbound: u64,
     /// An event bucket holds 2^kb consecutive event numbers.
-    kb: u32,
-    nb: usize,
+    pub(crate) kb: u32,
+    pub(crate) nb: usize,
     /// A person bucket holds 2^ku consecutive persons (2^(ku+3) nodes).
-    ku: u32,
-    nq: usize,
+    pub(crate) ku: u32,
+    pub(crate) nq: usize,
     /// Direct nodes are `0..d`: node = 8 x person + ID. Interned users follow.
-    d: usize,
+    pub(crate) d: usize,
     /// Per direct node: xor this into the node to get its person's node
     /// (the one with the smallest name); 0xFF: a person that needs a lookup.
-    r8: *mut u8,
+    pub(crate) r8: *mut u8,
     /// Per direct node that names a person: 1 once a run of its events was
     /// seen, 3 once a second one was.
-    runs: *mut u8,
+    pub(crate) runs: *mut u8,
     /// Union-find parents, stored xor the node (so untouched memory says "itself").
-    parent: *mut u32,
-    users: RwLock<Names>,
-    events: Mutex<HashMap<Key, u32>>,
-    clicks: RwLock<Names>,
-    overflow: AtomicBool,
+    pub(crate) parent: *mut u32,
+    pub(crate) users: RwLock<Names>,
+    pub(crate) events: Mutex<HashMap<Key, u32>>,
+    pub(crate) clicks: RwLock<Names>,
+    pub(crate) overflow: AtomicBool,
     /// Per interned user known when the links were read: its person.
-    ext_person: Vec<u32>,
+    pub(crate) ext_person: Vec<u32>,
     /// Direct nodes of persons that need a lookup.
-    direct_special: HashMap<u32, u32>,
+    pub(crate) direct_special: HashMap<u32, u32>,
     /// Names of the persons numbered `d..` (a copy of `users.list`, taken
     /// when parsing is over).
-    names: Vec<Key>,
-    click_names: Vec<Key>,
+    pub(crate) names: Vec<Key>,
+    pub(crate) click_names: Vec<Key>,
     /// A click key is `ts << 32 | campaign << obits | number among its person's clicks`.
-    obits: u32,
+    pub(crate) obits: u32,
 }
 
 unsafe impl Sync for Dn {}
@@ -236,7 +236,7 @@ unsafe impl Send for Dn {}
 
 impl Dn {
     #[inline(always)]
-    fn event_index(&self, id: &[u8]) -> u64 {
+    pub(crate) fn event_index(&self, id: &[u8]) -> u64 {
         if id[0] == b'e' {
             let s = decode36(&id[1..]);
             if s != NONE {
@@ -251,7 +251,7 @@ impl Dn {
 
     #[cold]
     #[inline(never)]
-    fn intern_event(&self, id: &[u8]) -> u64 {
+    pub(crate) fn intern_event(&self, id: &[u8]) -> u64 {
         let k = pack(id);
         let mut m = self.events.lock().unwrap();
         let n = m.len() as u32;
@@ -264,7 +264,7 @@ impl Dn {
     }
 
     #[inline(always)]
-    fn user_node(&self, id: &[u8]) -> u32 {
+    pub(crate) fn user_node(&self, id: &[u8]) -> u32 {
         if id[0] == b'u' {
             let s = decode36(&id[1..]);
             if s != NONE {
@@ -279,7 +279,7 @@ impl Dn {
 
     #[cold]
     #[inline(never)]
-    fn intern_user(&self, id: &[u8]) -> u32 {
+    pub(crate) fn intern_user(&self, id: &[u8]) -> u32 {
         let k = pack(id);
         if let Some(&i) = self.users.read().unwrap().map.get(&k) {
             return (self.d + i as usize) as u32;
@@ -299,7 +299,7 @@ impl Dn {
     }
 
     #[inline(always)]
-    fn click_index(&self, id: &[u8]) -> u32 {
+    pub(crate) fn click_index(&self, id: &[u8]) -> u32 {
         if id[0] == b'k' {
             let s = decode36(&id[1..]);
             if s != NONE {
@@ -314,7 +314,7 @@ impl Dn {
 
     #[cold]
     #[inline(never)]
-    fn intern_click(&self, id: &[u8]) -> u32 {
+    pub(crate) fn intern_click(&self, id: &[u8]) -> u32 {
         let k = pack(id);
         if let Some(&i) = self.clicks.read().unwrap().map.get(&k) {
             return (self.max_click + i as u64) as u32;
@@ -488,19 +488,19 @@ impl Click for Ckd {
 }
 
 /// What a thread produces while parsing.
-struct DOut {
-    arena: Arena,
+pub(crate) struct DOut {
+    pub(crate) arena: Arena,
     /// Event lines by event bucket: `[ingest << 33 | ts << 2 | purchase << 1
     /// | invalid, 2 x slot | node << 21]`. A purchase also has `PURCHASE` set
     /// in the second word and is followed by `[price | category << 24, EXT]`.
     /// (The first word orders the copies of an event: smallest ingest time
     /// first.)
-    ev: Streams<[u64; 2], 10>,
+    pub(crate) ev: Streams<[u64; 2], 10>,
     /// Valid clicks by their user's person bucket (interned users: bucket
     /// `nq`): `[ts << 32 | campaign, node | click << 32]`.
-    ck: Streams<[u64; 2], 10>,
-    reader: input::Reader,
-    pend_l: Vec<(u32, u32)>,
+    pub(crate) ck: Streams<[u64; 2], 10>,
+    pub(crate) reader: input::Reader,
+    pub(crate) pend_l: Vec<(u32, u32)>,
 }
 
 /// What a thread produces while removing duplicates.
@@ -783,7 +783,7 @@ fn settle_links(dn: &mut Dn, threads: usize) {
 /// 31 bits (only ever compared between copies of one event). Times out of
 /// range, and unparsable ones, sit at the ends.
 #[inline(always)]
-fn ingest31(ctx: &Ctx, ing: Option<i64>) -> u64 {
+pub(crate) fn ingest31(ctx: &Ctx, ing: Option<i64>) -> u64 {
     match ing {
         Some(ms) => {
             let rel = (ms - ctx.origin).div_euclid(1000) + (1 << 30);
@@ -795,7 +795,7 @@ fn ingest31(ctx: &Ctx, ing: Option<i64>) -> u64 {
 
 /// One event line by the plain rules (see `event_line` in main.rs), as
 /// dense-mode records.
-fn event_line(line: &[u8], ctx: &Ctx, dn: &Dn, out: &mut DOut) {
+pub(crate) fn event_line(line: &[u8], ctx: &Ctx, dn: &Dn, out: &mut DOut) {
     let Some([eid, user, ts, ingest, typ, prod, price]) = split::<7>(line) else { return };
     if eid.is_empty() {
         return;
@@ -848,7 +848,7 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: 
 }
 
 /// One click line by the plain rules (see `click_line` in main.rs).
-fn click_line(line: &[u8], ctx: &Ctx, dn: &Dn, out: &mut DOut) {
+pub(crate) fn click_line(line: &[u8], ctx: &Ctx, dn: &Dn, out: &mut DOut) {
     let Some([cid, user, camp, ts]) = split::<4>(line) else { return };
     if cid.is_empty() || user.is_empty() || camp.is_empty() {
         return;
