@@ -349,7 +349,22 @@ pub struct Streams<T, const CB: usize> {
     /// Where each stream's staging line goes when it fills.
     dst: Vec<*mut T>,
     chunks: Vec<Vec<*mut T>>,
+    /// Experiment (SS_QUEUE=1): appends without the branch on whether the
+    /// staging line is full. Every append writes what the full line would be
+    /// into the next slot of a short queue and only counts the slot when the
+    /// line is in fact full; the queue is emptied each time it fills.
+    qmode: bool,
+    queue: Vec<Line>,
+    owner: Vec<u64>,
+    queued: usize,
+    /// A line nobody writes, read in place of a staging line that is not
+    /// full yet (reading that one right after writing part of it would wait
+    /// on the store).
+    idle: Box<Line>,
 }
+
+/// Lines the queue holds before it is emptied.
+const QUEUE: usize = 32;
 
 unsafe impl<T, const CB: usize> Sync for Streams<T, CB> {}
 unsafe impl<T, const CB: usize> Send for Streams<T, CB> {}
@@ -364,6 +379,11 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
             n: vec![0; streams],
             dst: vec![std::ptr::null_mut(); streams],
             chunks: (0..streams).map(|_| Vec::new()).collect(),
+            qmode: std::env::var_os("SS_QUEUE").is_some(),
+            queue: vec![Line([0; 64]); QUEUE],
+            owner: vec![0; QUEUE],
+            queued: 0,
+            idle: Box::new(Line([0; 64])),
         }
     }
 
@@ -385,6 +405,80 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
         self.dst[s] = p;
     }
 
+    /// Send the queued lines to their lists.
+    #[inline(never)]
+    fn drain(&mut self, arena: &mut Arena) {
+        unsafe {
+            use core::arch::x86_64::*;
+            for i in 0..self.queued {
+                let o = *self.owner.get_unchecked(i);
+                let (s, last) = (o as u32 as usize, (o >> 32) as usize);
+                // The line's first item starts a chunk?
+                if (last + 1 - Self::PER_LINE) & ((1 << CB) - 1) == 0 {
+                    self.new_chunk(s, arena);
+                }
+                let d = *self.dst.get_unchecked(s) as *mut __m256i;
+                let q = self.queue.as_ptr().add(i) as *const __m256i;
+                _mm256_stream_si256(d, _mm256_load_si256(q));
+                _mm256_stream_si256(d.add(1), _mm256_load_si256(q.add(1)));
+                *self.dst.get_unchecked_mut(s) = d.add(2) as *mut T;
+            }
+            self.queued = 0;
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push16_q(&mut self, s: usize, a: u64, b: u64, arena: &mut Arena) -> usize {
+        use core::arch::x86_64::*;
+        let n = *self.n.get_unchecked(s) as usize;
+        let r = n & 3;
+        let line = self.lines.as_mut_ptr().add(s) as *mut __m128i;
+        *self.n.get_unchecked_mut(s) = (n + 1) as u32;
+        let v = _mm_set_epi64x(b as i64, a as i64);
+        _mm_store_si128(line.add(r), v);
+        // The full line, if this is its last item: three staged items and
+        // this one from the register.
+        let full = r == 3;
+        let src = std::hint::select_unpredictable(full, line as *const __m128i, &*self.idle as *const Line as *const __m128i);
+        let k = self.queued;
+        let q = self.queue.as_mut_ptr().add(k) as *mut __m256i;
+        let lo = _mm256_loadu_si256(src as *const __m256i);
+        let hi = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_load_si128(src.add(2))), v, 1);
+        _mm256_store_si256(q, lo);
+        _mm256_store_si256(q.add(1), hi);
+        *self.owner.get_unchecked_mut(k) = ((n as u64) << 32) | s as u64;
+        let k = k + full as usize;
+        self.queued = k;
+        if k == QUEUE {
+            self.drain(arena);
+        }
+        n
+    }
+
+    #[inline(always)]
+    unsafe fn push32_q(&mut self, s: usize, w: [u64; 4], arena: &mut Arena) -> usize {
+        use core::arch::x86_64::*;
+        let n = *self.n.get_unchecked(s) as usize;
+        let r = n & 1;
+        let line = self.lines.as_mut_ptr().add(s) as *mut __m256i;
+        *self.n.get_unchecked_mut(s) = (n + 1) as u32;
+        let v = _mm256_set_epi64x(w[3] as i64, w[2] as i64, w[1] as i64, w[0] as i64);
+        _mm256_store_si256(line.add(r), v);
+        let full = r == 1;
+        let src = std::hint::select_unpredictable(full, line as *const __m256i, &*self.idle as *const Line as *const __m256i);
+        let k = self.queued;
+        let q = self.queue.as_mut_ptr().add(k) as *mut __m256i;
+        _mm256_store_si256(q, _mm256_load_si256(src));
+        _mm256_store_si256(q.add(1), v);
+        *self.owner.get_unchecked_mut(k) = ((n as u64) << 32) | s as u64;
+        let k = k + full as usize;
+        self.queued = k;
+        if k == QUEUE {
+            self.drain(arena);
+        }
+        n
+    }
+
     /// Append a 16-byte item, given as two words, to stream `s` and return
     /// its index. The item that fills a staging line goes out straight from
     /// the registers: reading it back from the line right after writing it
@@ -394,6 +488,9 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
         debug_assert!(std::mem::size_of::<T>() == 16);
         unsafe {
             use core::arch::x86_64::*;
+            if self.qmode {
+                return self.push16_q(s, a, b, arena);
+            }
             let n = *self.n.get_unchecked(s) as usize;
             let r = n & 3;
             let line = self.lines.as_mut_ptr().add(s) as *mut u64;
@@ -423,6 +520,9 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
         debug_assert!(std::mem::size_of::<T>() == 32);
         unsafe {
             use core::arch::x86_64::*;
+            if self.qmode {
+                return self.push32_q(s, w, arena);
+            }
             let n = *self.n.get_unchecked(s) as usize;
             let line = self.lines.as_mut_ptr().add(s) as *mut u64;
             *self.n.get_unchecked_mut(s) = (n + 1) as u32;
@@ -448,6 +548,7 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
 
     /// Move every partly filled staging line out. Call once, when done appending.
     pub fn finish(&mut self, arena: &mut Arena) {
+        self.drain(arena);
         for s in 0..self.n.len() {
             let n = self.n[s] as usize;
             let r = n & (Self::PER_LINE - 1);
