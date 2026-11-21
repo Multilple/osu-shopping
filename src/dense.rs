@@ -42,6 +42,7 @@ use crate::{
 // ---------------------------------------------------------------- the ID code
 
 pub use crate::keys::{scramble, unscramble, Keys, NONE};
+pub const M40: u64 = crate::keys::MASK;
 
 /// The number behind the ID `prefix + digits` under `key` (see keys.rs), or
 /// `NONE` when the ID is not a prefix and a canonical base-36 number below
