@@ -32,7 +32,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use crate::input::Src;
-use crate::table::{map_anon, release, Arena, Streams};
+use crate::table::{map_anon, release, Arena, Plain};
 use crate::util::*;
 use crate::{
     build_ctx, env_usize, fast, grid_tasks, input, lines, load_aux, par, person_grid, person_sorted,
@@ -426,10 +426,10 @@ pub(crate) struct DOut {
     /// in the second word and is followed by `[price | category << 24, EXT]`.
     /// (The first word orders the copies of an event: smallest ingest time
     /// first.)
-    pub(crate) ev: Streams<[u64; 2], 10>,
+    pub(crate) ev: Plain<[u64; 2], 10>,
     /// Valid clicks by their user's person bucket (interned users: bucket
     /// `nq`): `[ts << 32 | campaign, node | click << 32]`.
-    pub(crate) ck: Streams<[u64; 2], 10>,
+    pub(crate) ck: Plain<[u64; 2], 10>,
     pub(crate) reader: input::Reader,
     pub(crate) pend_l: Vec<(u32, u32)>,
     /// The click kernel's memory of dates.
@@ -1631,8 +1631,8 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         .map(|_| {
             Shared(UnsafeCell::new(DOut {
                 arena: Arena::new(),
-                ev: Streams::new(nb),
-                ck: Streams::new(nq + 1),
+                ev: Plain::new(nb),
+                ck: Plain::new(nq + 1),
                 reader: input::Reader::new(chunk),
                 pend_l: Vec::with_capacity(PEND),
                 ckd: crate::dense_ck::DateMemo::new(ctx.origin),

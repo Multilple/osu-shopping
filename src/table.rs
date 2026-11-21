@@ -334,6 +334,24 @@ impl Arena {
         p as *mut u8
     }
 
+    /// `alloc`, at an address that is a multiple of `align` (a power of two).
+    #[inline(always)]
+    pub fn alloc_aligned(&mut self, bytes: usize, align: usize) -> *mut u8 {
+        let at = (self.cur + align - 1) & !(align - 1);
+        if self.cur == 0 || at + bytes > self.end {
+            let block = (bytes + align).max(32 << 20);
+            let base = map_anon(block) as usize;
+            self.blocks.push((base, block));
+            self.end = base + block;
+            self.cur = (base + align - 1) & !(align - 1);
+        } else {
+            self.cur = at;
+        }
+        let p = self.cur;
+        self.cur += bytes;
+        p as *mut u8
+    }
+
     /// Give back the tail of the latest allocation, from `p` on.
     pub fn shrink_to(&mut self, p: *mut u8) {
         let p = (p as usize + 63) & !63;
@@ -478,6 +496,74 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
     }
 
     /// Stream `s` as (pointer, length) pieces.
+    pub fn pieces(&self, s: usize) -> impl Iterator<Item = (*mut T, usize)> + '_ {
+        let n = self.n[s] as usize;
+        self.chunks[s].iter().enumerate().map(move |(i, &p)| (p, (n - (i << CB)).min(1 << CB)))
+    }
+}
+
+/// Many append-only lists of 16-byte items, each stored in chunks of
+/// `1 << CB` items, written in place with plain stores: appending is a load
+/// of the list's write pointer, two stores and a store of the pointer, with
+/// no branch that depends on the data (items arrive for the lists in random
+/// order, so "is this list's staging line full" would be a coin toss).
+/// Chunks sit at multiples of their size, so a write pointer that is such a
+/// multiple is at the end of its chunk (or has none yet).
+pub struct Plain<T, const CB: usize> {
+    dst: Vec<*mut T>,
+    n: Vec<u32>,
+    chunks: Vec<Vec<*mut T>>,
+}
+
+unsafe impl<T, const CB: usize> Sync for Plain<T, CB> {}
+unsafe impl<T, const CB: usize> Send for Plain<T, CB> {}
+
+impl<T: Copy, const CB: usize> Plain<T, CB> {
+    const BYTES: usize = std::mem::size_of::<T>() << CB;
+
+    pub fn new(streams: usize) -> Self {
+        assert!(std::mem::size_of::<T>() == 16);
+        Plain { dst: vec![std::ptr::null_mut(); streams], n: vec![0; streams], chunks: (0..streams).map(|_| Vec::new()).collect() }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn new_chunk(&mut self, s: usize, arena: &mut Arena) -> *mut T {
+        let p = arena.alloc_aligned(Self::BYTES, Self::BYTES) as *mut T;
+        self.chunks[s].push(p);
+        p
+    }
+
+    /// Append an item, given as two words, to stream `s`.
+    #[inline(always)]
+    pub fn push16(&mut self, s: usize, a: u64, b: u64, arena: &mut Arena) {
+        unsafe {
+            let mut d = *self.dst.get_unchecked(s) as *mut u64;
+            if (d as usize) & (Self::BYTES - 1) == 0 {
+                d = self.new_chunk(s, arena) as *mut u64;
+            }
+            *d = a;
+            *d.add(1) = b;
+            *self.dst.get_unchecked_mut(s) = d.add(2) as *mut T;
+        }
+    }
+
+    /// Count every stream's items. Call once, when done appending.
+    pub fn finish(&mut self, _arena: &mut Arena) {
+        for s in 0..self.dst.len() {
+            self.n[s] = match self.chunks[s].last() {
+                Some(&last) => (((self.chunks[s].len() - 1) << CB) + (self.dst[s] as usize - last as usize) / std::mem::size_of::<T>()) as u32,
+                None => 0,
+            };
+        }
+    }
+
+    /// (After `finish`.)
+    pub fn len(&self, s: usize) -> usize {
+        self.n[s] as usize
+    }
+
+    /// Stream `s` as (pointer, length) pieces (after `finish`).
     pub fn pieces(&self, s: usize) -> impl Iterator<Item = (*mut T, usize)> + '_ {
         let n = self.n[s] as usize;
         self.chunks[s].iter().enumerate().map(move |(i, &p)| (p, (n - (i << CB)).min(1 << CB)))
