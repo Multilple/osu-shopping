@@ -258,28 +258,23 @@ pub fn main(threads: usize) -> ! {
         // A label ending in "~" runs after a pause, in "!" with nothing measured inside; "dx" reads the files on disk.)
         // The first two are the general pipeline and this build, both with the sums (for the comparison of answers).
         let mut variants: Vec<(&str, usize, Vec<(&str, &str)>, &str)> = vec![("g$", threads, vec![("SS_DENSE", "0")], ""), ("d$", threads, vec![], "")];
+        // "p": this source built as before; "j": built with jumps kept off 32-byte boundaries.
         variants.extend([
-            ("d", threads, vec![], ""),
-            ("d!", threads, vec![], ""),
-            ("m7", threads, vec![], "2"),
-            ("m7!", threads, vec![], "2"),
-            ("e10!", threads, vec![], "3"),
-            ("uf!", threads, vec![("SS_UNMAP", "final")], ""),
+            ("p", threads, vec![], "2"),
+            ("p!", threads, vec![], "2"),
+            ("j", threads, vec![], "3"),
+            ("j!", threads, vec![], "3"),
+            ("puf!", threads, vec![("SS_UNMAP", "final")], "2"),
+            ("juf!", threads, vec![("SS_UNMAP", "final")], "3"),
         ]);
         if !big {
-            variants.extend([
-                ("e10", threads, vec![], "3"),
-                ("d4", 4, vec![], ""),
-                ("d4!", 4, vec![], ""),
-                ("d6!", 6, vec![], ""),
-                ("kb17!", threads, vec![("SS_KB", "17")], ""),
-            ]);
+            variants.extend([("p4!", 4, vec![], "2"), ("j4!", 4, vec![], "3"), ("p4", 4, vec![], "2"), ("j4", 4, vec![], "3")]);
         } else {
-            variants.extend([("kb16!", threads, vec![("SS_KB", "16")], ""), ("kb17!", threads, vec![("SS_KB", "17")], "")]);
+            variants.extend([("pk15!", threads, vec![("SS_KB", "15")], "2")]);
         }
         variants.retain(|v| v.3.is_empty() || Path::new(&format!("{}{}", exe.display(), v.3)).exists());
         let mut best: Vec<Option<Run>> = variants.iter().map(|_| None).collect();
-        let rounds = if big { 2 } else { 3 };
+        let rounds = if big { 3 } else { 5 };
         'rounds: for round in 0..rounds {
             for k in 0..variants.len() {
                 let i = if round % 2 == 0 { k } else { variants.len() - 1 - k };
@@ -311,9 +306,8 @@ pub fn main(threads: usize) -> ! {
                     if r.laps.is_empty() {
                         continue;
                     }
-                    if v.0 == "d" {
-                        page.push(format!("Ld {}", r.laps));
-                        page.push(format!("Ls {}", r.subs));
+                    if v.0 == "p" || v.0 == "j" {
+                        page.push(format!("L{} {}", v.0, r.laps));
                     } else {
                         let walls: Vec<&str> = r.laps.split_whitespace().map(|t| t.split('/').next().unwrap_or("")).collect();
                         page.push(format!("L{} {}", v.0, walls.join(" ")));
