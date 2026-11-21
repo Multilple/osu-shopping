@@ -170,8 +170,11 @@ fn one(exe: &Path, data: &Path, out: &Path, threads: usize, env: &[(&str, &str)]
     let mut cmd = Command::new(exe);
     cmd.arg(data).arg(out).env("SS_T", ticket(std::process::id() as u64)).env("NCPU", threads.to_string()).stdout(Stdio::null()).stderr(Stdio::piped());
     // "!": as a scored run, with nothing measured or summed inside.
-    if !label.ends_with('!') {
+    // "$": the sums of the rows as well (they cost time, so only where the answers are compared).
+    if label.ends_with('$') {
         cmd.env("SS_TIMING", "1").env("SS_SUM", "1");
+    } else if !label.ends_with('!') {
+        cmd.env("SS_TIMING", "1");
     }
     for (k, v) in env {
         cmd.env(k, v);
@@ -229,6 +232,7 @@ pub fn main(threads: usize) -> ! {
     });
     let out = scratch.join("out");
     let th = threads.to_string();
+    PAGE.lock().unwrap().push(clock_line(threads));
     for (tag, events, clicks) in [("20", "20000000", "5000000"), ("60", "60000000", "15000000")] {
         if t0.elapsed().as_secs_f64() > limit * 0.45 {
             break;
@@ -252,22 +256,26 @@ pub fn main(threads: usize) -> ! {
         }
         // (label, threads, settings, which binary: "" is this one, "2" is /ss2 and so on, where present.
         // A label ending in "~" runs after a pause, in "!" with nothing measured inside; "dx" reads the files on disk.)
-        let mut variants: Vec<(&str, usize, Vec<(&str, &str)>, &str)> = vec![("g", threads, vec![("SS_DENSE", "0")], ""), ("d", threads, vec![], "")];
+        // The first two are the general pipeline and this build, both with the sums (for the comparison of answers).
+        let mut variants: Vec<(&str, usize, Vec<(&str, &str)>, &str)> = vec![("g$", threads, vec![("SS_DENSE", "0")], ""), ("d$", threads, vec![], "")];
         variants.extend([
+            ("d", threads, vec![], ""),
             ("d!", threads, vec![], ""),
-            ("e8", threads, vec![], "2"),
-            ("e7", threads, vec![], "3"),
-            ("m4", threads, vec![], "4"),
-            ("uf", threads, vec![("SS_UNMAP", "final")], ""),
+            ("m7", threads, vec![], "2"),
+            ("m7!", threads, vec![], "2"),
+            ("e10!", threads, vec![], "3"),
+            ("uf!", threads, vec![("SS_UNMAP", "final")], ""),
         ]);
         if !big {
             variants.extend([
-                ("d~", threads, vec![], ""),
-                ("dx", threads, vec![], ""),
-                ("e8!", threads, vec![], "2"),
-                ("e7!", threads, vec![], "3"),
-                ("un", threads, vec![("SS_UNMAP", "none")], ""),
+                ("e10", threads, vec![], "3"),
+                ("d4", 4, vec![], ""),
+                ("d4!", 4, vec![], ""),
+                ("d6!", 6, vec![], ""),
+                ("kb17!", threads, vec![("SS_KB", "17")], ""),
             ]);
+        } else {
+            variants.extend([("kb16!", threads, vec![("SS_KB", "16")], ""), ("kb17!", threads, vec![("SS_KB", "17")], "")]);
         }
         variants.retain(|v| v.3.is_empty() || Path::new(&format!("{}{}", exe.display(), v.3)).exists());
         let mut best: Vec<Option<Run>> = variants.iter().map(|_| None).collect();
@@ -290,27 +298,29 @@ pub fn main(threads: usize) -> ! {
         let mut line = format!("{tag}M gen{gen_s:.0}s mem{view_s:.0}s/{}", fds.len());
         for (v, b) in variants.iter().zip(&best) {
             match b {
-                Some(r) => line += &format!(" {}{}:{:.0}/{:.0}/{:.0}", v.0, if !r.ok { "!FAIL" } else if v.0 != "g" && !v.0.ends_with('!') && !r.dense { "!GEN" } else { "" }, r.wall, r.user, r.sys),
+                Some(r) => line += &format!(" {}{}:{:.0}/{:.0}/{:.0}", v.0, if !r.ok { "!FAIL" } else if v.0 != "g$" && !v.0.ends_with('!') && !r.dense { "!GEN" } else { "" }, r.wall, r.user, r.sys),
                 None => line += &format!(" {}:-", v.0),
             }
         }
         let mut page = PAGE.lock().unwrap();
         page.push(line);
         if let (Some(g), Some(d)) = (&best[0], &best[1]) {
-            page.push(format!("Ld {}", d.laps));
-            // The other settings' stages: wall time only.
+            // The stages of the timed runs: in full for this build, wall time only for the others.
             for (v, b) in variants.iter().zip(&best).skip(2) {
                 if let Some(r) = b {
                     if r.laps.is_empty() {
                         continue;
                     }
-                    let walls: Vec<&str> = r.laps.split_whitespace().map(|t| t.split('/').next().unwrap_or("")).collect();
-                    page.push(format!("L{} {}", v.0, walls.join(" ")));
+                    if v.0 == "d" {
+                        page.push(format!("Ld {}", r.laps));
+                        page.push(format!("Ls {}", r.subs));
+                    } else {
+                        let walls: Vec<&str> = r.laps.split_whitespace().map(|t| t.split('/').next().unwrap_or("")).collect();
+                        page.push(format!("L{} {}", v.0, walls.join(" ")));
+                    }
                 }
             }
-            page.push(format!("Ls {}", d.subs));
-            page.push(format!("Lg {}", g.laps));
-            page.push(format!("sum {} [{}] hwm d{:.1} g{:.1}", if !d.sum.is_empty() && d.sum == g.sum { "SAME" } else { "DIFFERENT" }, d.sum, d.hwm_gb, g.hwm_gb));
+            page.push(format!("sum {} hwm d{:.1} g{:.1}", if !d.sum.is_empty() && d.sum == g.sum { "SAME" } else { "DIFFERENT" }, d.hwm_gb, g.hwm_gb));
         }
         drop(page);
         let _ = std::fs::remove_dir_all(&data);
@@ -322,4 +332,74 @@ pub fn main(threads: usize) -> ! {
     let _ = std::fs::remove_dir_all(&scratch);
     PAGE.lock().unwrap().push(format!("t{:.0}s", t0.elapsed().as_secs_f64()));
     finish();
+}
+
+/// One thread's clock, GHz: a chain of one-cycle adds (24 a round) timed for
+/// about `ms`, with one vector instruction a round mixed in by `mode`
+/// (0 none; 1 a 128-bit multiply; 2 a 256-bit multiply; 3 a 512-bit add;
+/// 4 a 512-bit multiply). The first third of the time is not counted.
+fn clock_one(mode: u8, ms: u64) -> f64 {
+    use core::arch::asm;
+    macro_rules! spin {
+        ($n:expr, $($v:literal),*) => {{
+            let mut x = 0u64;
+            let mut n: u64 = $n;
+            unsafe {
+                asm!(
+                    "2:",
+                    "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1",
+                    "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1",
+                    "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1", "add {x}, 1",
+                    $($v,)*
+                    "dec {n}",
+                    "jnz 2b",
+                    "vzeroupper",
+                    x = inout(reg) x,
+                    n = inout(reg) n,
+                    out("zmm0") _, out("zmm1") _, out("zmm2") _,
+                    options(nostack),
+                );
+            }
+            std::hint::black_box((x, n));
+        }};
+    }
+    const ROUND: u64 = 20_000;
+    let chunk = |m: u8| match m {
+        1 => spin!(ROUND, "vpmaddwd xmm0, xmm1, xmm2"),
+        2 => spin!(ROUND, "vpmaddwd ymm0, ymm1, ymm2"),
+        3 => spin!(ROUND, "vpaddd zmm0, zmm1, zmm2"),
+        4 => spin!(ROUND, "vpmaddwd zmm0, zmm1, zmm2"),
+        _ => spin!(ROUND,),
+    };
+    let t0 = Instant::now();
+    let warm = std::time::Duration::from_millis(ms / 3);
+    let end = std::time::Duration::from_millis(ms);
+    while t0.elapsed() < warm {
+        chunk(mode);
+    }
+    let t1 = Instant::now();
+    let mut rounds = 0u64;
+    while t0.elapsed() < end {
+        chunk(mode);
+        rounds += ROUND;
+    }
+    (rounds * 24) as f64 / t1.elapsed().as_nanos().max(1) as f64
+}
+
+/// The clock by how many threads are busy and what they mix in: "F 8:3.40 8x:.. 8y:.. 8l:.. 8z:.. 4:.. 1:..".
+fn clock_line(threads: usize) -> String {
+    let avx512 = std::is_x86_feature_detected!("avx512bw");
+    let mut line = String::from("F");
+    for (name, n, mode) in [("", threads, 0u8), ("x", threads, 1), ("y", threads, 2), ("l", threads, 3), ("z", threads, 4), ("", threads, 0), ("", threads / 2, 0), ("y", threads / 2, 2), ("", 1, 0)] {
+        if mode >= 3 && !avx512 {
+            continue;
+        }
+        let ghz: Vec<f64> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..n.max(1)).map(|_| s.spawn(move || clock_one(mode, 45))).collect();
+            hs.into_iter().map(|h| h.join().unwrap_or(0.0)).collect()
+        });
+        let (lo, hi) = (ghz.iter().cloned().fold(f64::MAX, f64::min), ghz.iter().cloned().fold(0.0, f64::max));
+        line += &format!(" {}{name}:{lo:.2}-{hi:.2}", n.max(1));
+    }
+    line
 }
