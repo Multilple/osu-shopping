@@ -40,7 +40,6 @@
 use core::arch::asm;
 use core::arch::x86_64::*;
 use core::mem::offset_of;
-use std::cell::Cell;
 
 use crate::dense::{DOut, Dn, M40};
 use crate::dense_ck::{both, civil_of_days, A_INV, ALIAS_HI_TOP, B_INV, ID_ADJ, ID_LIM0, ID_LIM1, ID_W1, ID_W2, NODE_MASK_TOP};
@@ -59,9 +58,8 @@ struct DayEnt {
     _pad: u64,
 }
 
-const DAYS_CIVIL: usize = 1 << 11;
-const DAYS_EPOCH: usize = 1 << 8;
-const DAYS_LEN: usize = 2 * DAYS_CIVIL + 2 * DAYS_EPOCH;
+/// Entries of a block of the day table (dates; epoch times use the first 256).
+const DAYS: usize = 1 << 11;
 
 /// How a `ts` field of one raw length is read (offsets fixed by the assembly).
 #[repr(C, align(64))]
@@ -75,13 +73,21 @@ struct Row {
     w2: [i16; 8],
     dmask: [u8; 16],
     pmask: u64,
-    tbl: *const DayEnt,
+    _pad: u64,
     /// `mm[0]` for a sign byte of `-` (or none), `mm[8]` for `+`: 64 bytes apart.
     mm: [u64; 16],
 }
 
 const ROWS: usize = 7;
 const R_POISON: usize = 0;
+
+/// A timestamp row and its block of the day table, right after it (at a
+/// fixed distance from the row, so that no pointer to it is needed).
+#[repr(C, align(64))]
+struct TsBlock {
+    row: Row,
+    days: [DayEnt; DAYS],
+}
 
 /// ID rows by both comma positions (`a1 * 32 + a2`, each at most 32).
 const IDT: usize = 33 * 32 + 1;
@@ -117,10 +123,9 @@ pub(crate) struct KC {
     cmask: [u64; 33],
     cbase: [*const u64; 33],
     cpm: [u64; 33],
-    rowptr: [*const Row; 33],
-    rows: [Row; ROWS],
+    rowptr: [*const TsBlock; 33],
     idt: [IdEnt; IDT],
-    days: [DayEnt; DAYS_LEN + 1],
+    ts: [TsBlock; ROWS],
 }
 
 unsafe impl Sync for KC {}
@@ -162,7 +167,7 @@ fn id_lane(r: usize, prefix: u8) -> ([u8; 16], [u8; 16]) {
     (c, s)
 }
 
-fn blank_row(tbl: *const DayEnt) -> Row {
+fn blank_row() -> Row {
     Row {
         shuf: [0x80; 16],
         lo: [0; 16],
@@ -172,14 +177,14 @@ fn blank_row(tbl: *const DayEnt) -> Row {
         w2: [0; 8],
         dmask: [0; 16],
         pmask: 0,
-        tbl,
+        _pad: 0,
         mm: [0; 16],
     }
 }
 
 /// A row nothing passes: one byte would have to be both 0 and 1.
-fn poison_row(tbl: *const DayEnt) -> Row {
-    let mut r = blank_row(tbl);
+fn poison_row() -> Row {
+    let mut r = blank_row();
     r.shuf[0] = 15;
     r.shuf[1] = 15;
     r.lo[1] = 1;
@@ -203,8 +208,8 @@ fn close_quote(r: &mut Row, q: usize) {
 
 /// Epoch milliseconds, 13 digits: the first five are the day table's, then
 /// `A` = digits 6..9 (slots 8..12), `B` = digits 10..13 (slots 0..4).
-fn epoch_row(q: usize, tbl: *const DayEnt) -> Row {
-    let mut r = blank_row(tbl);
+fn epoch_row(q: usize) -> Row {
+    let mut r = blank_row();
     for i in 0..4 {
         put(&mut r, 13, q, 8 + i, 5 + i, b'0', 9);
         put(&mut r, 13, q, i, 9 + i, b'0', 9);
@@ -226,8 +231,8 @@ fn epoch_row(q: usize, tbl: *const DayEnt) -> Row {
 /// `YYYY-MM-DDTHH:MM:SS` then `Z` (`off` false) or `+HH:MM` / `-HH:MM`:
 /// the date is the day table's; `A` is the time of day in seconds, `B` the
 /// offset's.
-fn civil_row(off: bool, q: usize, tbl: *const DayEnt) -> Row {
-    let mut r = blank_row(tbl);
+fn civil_row(off: bool, q: usize) -> Row {
+    let mut r = blank_row();
     let n = if off { 25 } else { 20 };
     // Hours, minutes, seconds in slots 8..14.
     for (slot, c) in [(8, 11), (9, 12), (10, 14), (11, 15), (12, 17), (13, 18)] {
@@ -272,7 +277,7 @@ fn civil_row(off: bool, q: usize, tbl: *const DayEnt) -> Row {
 impl KC {
     /// The tables for a run, or `None` when the run is one the pass was not
     /// made for (then the Rust kernel takes it).
-    pub(crate) fn new(ctx: &Ctx, dn: &Dn) -> Option<Box<KC>> {
+    pub(crate) fn new(ctx: &Ctx, dn: &Dn) -> Option<&'static KC> {
         let (cmask, cbase, cpm) = dn.ckx.camp_rows()?;
         let cws = ctx.cws;
         let span = (ctx.we - cws).max(0);
@@ -280,7 +285,9 @@ impl KC {
         if span + 3 * DAY >= 1 << 31 || dn.nq + 1 > STAGE_MAX {
             return None;
         }
-        let mut k: Box<KC> = unsafe { Box::<KC>::new_zeroed().assume_init() };
+        // (Zeros from fresh pages: a valid KC, plain numbers and null
+        // pointers throughout. Kept for the run.)
+        let k: &'static mut KC = unsafe { &mut *(crate::table::map_anon(std::mem::size_of::<KC>()) as *mut KC) };
         k.c_30 = [0x30; 32];
         k.c_lim1 = ID_LIM1.0;
         k.c_adj = ID_ADJ.0;
@@ -318,23 +325,17 @@ impl KC {
             e.sub[16..].copy_from_slice(&s1);
         }
 
-        // ---- the days of the click window, a day to spare on both sides
-        // for the offset forms (the same keys as dense_ck's).
-        let ents = k.days.as_mut_ptr();
-        let blocks = [0, DAYS_CIVIL, 2 * DAYS_CIVIL, 2 * DAYS_CIVIL + DAYS_EPOCH];
-        let civil = [civil_row(false, 0, ents).pmask, civil_row(false, 1, ents).pmask];
-        let epoch = [epoch_row(0, ents).pmask, epoch_row(1, ents).pmask];
-        let taken = Cell::new(0usize);
-        let put_day = |block: usize, pmask: u64, start: &[u8], val: i64| unsafe {
-            let mut key = [0u8; 16];
-            key[..start.len()].copy_from_slice(start);
-            let idx = _pext_u64(u64::from_be_bytes(key[3..11].try_into().unwrap()), pmask) as usize;
-            let e = &mut *ents.add(block + idx);
-            if e.key == [0u8; 16] {
-                *e = DayEnt { key, val: (val as u64) << 32, _pad: 0 };
-                taken.set(taken.get() + 1);
-            }
-        };
+        // ---- timestamp rows, each with the days of the click window (a day
+        // to spare on both sides for the offset forms) in its form: the
+        // same keys as dense_ck's.
+        k.ts[R_POISON].row = poison_row();
+        for q in 0..2 {
+            k.ts[1 + q].row = epoch_row(q);
+            k.ts[3 + q].row = civil_row(false, q);
+            k.ts[5 + q].row = civil_row(true, q);
+        }
+        let mut dates: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut epochs: Vec<(Vec<u8>, i64)> = Vec::new();
         if ctx.we > cws {
             for z in cws.div_euclid(DAY) - 1..=(ctx.we - 1).div_euclid(DAY) + 1 {
                 let (y, m, d) = civil_of_days(z);
@@ -342,44 +343,44 @@ impl KC {
                 // The plain parser has the last word on what the day is.
                 if let Some(ms) = parse_ts(format!("{}00:00:00Z", &date[1..]).as_bytes()) {
                     if date.len() == 12 && ms == z * DAY {
-                        put_day(blocks[0], civil[0], &date.as_bytes()[1..], ms - cws);
-                        put_day(blocks[1], civil[1], date.as_bytes(), ms - cws);
+                        dates.push((date.into_bytes(), ms - cws));
                     }
                 }
             }
             for p in cws.div_euclid(100_000_000)..=(ctx.we - 1).div_euclid(100_000_000) {
-                if !(10_000..100_000).contains(&p) {
-                    continue;
+                if (10_000..100_000).contains(&p) {
+                    epochs.push((format!("\"{p}").into_bytes(), p * 100_000_000 - cws));
                 }
-                let digits = format!("\"{p}");
-                put_day(blocks[2], epoch[0], &digits.as_bytes()[1..], p * 100_000_000 - cws);
-                put_day(blocks[3], epoch[1], digits.as_bytes(), p * 100_000_000 - cws);
             }
         }
-        // An unused entry is all zeros, which no field that lands on it
-        // equals, as the index bits are among the bytes compared, except on
-        // entry 0: there it gets a key that belongs to entry 1.
-        for (b, &block) in blocks.iter().enumerate() {
-            let e = &mut k.days[block];
-            if e.key == [0u8; 16] {
-                e.key[if b < 2 { 9 + b } else { 2 + b }] = 1;
+        for (i, b) in k.ts.iter_mut().enumerate().skip(1) {
+            // Rows 1, 2: epoch times; 3..7: dates; odd rows: no quotes.
+            let q = 1 - i % 2;
+            let list = if i < 3 { &epochs } else { &dates };
+            for (start, val) in list {
+                let start = &start[1 - q..];
+                let mut key = [0u8; 16];
+                key[..start.len()].copy_from_slice(start);
+                let idx = unsafe { _pext_u64(u64::from_be_bytes(key[3..11].try_into().unwrap()), b.row.pmask) } as usize;
+                let e = &mut b.days[idx];
+                if e.key == [0u8; 16] {
+                    *e = DayEnt { key, val: (*val as u64) << 32, _pad: 0 };
+                }
+            }
+            // An unused entry is all zeros, which no field that lands on it
+            // equals, as the index bits are among the bytes compared, except
+            // on entry 0: there it gets a key that belongs to entry 1.
+            if b.days[0].key == [0u8; 16] {
+                // The byte with the lowest index bits: the day's units, the fifth digit.
+                b.days[0].key[if i >= 3 { 9 + q } else { 4 + q }] = 1;
             }
         }
-
-        // ---- timestamp rows
-        let blk = |b: usize| unsafe { ents.add(blocks[b]) as *const DayEnt };
-        k.rows[R_POISON] = poison_row(blk(0));
+        let blocks = k.ts.as_ptr();
+        k.rowptr = [blocks; 33];
         for q in 0..2 {
-            k.rows[1 + q] = epoch_row(q, blk(2 + q));
-            k.rows[3 + q] = civil_row(false, q, blk(q));
-            k.rows[5 + q] = civil_row(true, q, blk(q));
-        }
-        let rows = k.rows.as_ptr();
-        k.rowptr = [rows; 33];
-        for q in 0..2 {
-            k.rowptr[13 + 2 * q] = unsafe { rows.add(1 + q) };
-            k.rowptr[20 + 2 * q] = unsafe { rows.add(3 + q) };
-            k.rowptr[25 + 2 * q] = unsafe { rows.add(5 + q) };
+            k.rowptr[13 + 2 * q] = unsafe { blocks.add(1 + q) };
+            k.rowptr[20 + 2 * q] = unsafe { blocks.add(3 + q) };
+            k.rowptr[25 + 2 * q] = unsafe { blocks.add(5 + q) };
         }
         Some(k)
     }
@@ -410,7 +411,7 @@ unsafe fn user_line(p: *const u8, w0: u64, tc: u64, dn: &Dn, out: &mut DOut) {
 /// where the rest starts, or `None` when this kernel cannot take the run.
 #[inline(never)]
 pub(crate) unsafe fn clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> Option<usize> {
-    let kc: &KC = dn.cka.as_deref()?;
+    let kc: &KC = dn.cka?;
     let pos = out.ck.pointers()?;
     let base = file.as_ptr();
     // Past the last line that ends before `end`; a pass reads up to 100
@@ -519,9 +520,8 @@ pub(crate) unsafe fn clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn
             "vpcmpgtw xmm6, xmm5, xmmword ptr [r11 + 64]",
             "vpor xmm3, xmm3, xmm6",    // xmm3: what is wrong with its end
             "pext rdx, rdx, qword ptr [r11 + 112]",
-            "shl rdx, 5",
-            "add rdx, qword ptr [r11 + 120]",                       // the day's entry
-            "vpxor xmm6, xmm1, xmmword ptr [rdx]",
+            "shl rdx, 5",               // the day's entry: r11 + rdx + {days}
+            "vpxor xmm6, xmm1, xmmword ptr [r11 + rdx + {days}]",
             "vpand xmm6, xmm6, xmmword ptr [r11 + 96]",
             "vpor xmm6, xmm6, xmm3",
             "vpor ymm6, ymm6, ymm4",
@@ -533,7 +533,7 @@ pub(crate) unsafe fn clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn
             "vpmovmskb eax, xmm2",      // 64 for `+`, else 0
             "imul r12, qword ptr [r11 + rax + 128]",
             "and r12, qword ptr [rdi + {c_hi}]",
-            "add r12, qword ptr [rdx + 16]",                        // ms from the window's start, << 32
+            "add r12, qword ptr [r11 + rdx + {days} + 16]",                        // ms from the window's start, << 32
             "cmp r12, qword ptr [rdi + {span32}]",
             "jae 3f",                   // outside the window: no record
             "add r12, r13",             // r12: the record's first word
@@ -544,15 +544,16 @@ pub(crate) unsafe fn clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn
             "cmp rdx, qword ptr [rdi + {max_node}]",
             "jae 85f",
             "pext r13, r10, qword ptr [rdi + {stream_mask}]",
-            "shl r9, 8",
-            "or r9, rdx",               // r9: the second word
-            // ---- Append.
+            // ---- Append. The second word is the node, then the click's
+            // number: bytes 3..7 of r9, whose top byte is 0 (the slot after
+            // this one gets it, before its own item, if any).
             "mov rax, qword ptr [r14 + r13*8]",
             "lea r11, [rax + 16]",
             "test r11b, 127",
             "jz 86f",                   // the staging line's last slot
             "mov qword ptr [rax], r12",
-            "mov qword ptr [rax + 8], r9",
+            "mov qword ptr [rax + 9], r9",
+            "mov dword ptr [rax + 8], edx",
             "mov qword ptr [r14 + r13*8], r11",
             "3:",
             "cmp rsi, r15",
@@ -563,6 +564,8 @@ pub(crate) unsafe fn clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn
             ".pushsection .text.unlikely.ss_cka,\"ax\",@progbits",
             // The staging line is full: moved out with the item from the registers.
             "86:",
+            "shl r9, 8",
+            "or r9, rdx",               // r9: the second word
             "mov rdx, qword ptr [r14 + r13*8 + {dst}]",
             "test edx, {chunk_mask}",
             "jz 87f",                   // a new chunk first
@@ -636,6 +639,7 @@ pub(crate) unsafe fn clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn
             cpm = const offset_of!(KC, cpm),
             cap8 = const 8 * crate::dense_ck::CAMP_CAP,
             rowptr = const offset_of!(KC, rowptr),
+            days = const offset_of!(TsBlock, days),
             c_hi = const offset_of!(KC, c_hi),
             span32 = const offset_of!(KC, span32),
             alias_hi = const offset_of!(KC, alias_hi),
@@ -669,9 +673,9 @@ pub(crate) unsafe fn clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn
         } else if st == ST_COLD {
             crate::dense_ck::plain_line(file, s, end, ctx, dn, out)
         } else if st == ST_CAMP {
-            crate::dense_ck::slow_line(file, s, end, w0 as usize, next as usize, r3 as usize, None, false, w1, tu, ctx, dn, out)
+            crate::dense_ck::slow_line(file, s, end, w0 as usize, next as usize, r3 as usize, None, None, false, w1, tu, ctx, dn, out)
         } else if st >= ST_TS {
-            crate::dense_ck::slow_line(file, s, end, 0, next as usize, r3 as usize, Some(stream), st == ST_DATE, w1, tu, ctx, dn, out)
+            crate::dense_ck::slow_line(file, s, end, 0, next as usize, r3 as usize, Some(stream), None, st == ST_DATE, w1, tu, ctx, dn, out)
         } else if st == ST_USER {
             user_line(a0.add(1), w0, w1, dn, out);
             next as usize - base as usize + 1

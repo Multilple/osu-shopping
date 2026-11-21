@@ -569,8 +569,9 @@ struct Line128([u64; 16]);
 pub struct Stage16<const CB: usize> {
     lines: Vec<Line128>,
     /// `st[s]`: where stream `s`'s next item goes in its staging line;
-    /// `st[off + s]`: where its staging line goes when it fills.
-    st: Vec<*mut u64>,
+    /// `st[off + s]`: where its staging line goes when it fills. (Addresses:
+    /// zeros come from fresh pages, and most of them are never touched.)
+    st: Vec<usize>,
     off: usize,
     n: Vec<u32>,
     chunks: Vec<Vec<*mut [u64; 2]>>,
@@ -585,9 +586,9 @@ impl<const CB: usize> Stage16<CB> {
     pub fn new(streams: usize) -> Self {
         let lines = vec![Line128([0; 16]); streams];
         let off = STAGE_MAX.max(streams);
-        let mut st = vec![std::ptr::null_mut(); off + streams];
+        let mut st = vec![0usize; off + streams];
         for s in 0..streams {
-            st[s] = lines[s].0.as_ptr() as *mut u64;
+            st[s] = lines[s].0.as_ptr() as usize;
         }
         Stage16 { lines, st, off, n: vec![0; streams], chunks: (0..streams).map(|_| Vec::new()).collect() }
     }
@@ -595,20 +596,20 @@ impl<const CB: usize> Stage16<CB> {
     /// The write pointers (for the click kernel): `STAGE_MAX` apart from the
     /// moved-out pointers, or `None` when there are too many lists for that.
     pub fn pointers(&mut self) -> Option<*mut *mut u64> {
-        (self.off == STAGE_MAX).then(|| self.st.as_mut_ptr())
+        (self.off == STAGE_MAX).then(|| self.st.as_mut_ptr() as *mut *mut u64)
     }
 
     /// Append an item, given as two words, to stream `s`.
     #[inline(always)]
     pub fn push16(&mut self, s: usize, a: u64, b: u64, arena: &mut Arena) {
         unsafe {
-            let p = *self.st.get_unchecked(s);
+            let p = *self.st.get_unchecked(s) as *mut u64;
             if (p as usize + 16) & 127 == 0 {
                 self.flush(s, a, b, arena);
             } else {
                 *p = a;
                 *p.add(1) = b;
-                *self.st.get_unchecked_mut(s) = p.add(2);
+                *self.st.get_unchecked_mut(s) = p.add(2) as usize;
             }
         }
     }
@@ -618,7 +619,7 @@ impl<const CB: usize> Stage16<CB> {
     pub fn flush(&mut self, s: usize, a: u64, b: u64, arena: &mut Arena) {
         unsafe {
             use core::arch::x86_64::*;
-            let line = (*self.st.get_unchecked(s)).sub(14);
+            let line = (*self.st.get_unchecked(s) as *mut u64).sub(14);
             let mut d = *self.st.get_unchecked(self.off + s) as *mut __m256i;
             if (d as usize) & (Self::BYTES - 1) == 0 {
                 d = arena.alloc_aligned(Self::BYTES, Self::BYTES) as *mut __m256i;
@@ -631,8 +632,8 @@ impl<const CB: usize> Stage16<CB> {
             let third = _mm_load_si128(line.add(12) as *const __m128i);
             let hi = _mm256_inserti128_si256(_mm256_castsi128_si256(third), _mm_set_epi64x(b as i64, a as i64), 1);
             _mm256_stream_si256(d.add(3), hi);
-            *self.st.get_unchecked_mut(self.off + s) = d.add(4) as *mut u64;
-            *self.st.get_unchecked_mut(s) = line;
+            *self.st.get_unchecked_mut(self.off + s) = d.add(4) as usize;
+            *self.st.get_unchecked_mut(s) = line as usize;
         }
     }
 
@@ -641,9 +642,9 @@ impl<const CB: usize> Stage16<CB> {
     pub fn finish(&mut self, arena: &mut Arena) {
         for s in 0..self.n.len() {
             let line = self.lines[s].0.as_ptr();
-            let r = (self.st[s] as usize - line as usize) / 16;
+            let r = (self.st[s] - line as usize) / 16;
             let moved = match self.chunks[s].last() {
-                Some(&last) => ((self.chunks[s].len() - 1) << CB) + (self.st[self.off + s] as usize - last as usize) / 16,
+                Some(&last) => ((self.chunks[s].len() - 1) << CB) + (self.st[self.off + s] - last as usize) / 16,
                 None => 0,
             };
             for k in 0..r {

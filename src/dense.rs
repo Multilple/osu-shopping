@@ -226,7 +226,7 @@ pub struct Dn {
     /// The click kernel's tables.
     pub(crate) ckx: crate::dense_ck::Cx,
     /// The assembly click kernel's (`None`: the run is one it was not made for).
-    pub(crate) cka: Option<Box<crate::dense_cka::KC>>,
+    pub(crate) cka: Option<&'static crate::dense_cka::KC>,
 }
 
 unsafe impl Sync for Dn {}

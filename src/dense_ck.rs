@@ -936,12 +936,13 @@ pub(crate) unsafe fn plain_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn
 /// `tc`, the user's `tu`, both as `unscramble_top` gives them) and found its
 /// commas at `a2`, `a3` and the newline `r3` after the third (as here), but
 /// not the campaign in the direct table (`camp` is `None`) or not the
-/// timestamp in its rows (`date_only`: its end was fine). Returns where the
+/// timestamp in its rows (`ms32` is `None`; `date_only`: its end was fine;
+/// otherwise the time from the window's start, shifted up by 32, in it). Returns where the
 /// next line starts, or `usize::MAX` when the line does not end before `end`.
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn slow_line(file: &[u8], s: usize, end: usize, a2: usize, a3: usize, r3: usize, camp: Option<u64>, date_only: bool, tc: u64, tu: u64, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
+pub(crate) unsafe fn slow_line(file: &[u8], s: usize, end: usize, a2: usize, a3: usize, r3: usize, camp: Option<u64>, ms32: Option<u64>, date_only: bool, tc: u64, tu: u64, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
     let t: &Tables = dn.ckx.t.as_deref().unwrap_unchecked();
     let p = file.as_ptr().add(s);
     let next = s + a3 + r3 + 3;
@@ -953,20 +954,26 @@ pub(crate) unsafe fn slow_line(file: &[u8], s: usize, end: usize, a2: usize, a3:
             c => c,
         },
     };
-    let ms = match ts_cold(p.add(a3 + 2), r3, t, date_only) {
-        TS_COLD => return plain_line(file, s, end, ctx, dn, out),
-        TS_DROP => return next,
-        r => r as u64,
+    let ms32 = match ms32 {
+        Some(m) => m,
+        None => {
+            let ms = match ts_cold(p.add(a3 + 2), r3, t, date_only) {
+                TS_COLD => return plain_line(file, s, end, ctx, dn, out),
+                TS_DROP => return next,
+                r => r as u64,
+            };
+            if ms >= t.span {
+                return next;
+            }
+            ms << 32
+        }
     };
-    if ms >= t.span {
-        return next;
-    }
     let mut node = _pext_u64(tu, t.node_mask);
     let mut stream = _pext_u64(tu, t.stream_mask);
     if (tu & t.alias_hi != 0) | (node >= t.max_node) {
         (node, stream) = user_slow(p, dn);
     }
-    out.put(stream as usize, (ms << 32).wrapping_add(camp), node | tc << 8);
+    out.put(stream as usize, ms32.wrapping_add(camp), node | tc << 8);
     next
 }
 
