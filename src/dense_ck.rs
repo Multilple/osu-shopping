@@ -759,7 +759,8 @@ pub(crate) fn unscramble_top(id: u64, key: u64, binv24: u64, ainv24: u64) -> u64
 /// the fast path can go. Returns where the unhandled rest starts.
 #[inline(always)]
 unsafe fn kernel<S: Sink>(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, sink: &mut S) -> usize {
-    let cx = &dn.ckx;
+    // (Set before any click is parsed: see `dense::run`.)
+    let cx = dn.ckx.get().unwrap();
     let t: &Tables = cx.t.as_deref().unwrap_unchecked();
     let base = file.as_ptr();
     // Past the last line that ends before `end`; the loop reads up to 128
@@ -939,7 +940,7 @@ unsafe fn verified(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, ou
 /// starts (see `kernel`).
 #[inline(never)]
 pub(crate) unsafe fn clicks_dense(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
-    if dn.ckx.verify {
+    if dn.ckx.get().unwrap().verify {
         return verified(file, start, end, ctx, dn, out);
     }
     kernel(file, start, end, ctx, dn, out)

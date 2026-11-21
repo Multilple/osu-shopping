@@ -4,14 +4,19 @@
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
+
 use crate::util::{memchr, sys};
 
 pub struct Src {
     pub file: std::fs::File,
     pub len: usize,
     /// Where file offset 0 is mapped (0: not mapped). A readable page of
-    /// zeros comes before the file's pages and another after them.
-    map: usize,
+    /// zeros comes before the file's pages and another after them. (Atomic
+    /// so that any thread can map a shared file: see `map_shared`; whoever
+    /// reads the file after that must have synchronized with that thread.)
+    map: AtomicUsize,
 }
 
 impl Src {
@@ -27,7 +32,7 @@ impl Src {
     pub fn map_addr(&self) -> usize {
         use std::os::unix::io::AsRawFd;
         const PAGE: usize = 4096;
-        if self.len == 0 || self.map != 0 {
+        if self.len == 0 || self.m() != 0 {
             return 0;
         }
         let pages = (self.len + PAGE - 1) & !(PAGE - 1);
@@ -54,31 +59,46 @@ impl Src {
 
     /// Take up a mapping that `map_addr` made for this file (0: none).
     pub fn set_map(&mut self, at: usize) {
-        if at != 0 && self.map == 0 {
-            self.map = at;
+        if at != 0 && self.m() == 0 {
+            *self.map.get_mut() = at;
         }
+    }
+
+    /// `map` through a shared reference (one thread per file at a time).
+    pub fn map_shared(&self) {
+        let at = self.map_addr();
+        if at != 0 {
+            self.map.store(at, Relaxed);
+        }
+    }
+
+    #[inline(always)]
+    fn m(&self) -> usize {
+        self.map.load(Relaxed)
     }
 
     /// Ask the system to map the pages holding file offsets `a..b` now, in
     /// one call, rather than fault by fault as the parser reaches them.
     pub fn populate(&self, a: usize, b: usize) {
         const MADV_POPULATE_READ: i32 = 22;
-        if self.map != 0 {
-            let lo = (self.map + a) & !4095;
-            let hi = (self.map + b.min(self.len) + 4095) & !4095;
+        let map = self.m();
+        if map != 0 {
+            let lo = (map + a) & !4095;
+            let hi = (map + b.min(self.len) + 4095) & !4095;
             unsafe { sys::madvise(lo as *mut std::ffi::c_void, hi - lo, MADV_POPULATE_READ) };
         }
     }
 
     pub fn mapped(&self) -> bool {
-        self.map != 0
+        self.m() != 0
     }
 
     /// Let go of a mapped file's pages (cheaper done by several threads
     /// before the end than by process exit alone). It must not be read after.
     pub fn unmap(&self) {
-        if self.map != 0 {
-            unsafe { sys::madvise(self.map as *mut std::ffi::c_void, (self.len + 4095) & !4095, sys::MADV_DONTNEED) };
+        let map = self.m();
+        if map != 0 {
+            unsafe { sys::madvise(map as *mut std::ffi::c_void, (self.len + 4095) & !4095, sys::MADV_DONTNEED) };
         }
     }
 
@@ -92,7 +112,7 @@ impl Src {
         // file covers the first FRONT bytes when r0 is 0, and the one after
         // it covers what is read past the end.
         let data_end = FRONT + self.len - r0;
-        let v = unsafe { std::slice::from_raw_parts((self.map + r0 - FRONT) as *const u8, data_end + 1024) };
+        let v = unsafe { std::slice::from_raw_parts((self.m() + r0 - FRONT) as *const u8, data_end + 1024) };
         let ib = FRONT + b - r0;
         let lim = (ib - 1).min(data_end);
         let Some(i) = memchr(b'\n', &v[FRONT..lim.max(FRONT)]) else { return (&v[..FRONT + 128], FRONT, FRONT) };
@@ -126,7 +146,7 @@ pub fn list_dir(dir: &Path) -> Vec<Src> {
         .map(|p| {
             let file = std::fs::File::open(p).unwrap();
             let len = file.metadata().unwrap().len() as usize;
-            Src { file, len, map: 0 }
+            Src { file, len, map: AtomicUsize::new(0) }
         })
         .collect()
 }

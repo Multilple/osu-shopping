@@ -27,7 +27,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
@@ -222,8 +222,9 @@ pub struct Dn {
     pub(crate) click_names: Vec<Key>,
     /// A click key is `ts << 32 | campaign << obits | number among its person's clicks`.
     pub(crate) obits: u32,
-    /// The click kernel's tables.
-    pub(crate) ckx: crate::dense_ck::Cx,
+    /// The click kernel's tables (made once the campaigns are read, while
+    /// the links are parsed; set before any click is parsed).
+    pub(crate) ckx: std::sync::OnceLock<crate::dense_ck::Cx>,
 }
 
 unsafe impl Sync for Dn {}
@@ -2033,7 +2034,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         names: Vec::new(),
         click_names: Vec::new(),
         obits: 0,
-        ckx: Default::default(),
+        ckx: std::sync::OnceLock::new(),
     };
     // Interned users are always looked up.
     unsafe { std::ptr::write_bytes(dn.r8.add(d), 0xFF, XCAP) };
@@ -2051,83 +2052,106 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         .collect();
     lap("setup");
 
-    // ------------------------------------------------------------ links
+    // ------------------------------------------------------------ links and parse
+    // One queue: the link files' pieces first, then the event and click
+    // files'. A thread that runs out of link pieces goes straight on to the
+    // parse; the joined sets are settled once everything is read (the
+    // parse needs nothing of them: the dedup is the first to read them).
+    // Before its first piece each thread touches its share of the parents
+    // and maps some of the event and click files; on a side thread the
+    // products and campaigns are read and the click kernel's tables made.
+    let mapped = env_usize("SS_MMAP", 1) != 0;
+    let piece = env_usize("SS_PIECE", if mapped { 4 << 20 } else { chunk });
     let mut tasks = Vec::new();
     grid_tasks(&link_files, false, chunk, &mut tasks);
-    // The event and click files are mapped by the link stage's threads once
-    // they run out of link tasks (the mapping is serial work otherwise).
-    let mapped = env_usize("SS_MMAP", 1) != 0;
+    let n_link = tasks.len();
+    grid_tasks(&event_files, true, piece, &mut tasks);
+    grid_tasks(&click_files, false, piece, &mut tasks);
     let to_map: Vec<&Src> = if mapped { event_files.iter().chain(click_files.iter()).collect() } else { Vec::new() };
-    let maps: Vec<AtomicUsize> = to_map.iter().map(|_| AtomicUsize::new(0)).collect();
     let next_map = AtomicUsize::new(0);
-    let aux = std::thread::scope(|scope| {
-        let aux = scope.spawn(|| load_aux(data_dir));
+    let maps_done = AtomicUsize::new(0);
+    let touched = AtomicUsize::new(0);
+    let links_left = AtomicUsize::new(threads);
+    let links_at = AtomicU64::new(0);
+    let next = AtomicUsize::new(0);
+    // (Asking for a piece's pages in one call costs more than their faults on the scoring machine.)
+    let populate = env_usize("SS_POP", 0) != 0;
+    // The context with the products and campaigns in it: set (once, with
+    // `dn.ckx` before it) by the side thread; no event or click piece is
+    // parsed before it is.
+    let ready: std::sync::OnceLock<Ctx> = std::sync::OnceLock::new();
+    let aux_failed = AtomicBool::new(false);
+    lap("links");
+    std::thread::scope(|scope| {
         let dn = &dn;
-        // The parents are read before they are written: touch them first, so
-        // each 2 MB comes in as one huge page (see `IdTable::touch_part`).
+        let (ready, aux_failed) = (&ready, &aux_failed);
+        scope.spawn(move || {
+            // (Should this panic, the parsing threads stop waiting; the
+            // panic comes out of the scope.)
+            struct Failed<'a>(&'a AtomicBool, &'a std::sync::OnceLock<Ctx>);
+            impl Drop for Failed<'_> {
+                fn drop(&mut self) {
+                    if self.1.get().is_none() {
+                        self.0.store(true, Release);
+                    }
+                }
+            }
+            let _failed = Failed(aux_failed, ready);
+            let mut ctx = ctx;
+            ctx.aux = load_aux(data_dir);
+            let _ = dn.ckx.set(crate::dense_ck::Cx::new(&ctx, dn));
+            let _ = ready.set(ctx);
+        });
         par(threads, |tid| {
+            let out = mine(&outs, tid);
+            // The parents are read before they are written: touch them first,
+            // so each 2 MB comes in as one huge page (see `IdTable::touch_part`).
+            // (A write that changes nothing, so it is sound whatever runs.)
             let bytes = d * 4;
             let (a, b) = (bytes * tid / threads / 4096 * 4096, bytes * (tid + 1) / threads / 4096 * 4096);
             let mut o = a;
             while o < b {
-                unsafe { std::ptr::write_volatile((dn.parent as *mut u8).add(o), 0) };
+                dn.parent_slot((o / 4) as u32).fetch_or(0, Relaxed);
                 o += 4096;
             }
-        });
-        lap("    links: parents touched");
-        let next = AtomicUsize::new(0);
-        par(threads, |tid| {
-            let out = mine(&outs, tid);
-            loop {
-                let i = next.fetch_add(1, Relaxed);
-                let Some(task) = tasks.get(i) else { break };
-                let (start, end) = out.reader.load(&link_files[task.file], task.a, task.b);
-                let buf = std::mem::take(&mut out.reader.buf);
-                parse_links(&buf[..end + 128], start, end, dn, out);
-                out.reader.buf = buf;
-            }
-            flush_links(dn, out);
+            touched.fetch_add(1, Release);
+            // The event and click files are mapped now, before any of them is
+            // parsed (no thread maps anything once the parse has started).
             loop {
                 let i = next_map.fetch_add(1, Relaxed);
                 let Some(src) = to_map.get(i) else { break };
-                maps[i].store(src.map_addr(), Relaxed);
+                src.map_shared();
+                maps_done.fetch_add(1, Release);
             }
-        });
-        lap("    links: parsed");
-        aux.join().unwrap()
-    });
-    lap("  links: parse and join");
-    settle_links(&mut dn, threads);
-    release(dn.parent as *mut u8, nodes * 4);
-    ctx.aux = aux;
-    // Campaign numbers take the bits they need; the rest of a click key's
-    // low half numbers the click among its person's.
-    dn.obits = (ctx.aux.camp_names.len() as u32).leading_zeros();
-    dn.ckx = crate::dense_ck::Cx::new(&ctx, &dn);
-    lap("links");
-    if dn.overflow.load(Relaxed) {
-        return give_up(&dn, &outs, nodes);
-    }
-
-    // ------------------------------------------------------------ parse
-    drop(to_map);
-    for (src, at) in event_files.iter_mut().chain(click_files.iter_mut()).zip(&maps) {
-        src.set_map(at.load(Relaxed));
-    }
-    let mut tasks = Vec::new();
-    let piece = env_usize("SS_PIECE", if mapped { 4 << 20 } else { chunk });
-    grid_tasks(&event_files, true, piece, &mut tasks);
-    grid_tasks(&click_files, false, piece, &mut tasks);
-    let next = AtomicUsize::new(0);
-    // (Asking for a piece's pages in one call costs more than their faults on the scoring machine.)
-    let populate = env_usize("SS_POP", 0) != 0;
-    {
-        let (dn, ctx) = (&dn, &ctx);
-        par(threads, |tid| {
-            let out = mine(&outs, tid);
+            wait_until(|| touched.load(Acquire) == threads);
+            let mut ctx: Option<&Ctx> = None;
+            let mut linking = true;
             loop {
                 let i = next.fetch_add(1, Relaxed);
                 let Some(task) = tasks.get(i) else { break };
+                if i < n_link {
+                    let (start, end) = out.reader.load(&link_files[task.file], task.a, task.b);
+                    let buf = std::mem::take(&mut out.reader.buf);
+                    parse_links(&buf[..end + 128], start, end, dn, out);
+                    out.reader.buf = buf;
+                    continue;
+                }
+                if linking {
+                    linking = false;
+                    flush_links(dn, out);
+                    if links_left.fetch_sub(1, Relaxed) == 1 {
+                        links_at.store(t0.elapsed().as_micros() as u64, Relaxed);
+                    }
+                }
+                let ctx = match ctx {
+                    Some(c) => c,
+                    None => {
+                        // (The maps' and the side thread's stores are seen from here on.)
+                        wait_until(|| (ready.get().is_some() && maps_done.load(Acquire) == to_map.len()) || aux_failed.load(Acquire));
+                        let Some(c) = ready.get() else { break };
+                        *ctx.insert(c)
+                    }
+                };
                 let src = if task.events { &event_files[task.file] } else { &click_files[task.file] };
                 if src.mapped() {
                     if populate {
@@ -2150,10 +2174,28 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
                 }
                 out.reader.buf = buf;
             }
+            if linking {
+                flush_links(dn, out);
+                if links_left.fetch_sub(1, Relaxed) == 1 {
+                    links_at.store(t0.elapsed().as_micros() as u64, Relaxed);
+                }
+            }
             out.ev.finish(&mut out.arena);
             out.ck.finish(&mut out.arena);
         });
+    });
+    drop(to_map);
+    let ctx = ready.into_inner().expect("products and campaigns");
+    lap("  parse: links, events, clicks");
+    if log {
+        eprintln!("    links: last link piece done at {:.1} ms", links_at.load(Relaxed) as f64 / 1e3);
     }
+    // (Every interned user is known now, those of the events and clicks too.)
+    settle_links(&mut dn, threads);
+    // Campaign numbers take the bits they need; the rest of a click key's
+    // low half numbers the click among its person's.
+    dn.obits = (ctx.aux.camp_names.len() as u32).leading_zeros();
+    lap("    links: settled");
     dn.names = dn.users.read().unwrap().list.clone();
     dn.click_names = dn.clicks.read().unwrap().list.clone();
     lap("parse");
@@ -2168,7 +2210,10 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     // is neither left for the end nor for the exit.
     let unmapper = {
         let files: Vec<Src> = event_files.into_iter().chain(click_files).collect();
+        // (The parents too: nothing reads them once the links are settled.)
+        let parent = dn.parent as usize;
         std::thread::spawn(move || {
+            release(parent as *mut u8, nodes * 4);
             for f in &files {
                 f.unmap();
             }
@@ -2313,6 +2358,19 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     CURRENT.store(std::ptr::null_mut(), Relaxed);
     lap("campaign_daily");
     true
+}
+
+/// Spin (then yield) until `done()`.
+fn wait_until(done: impl Fn() -> bool) {
+    let mut n = 0u32;
+    while !done() {
+        if n < 2000 {
+            std::hint::spin_loop();
+            n += 1;
+        } else {
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// Abandon the dense run: give its memory back and let the general pipeline run.
