@@ -1405,6 +1405,7 @@ fn person_bucket(q: usize, segs: &[Seg], outs: &[&DOut], dn: &Dn, me: &mut BOut)
     if nck > 0 {
         me.cnt.clear();
         me.cnt.resize(bslots, 0);
+        if timed { me.prof[5] += sys::thread_cpu() - t_a; }
         let mut n = 0usize;
         for o in outs {
             for (ptr, len) in o.ck.pieces(q) {
@@ -1420,12 +1421,14 @@ fn person_bucket(q: usize, segs: &[Seg], outs: &[&DOut], dn: &Dn, me: &mut BOut)
                 }
             }
         }
+        if timed { me.prof[6] -= sys::thread_cpu(); }
         let mut at = 0u32;
         for c in me.cnt.iter_mut() {
             let k = *c;
             *c = at;
             at += k;
         }
+        if timed { me.prof[6] += sys::thread_cpu(); }
         me.keys.reserve(n);
         me.cids.reserve(n);
         // Every element is written below.
@@ -1832,8 +1835,10 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         }
         if log {
             eprintln!(
-                "    t{tid}: CPU ms: clicks {:.1} one-run {:.1} others {:.1} special {:.1} write {:.1} | events one-run {:.0} others {:.0}",
+                "    t{tid}: CPU ms: clicks {:.1} (clear {:.1} prefix {:.1}) one-run {:.1} others {:.1} special {:.1} write {:.1} | events one-run {:.0} others {:.0}",
                 me.prof[0] * 1e3,
+                me.prof[5] * 1e3,
+                me.prof[6] * 1e3,
                 me.prof[1] * 1e3,
                 me.prof[2] * 1e3,
                 (t_w - t_s) * 1e3,

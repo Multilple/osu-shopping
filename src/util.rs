@@ -217,14 +217,15 @@ pub mod sys {
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         pub fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+        pub fn clock_gettime(clock: i32, t: *mut [i64; 2]) -> i32;
     }
 
     /// This thread's CPU time so far (user and kernel), in seconds.
     pub fn thread_cpu() -> f64 {
-        let mut r = [0i64; 18];
-        // RUSAGE_THREAD
-        unsafe { getrusage(1, &mut r) };
-        (r[0] + r[2]) as f64 + (r[1] + r[3]) as f64 / 1e6
+        let mut t = [0i64; 2];
+        // CLOCK_THREAD_CPUTIME_ID
+        unsafe { clock_gettime(3, &mut t) };
+        t[0] as f64 + t[1] as f64 / 1e9
     }
 
     /// CPU time in user mode and in the kernel (ms), and page faults so far.
