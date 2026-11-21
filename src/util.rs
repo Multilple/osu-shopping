@@ -243,8 +243,6 @@ pub mod sys {
     pub const MAP_ANONYMOUS: i32 = 0x20;
     pub const MAP_NORESERVE: i32 = 0x4000;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
-    pub const MADV_SEQUENTIAL: i32 = 2;
-    pub const MADV_WILLNEED: i32 = 3;
     pub const MADV_HUGEPAGE: i32 = 14;
     extern "C" {
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
@@ -259,55 +257,6 @@ pub fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
 
 pub fn memfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
-}
-
-// ---------------------------------------------------------------- mmap
-
-pub struct Mmap {
-    ptr: *const u8,
-    len: usize,
-}
-
-unsafe impl Send for Mmap {}
-unsafe impl Sync for Mmap {}
-
-impl Mmap {
-    pub fn open(path: &std::path::Path) -> std::io::Result<Mmap> {
-        use std::os::unix::io::AsRawFd;
-        let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len() as usize;
-        if len == 0 {
-            return Ok(Mmap {
-                ptr: std::ptr::NonNull::dangling().as_ptr(),
-                len: 0,
-            });
-        }
-        let ptr = unsafe {
-            sys::mmap(
-                std::ptr::null_mut(),
-                len,
-                sys::PROT_READ,
-                sys::MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == sys::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-        unsafe {
-            sys::madvise(ptr, len, sys::MADV_SEQUENTIAL | sys::MADV_WILLNEED);
-        }
-        Ok(Mmap {
-            ptr: ptr as *const u8,
-            len,
-        })
-    }
-
-    #[inline(always)]
-    pub fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
 }
 
 // ---------------------------------------------------------------- CSV
