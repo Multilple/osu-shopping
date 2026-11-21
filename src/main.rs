@@ -191,6 +191,92 @@ fn main() {
     // SS_DIAG=log: describe the machine on stderr, time the whole job a few
     // times (with the stage times shown), and write no output, so that the
     // check of the public set fails and shows the log.
+    // SS_DIAG=log2: memory microbenchmarks and the whole job at full size
+    // under several settings; one short page at the end, then an error exit.
+    if std::env::var("SS_DIAG").as_deref() == Ok("log2") {
+        std::env::remove_var("SS_DIAG");
+        let mut lines: Vec<String> = vec![diag::machine_line()];
+        lines.push(diag::scatter_bench(threads, &|t, f| par(t, f)));
+        lines.push(diag::release_bench(threads, &|t, f| par(t, f)));
+        let scratch_root = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into()));
+        let scratch = scratch_root.join("diag-out");
+        let gen = std::path::Path::new("/gen");
+        if gen.exists() {
+            let big = scratch_root.join("d20");
+            let t = Instant::now();
+            let status = std::process::Command::new(gen)
+                .args(["--seed", "4242", "--events", "20000000", "--clicks", "5000000", "--threads", &threads.to_string(), "--output"])
+                .arg(&big)
+                .status();
+            eprintln!("==== generated in {:.1} s: {status:?}", t.elapsed().as_secs_f64());
+            let gen_s = t.elapsed().as_secs_f64();
+            let variants: Vec<(&str, usize, Vec<(&str, &str)>)> = vec![
+                ("u", threads, vec![]),
+                ("a0", threads, vec![("SS_AHEAD", "0")]),
+                ("a1k", threads, vec![("SS_AHEAD", "1024")]),
+                ("a16k", threads, vec![("SS_AHEAD", "16384")]),
+                ("pop", threads, vec![("SS_POP", "1")]),
+                ("pop4m", threads, vec![("SS_POP", "1"), ("SS_PIECE", "4194304")]),
+                ("pc4m", threads, vec![("SS_PIECE", "4194304")]),
+                ("pc64k", threads, vec![("SS_PIECE", "65536")]),
+                ("nh", threads, vec![("SS_NOHUGE", "1")]),
+                ("t4", threads / 2, vec![]),
+                ("t5", threads * 5 / 8, vec![]),
+                ("t6", threads * 3 / 4, vec![]),
+                ("t7", threads * 7 / 8, vec![]),
+                ("t12", threads * 3 / 2, vec![]),
+                ("t16", threads * 2, vec![]),
+            ];
+            let mut best: Vec<(f64, f64, f64)> = vec![(f64::MAX, 0.0, 0.0); variants.len()];
+            'rounds: for round in 0..3 {
+                for k in 0..variants.len() {
+                    let i = if round % 2 == 0 { k } else { variants.len() - 1 - k };
+                    if t0.elapsed().as_secs_f64() > 140.0 {
+                        break 'rounds;
+                    }
+                    let (_, th, envs) = &variants[i];
+                    for (k, v) in envs {
+                        std::env::set_var(k, v);
+                    }
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    let t = Instant::now();
+                    let (u0, s0, _) = util::sys::usage();
+                    let mut scale = 1;
+                    while !run(&big, &scratch, (*th).max(1), scale, t) {
+                        scale *= 4;
+                    }
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    let (u1, s1, _) = util::sys::usage();
+                    for (k, _) in envs {
+                        std::env::remove_var(k);
+                    }
+                    if ms < best[i].0 {
+                        best[i] = (ms, u1 - u0, s1 - s0);
+                    }
+                }
+            }
+            let mut line = format!("G gen{gen_s:.0}s");
+            for (v, b) in variants.iter().zip(&best) {
+                if b.0 < f64::MAX {
+                    line += &format!(" {}:{:.0}/{:.0}/{:.0}", v.0, b.0, b.1, b.2);
+                }
+            }
+            lines.push(line);
+            let _ = std::fs::remove_dir_all(&big);
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        lines.push(format!("t{:.0}s", t0.elapsed().as_secs_f64()));
+        let mut page = String::from("\n<<<");
+        for l in &lines {
+            page += l;
+            page.push('\n');
+        }
+        page.truncate(1900);
+        for _ in 0..12 {
+            eprint!("{page}");
+        }
+        std::process::exit(3);
+    }
     if std::env::var("SS_DIAG").as_deref() == Ok("log") {
         let resident = diag::resident(&data_dir);
         eprintln!("==== input pages in memory at the start: {resident}");
@@ -544,6 +630,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         }
     }
     let ahead = env_usize("SS_AHEAD", 4096);
+    let populate = env_usize("SS_POP", 0) != 0;
     let mut tasks = Vec::new();
     let piece = env_usize("SS_PIECE", if mapped { 256 << 10 } else { chunk });
     grid_tasks(&event_files, true, piece, &mut tasks);
@@ -556,6 +643,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             let Some(task) = tasks.get(i) else { break };
             let src = if task.events { &event_files[task.file] } else { &click_files[task.file] };
             if src.mapped() {
+                if populate {
+                    src.populate(task.a, task.b);
+                }
                 let (buf, start, end) = src.view(task.a, task.b);
                 out.ahead = ahead;
                 if task.events {

@@ -736,3 +736,164 @@ pub fn page(resident: &str, secs: f64) -> String {
     out.truncate(1900);
     out
 }
+
+/// The processor and memory settings in one line.
+pub fn machine_line() -> String {
+    let cpuinfo = read("/proc/cpuinfo");
+    let first: Vec<&str> = cpuinfo.lines().take_while(|l| !l.trim().is_empty()).collect();
+    let field = |k: &str| first.iter().find(|l| l.starts_with(k)).and_then(|l| l.split(':').nth(1)).map(|v| v.trim().to_string()).unwrap_or_default();
+    let model = first.iter().find(|l| l.starts_with("model") && !l.starts_with("model name")).and_then(|l| l.split(':').nth(1)).map(|v| v.trim().to_string()).unwrap_or_default();
+    let flags = field("flags");
+    let has: Vec<&str> = flags.split_whitespace().collect();
+    let want = ["avx512f", "avx512bw", "avx512vl", "avx512vbmi", "avx512_vbmi2", "gfni", "fsrm", "erms", "hypervisor"];
+    let yes: Vec<String> = want.iter().filter(|w| has.contains(w)).map(|w| w.replace("avx512_", "5").replace("avx512", "5")).collect();
+    let status = read("/proc/self/status");
+    let allowed = status.lines().find(|l| l.starts_with("Cpus_allowed_list:")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()).unwrap_or_default();
+    let c0: String = allowed.split(|c| c == ',' || c == '-').next().unwrap_or("0").to_string();
+    let cache = |i: usize, f: &str| read(&format!("/sys/devices/system/cpu/cpu{c0}/cache/index{i}/{f}")).trim().to_string();
+    let sel = |f: &str| {
+        let t = read(&format!("/sys/kernel/mm/transparent_hugepage/{f}"));
+        t.split('[').nth(1).and_then(|x| x.split(']').next()).unwrap_or("?").to_string()
+    };
+    format!(
+        "C {} m{}s{} +{} A {} sib {} L2 {} L3 {} thp {}/{} os {}",
+        field("model name").replace("Intel(R) Xeon(R) ", "").replace("CPU ", ""),
+        model,
+        field("stepping"),
+        yes.join(","),
+        allowed,
+        read(&format!("/sys/devices/system/cpu/cpu{c0}/topology/thread_siblings_list")).trim(),
+        cache(2, "size"),
+        cache(3, "size"),
+        sel("enabled"),
+        sel("defrag"),
+        read("/proc/sys/kernel/osrelease").trim()
+    )
+}
+
+/// Appending 16-byte records to many lists in random order, every thread at
+/// once, while reading through a text-sized input: nanoseconds per record
+/// with records staged a cache line at a time and moved out with
+/// non-temporal stores (nt), written in place (pl), and written in place
+/// with the line after next asked for (pw). Lists are made of 16 KB chunks
+/// handed out one after the other from fresh memory, as in the real thing.
+pub fn scatter_bench(threads: usize, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> String {
+    use core::arch::x86_64::*;
+    const N: usize = 3_000_000;
+    const CHUNK: usize = 16 << 10;
+    let mut out = String::from("X");
+    for &lists in &[300usize, 600, 1200, 1800] {
+        let mut res = Vec::new();
+        for mode in 0..3 {
+            let t = Instant::now();
+            par(threads, &|tid| unsafe {
+                let bytes = N * 16 + lists * CHUNK + (2 << 20);
+                let region = map_anon(bytes);
+                let mut next = ((region as usize + CHUNK - 1) & !(CHUNK - 1)) as *mut u64;
+                let input = map_anon(64 << 20);
+                // (The input is touched beforehand, as a mapped file's pages would be.)
+                let mut o = 0;
+                while o < 64 << 20 {
+                    std::ptr::write_volatile(input.add(o), o as u8);
+                    o += 4096;
+                }
+                let mut dst: Vec<*mut u64> = vec![std::ptr::null_mut(); lists];
+                let mut lines = vec![[0u64; 8]; lists];
+                let mut fill = vec![0u32; lists];
+                let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ ((tid as u64 + 1) << 20);
+                let mut sum = _mm256_setzero_si256();
+                let mut at = 0usize;
+                for i in 0..N {
+                    // A line of input: 96 bytes looked at, 75 bytes on.
+                    let p = input.add(at);
+                    sum = _mm256_add_epi8(sum, _mm256_loadu_si256(p as *const __m256i));
+                    sum = _mm256_add_epi8(sum, _mm256_loadu_si256(p.add(32) as *const __m256i));
+                    sum = _mm256_add_epi8(sum, _mm256_loadu_si256(p.add(64) as *const __m256i));
+                    _mm_prefetch(p.add(4096) as *const i8, _MM_HINT_T0);
+                    at += 75;
+                    if at > (64 << 20) - 8192 {
+                        at = 0;
+                    }
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let l = ((x >> 32) * lists as u64 >> 32) as usize;
+                    let (a, b) = (x, i as u64);
+                    if mode == 0 {
+                        let n = *fill.get_unchecked(l) as usize;
+                        *fill.get_unchecked_mut(l) = (n + 1) as u32;
+                        let line = lines.as_mut_ptr().add(l) as *mut u64;
+                        if n & 3 == 3 {
+                            let mut d = *dst.get_unchecked(l) as *mut __m256i;
+                            if (d as usize) & (CHUNK - 1) == 0 {
+                                d = next as *mut __m256i;
+                                next = next.add(CHUNK / 8);
+                            }
+                            let lo = _mm256_loadu_si256(line as *const __m256i);
+                            let third = _mm_loadu_si128(line.add(4) as *const __m128i);
+                            let hi = _mm256_inserti128_si256(_mm256_castsi128_si256(third), _mm_set_epi64x(b as i64, a as i64), 1);
+                            _mm256_stream_si256(d, lo);
+                            _mm256_stream_si256(d.add(1), hi);
+                            *dst.get_unchecked_mut(l) = d.add(2) as *mut u64;
+                        } else {
+                            *line.add(2 * (n & 3)) = a;
+                            *line.add(2 * (n & 3) + 1) = b;
+                        }
+                    } else {
+                        let mut d = *dst.get_unchecked(l);
+                        if (d as usize) & (CHUNK - 1) == 0 {
+                            d = next;
+                            next = next.add(CHUNK / 8);
+                        }
+                        *d = a;
+                        *d.add(1) = b;
+                        *dst.get_unchecked_mut(l) = d.add(2);
+                        if mode == 2 {
+                            _mm_prefetch(d.add(16) as *const i8, _MM_HINT_ET0);
+                        }
+                    }
+                }
+                _mm_sfence();
+                std::hint::black_box(sum);
+                release(region, bytes);
+                release(input, 64 << 20);
+            });
+            res.push(format!("{:.1}", t.elapsed().as_secs_f64() * 1e9 / N as f64));
+        }
+        out += &format!(" {lists}:{}", res.join("/"));
+    }
+    eprintln!("-- scatter (nt/plain/plain+prefetch, ns per record incl. first touch): {out}");
+    out
+}
+
+/// Giving touched memory back: seconds (wall) per GB with every thread
+/// releasing 256 MB at once, for small pages and for huge ones.
+pub fn release_bench(threads: usize, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const BYTES: usize = 256 << 20;
+    let mut out = String::from("Rel");
+    for huge in [false, true] {
+        let bufs: Vec<AtomicUsize> = (0..threads).map(|_| AtomicUsize::new(0)).collect();
+        par(threads, &|tid| unsafe {
+            let p = sys::mmap(std::ptr::null_mut(), BYTES + (2 << 20), sys::PROT_READ | sys::PROT_WRITE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS, -1, 0) as *mut u8;
+            let a = ((p as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;
+            if huge {
+                sys::madvise(a as *mut std::ffi::c_void, BYTES, sys::MADV_HUGEPAGE);
+            }
+            let mut o = 0;
+            while o < BYTES {
+                std::ptr::write_volatile(a.add(o), 1);
+                o += 4096;
+            }
+            bufs[tid].store(a as usize, Ordering::Relaxed);
+        });
+        let (_, s0, _) = sys::usage();
+        let t = Instant::now();
+        par(threads, &|tid| release(bufs[tid].load(Ordering::Relaxed) as *mut u8, BYTES));
+        let (_, s1, _) = sys::usage();
+        let gb = (threads * BYTES) as f64 / (1u64 << 30) as f64;
+        out += &format!(" {}:{:.3}/{:.3}", if huge { 'h' } else { 's' }, t.elapsed().as_secs_f64() / gb * threads as f64, (s1 - s0) / 1e3 / gb);
+    }
+    eprintln!("-- release (wall thread-seconds per GB / sys seconds per GB): {out}");
+    out
+}

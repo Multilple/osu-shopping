@@ -44,6 +44,17 @@ impl Src {
         }
     }
 
+    /// Ask the system to map the pages holding file offsets `a..b` now, in
+    /// one call, rather than fault by fault as the parser reaches them.
+    pub fn populate(&self, a: usize, b: usize) {
+        const MADV_POPULATE_READ: i32 = 22;
+        if self.map != 0 {
+            let lo = (self.map + a) & !4095;
+            let hi = (self.map + b.min(self.len) + 4095) & !4095;
+            unsafe { sys::madvise(lo as *mut std::ffi::c_void, hi - lo, MADV_POPULATE_READ) };
+        }
+    }
+
     pub fn mapped(&self) -> bool {
         self.map != 0
     }
