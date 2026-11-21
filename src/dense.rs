@@ -541,6 +541,10 @@ struct BOut {
     sstart: Vec<u32>,
     scount: Vec<u32>,
     spurch: Vec<u64>,
+    /// Scratch for one person: each session's user_daily row, and each
+    /// day's (the last row written for it).
+    srow: Vec<u32>,
+    dayrow: Vec<u32>,
     /// Seconds spent: sorting clicks by person, on persons whose events
     /// came as one run, on the others (CPU time, kept only when `timed`);
     /// then counts of events of each kind.
@@ -1237,21 +1241,74 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
         tl.sess.clear();
         tl.sess.reserve(ns);
         let sess = tl.sess.as_mut_ptr();
+        me.srow.clear();
+        me.srow.reserve(ns);
+        if me.dayrow.len() < tl.nd {
+            me.dayrow.resize(tl.nd, 0);
+        }
+        let (srow, dayrow) = (me.srow.as_mut_ptr(), me.dayrow.as_mut_ptr());
+
+        // Sessions, and one row per day with a session: every session
+        // writes its day's row as it stands so far at the row's number, and
+        // the number moves on when the day changes (no branch on it).
+        reserve_rows(&mut tl.rows, tl.nd);
+        let rows = &mut tl.rows;
+        let r0 = rows.n;
+        let len = (who >> 120) as usize;
+        let ulen = 4 + len;
+        let u0 = rows.user.as_mut_ptr().add(rows.user.len());
+        let dayp = rows.day.as_mut_ptr().add(r0 * 4) as *mut i32;
+        let sesp = rows.sessions.as_mut_ptr().add(r0 * 4) as *mut u32;
+        let evp = rows.events.as_mut_ptr().add(r0 * 4) as *mut u32;
+        let revp = rows.rev.as_mut_ptr().add(r0 * 8) as *mut u64;
+        let catp = rows.cat.as_mut_ptr().add(r0);
+        let day0 = tl.day0;
+        let mut rc = usize::MAX;
+        let mut prevday = u32::MAX;
+        let (mut ds, mut de) = (0u32, 0u32);
         for k in 0..ns {
             let st = *start.add(k);
-            sess.add(k).write(Sess { start: st, day: st / DAY_MS - 7, purch: false, rev: 0, events: *count.add(k) });
+            let events = *count.add(k);
+            let day = st / DAY_MS - 7;
+            sess.add(k).write(Sess { start: st, day, purch: false, rev: 0, events });
+            let newd = day != prevday;
+            prevday = day;
+            rc = rc.wrapping_add(newd as usize);
+            ds = if newd { 1 } else { ds + 1 };
+            de = if newd { events } else { de + events };
+            let up = u0.add(rc * ulen);
+            (up as *mut u32).write_unaligned(len as u32);
+            (up.add(4) as *mut u128).write_unaligned(who);
+            dayp.add(rc).write_unaligned(day0 + day as i32);
+            sesp.add(rc).write_unaligned(ds);
+            evp.add(rc).write_unaligned(de);
+            revp.add(rc).write_unaligned(0);
+            catp.add(rc).write(NOCAT);
+            *srow.add(k) = rc as u32;
+            *dayrow.add(day as usize) = rc as u32;
         }
         tl.sess.set_len(ns);
+        let nrows = rc + 1;
+        rows.n = r0 + nrows;
+        rows.user.set_len(rows.user.len() + nrows * ulen);
+        rows.day.set_len((r0 + nrows) * 4);
+        rows.sessions.set_len((r0 + nrows) * 4);
+        rows.events.set_len((r0 + nrows) * 4);
+        rows.rev.set_len((r0 + nrows) * 8);
+        rows.cat.set_len(r0 + nrows);
 
-        // Purchases: revenue per session, and the best category per day (as in `person_grid`).
+        // Purchases: revenue per session and row, and the best category per day (as in `person_grid`).
         if !me.spurch.is_empty() {
             let ncat = tl.ncat;
             for &pp in &me.spurch {
-                let s = &mut *sess.add((pp >> 40) as usize);
+                let si = (pp >> 40) as usize;
+                let s = &mut *sess.add(si);
                 let cat = ((pp >> 24) & 0x1FF) as usize;
                 let price = pp & 0xFF_FFFF;
                 s.rev += price;
                 s.purch = true;
+                let r = revp.add(*srow.add(si) as usize);
+                r.write_unaligned(r.read_unaligned() + price);
                 let k = s.day as usize * ncat + cat;
                 if tl.daycat[k] == 0 {
                     tl.touched_dc.push(k as u32);
@@ -1268,25 +1325,16 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
                     tl.best_sum[d] = sum;
                 }
             }
-            tl.touched_dc.clear();
-        }
-
-        // One row per day with a session.
-        reserve_rows(&mut tl.rows, tl.nd);
-        let mut i = 0;
-        while i < ns {
-            let day = (*sess.add(i)).day;
-            let (mut d_sessions, mut d_events, mut d_rev) = (0u32, 0u32, 0u64);
-            while i < ns && (*sess.add(i)).day == day {
-                d_sessions += 1;
-                d_events += (*sess.add(i)).events;
-                d_rev += (*sess.add(i)).rev;
-                i += 1;
+            // (A day may be here more than once: the first time leaves its
+            // best in the row, later ones find NOCAT, which is larger.)
+            for &k in &tl.touched_dc {
+                let d = k as usize / ncat;
+                let c = catp.add(*dayrow.add(d) as usize);
+                *c = (*c).min(tl.best[d]);
+                tl.best[d] = NOCAT;
+                tl.best_sum[d] = 0;
             }
-            let best = tl.best[day as usize];
-            tl.best[day as usize] = NOCAT;
-            tl.best_sum[day as usize] = 0;
-            push_row(who, day, d_sessions, d_events, d_rev, best, tl);
+            tl.touched_dc.clear();
         }
     }
     true
@@ -2197,6 +2245,8 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             sstart: Vec::new(),
             scount: Vec::new(),
             spurch: Vec::new(),
+            srow: Vec::new(),
+            dayrow: Vec::new(),
             prof: [0.0; 8],
             timed: log,
         });
