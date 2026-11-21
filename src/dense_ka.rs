@@ -488,8 +488,7 @@ macro_rules! define_events {
             "cmp r10d, 14",
             "cmove r11, r13",           // date and time: of ts, or of ingest again when ts is digits (less 1)
             "vmovq xmm3, qword ptr [r11 + 12]",
-            "vpbroadcastq xmm6, qword ptr [r13 + 12]",
-            "vpblendd xmm3, xmm3, xmm6, 0x0C",
+            "vpinsrq xmm3, xmm3, qword ptr [r13 + 12], 1",
             "vpblendd ymm1, ymm1, ymm3, 0x0F",                       // two times of day | 13 digits
             "vpxor ymm1, ymm1, ymmword ptr [rdi + {c_tpat}]",
             "vpsubusb ymm3, ymm1, ymmword ptr [rdi + {c_tmax}]",
