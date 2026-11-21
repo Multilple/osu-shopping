@@ -281,8 +281,9 @@ impl KC {
         let (cmask, cbase, cpm) = dn.ckx.camp_rows()?;
         let cws = ctx.cws;
         let span = (ctx.we - cws).max(0);
-        // Times are compared modulo 2^32 (and may be up to three days off the window).
-        if span + 3 * DAY >= 1 << 31 || dn.nq + 1 > STAGE_MAX {
+        // Times are compared modulo 2^32 (and may be up to three days off the window:
+        // the window with them must be shorter, about 45 days).
+        if span + 3 * DAY >= 1 << 32 || dn.nq + 1 > STAGE_MAX {
             return None;
         }
         // (Zeros from fresh pages: a valid KC, plain numbers and null

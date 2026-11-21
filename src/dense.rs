@@ -1879,7 +1879,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     dn.ckx = crate::dense_ck::Cx::new(&ctx, &dn);
     dn.cka = crate::dense_cka::KC::new(&ctx, &dn);
     if log {
-        eprintln!("    click kernel tables: {}", if dn.cka.is_some() { "assembly and Rust" } else { "Rust only" });
+        eprintln!("    click kernel tables: {} (click window {:.1} days)", if dn.cka.is_some() { "assembly and Rust" } else { "Rust only" }, (ctx.we - ctx.cws) as f64 / 86_400_000.0);
     }
     lap("links");
     if dn.overflow.load(Relaxed) {
