@@ -60,7 +60,7 @@ fn main() {
     let gen = std::env::var("PROBE_GEN").unwrap_or_else(|_| "/generate".into());
     let gen_threads = std::env::var("PROBE_GEN_THREADS").unwrap_or_else(|_| "8".into());
     // name of the variant whose own stage timings are printed (run once more, with XL_TIMING=1)
-    let lap_of = std::env::var("PROBE_LAPS").unwrap_or_else(|_| "n".into());
+    let lap_of = std::env::var("PROBE_LAPS").unwrap_or_else(|_| "n,n4,n6".into());
     let settle_min: u64 = std::env::var("PROBE_SETTLE_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(40_000_000);
     let reps: usize = std::env::var("PROBE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
     let budget: f64 = std::env::var("PROBE_BUDGET").ok().and_then(|s| s.parse().ok()).unwrap_or(155.0);
@@ -143,20 +143,40 @@ fn main() {
             }
         }
         let mut laps = String::new();
-        if let Some(v) = variants.iter().find(|v| v.name == lap_of) {
+        for name in lap_of.split(',') {
+            let Some(v) = variants.iter().find(|v| v.name == name) else { continue };
             let _ = fs::remove_dir_all(&out);
             let _ = fs::create_dir_all(&out);
             let mut c = Command::new(&v.bin);
             c.arg(&data).arg(&out).env("XL_TIMING", "1").stdout(Stdio::null()).stderr(Stdio::piped());
+            for (k, val) in &v.env {
+                c.env(k, val);
+            }
             let t = Instant::now();
             if let Ok(o) = c.output() {
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 let err = String::from_utf8_lossy(&o.stderr);
                 for l in err.lines() {
                     if let Some(i) = l.find("ms: ") {
-                        // drop the laps that are zero, to keep the line short
-                        let kept: Vec<&str> = l[i + 4..].split_whitespace().filter(|f| !f.ends_with("=0.0") && !f.ends_with("=0.1")).collect();
-                        laps = format!(" laps[{}] wall={:.0} {}", v.name, ms, kept.join(" "));
+                        // only the big laps, to keep the line short
+                        let kept: Vec<String> = l[i + 4..]
+                            .split_whitespace()
+                            .filter_map(|f| {
+                                let (k, v) = f.split_once('=')?;
+                                let short = match k {
+                                    "parse" => "p",
+                                    "st2sort" => "s2",
+                                    "ev3a" => "e",
+                                    "ev3b" => "e2",
+                                    "write" => "w",
+                                    "total" => "T",
+                                    _ => return None,
+                                };
+                                let x: f64 = v.parse().ok()?;
+                                Some(format!("{short}={x:.0}"))
+                            })
+                            .collect();
+                        laps.push_str(&format!(" L[{}]W{:.0} {}", v.name, ms, kept.join(" ")));
                     }
                 }
             }
