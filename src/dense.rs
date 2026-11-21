@@ -1211,10 +1211,17 @@ fn settle_ties(keys: &mut [u64], cids: &[u32], dn: &Dn) -> usize {
 fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
     let (nd, organic) = (me.tl.nd, me.tl.organic);
     let ns = me.tl.sess.len();
-    let sess = me.tl.sess.as_ptr();
+    // Two spare sessions after the last, on day 0, so that the assist loop
+    // may look two sessions past a range it then adds nothing for.
+    me.tl.sess.reserve(2);
+    let sess = me.tl.sess.as_mut_ptr();
     let (credit, assist) = (me.credit.as_mut_ptr(), me.assist.as_mut_ptr());
     let n0 = keys.len();
     unsafe {
+        let spare = Sess { start: 0, day: 0, purch: false, rev: 0, events: 0 };
+        sess.add(ns).write(spare);
+        sess.add(ns + 1).write(spare);
+        let sess = sess as *const Sess;
         if n0 == 0 {
             for i in 0..ns {
                 let s = &*sess.add(i);
@@ -1321,13 +1328,21 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
         let mut have_days = false;
         for j in 0..live {
             let c = ((*kp.add(j) >> ob) & cmask) as usize;
-            let (a, b) = (*ca.add(j) as usize, *cb.add(j) as usize);
+            let (a, b) = (*ca.add(j), *cb.add(j) as usize);
             let e = &mut *cov.add(c);
-            let from = if e[0] == serial { (e[1] as usize).max(a) } else { a };
+            // (Clicks are in time order, so the campaign's earlier reach is at most `b`.)
+            let seen = 0u32.wrapping_sub((e[0] == serial) as u32);
+            let from = a.max(e[1] & seen) as usize;
             *e = [serial, b as u32];
-            if b <= from {
+            let n = b - from;
+            // The first two sessions without a branch (see the two spare sessions above).
+            let row = assist.add(c * nd);
+            *row.add((*sess.add(from)).day as usize) += (n > 0) as u32;
+            *row.add((*sess.add(from + 1)).day as usize) += (n > 1) as u32;
+            if n <= 2 {
                 continue;
             }
+            let from = from + 2;
             if b - from <= 12 {
                 for k in from..b {
                     *assist.add(c * nd + (*sess.add(k)).day as usize) += 1;
