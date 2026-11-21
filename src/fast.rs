@@ -158,6 +158,85 @@ pub unsafe fn cut<const NA: usize, const NB: usize, const N: usize>(base: *const
     Cut { p, q, shape: shape_a & shape_b, quotes: nq_a + nq_b == 2 * (qa.count_ones() + qb.count_ones()) }
 }
 
+/// One window's worth of a line: separators `p[0]..p[N - 1]` and, for the
+/// field after each but the last, whether it is wrapped in quotes.
+pub struct Part<const N: usize> {
+    pub p: [usize; N],
+    pub q: [usize; N],
+    /// The window holds the separators it should.
+    pub shape: bool,
+    /// Every quote in this part of the line wraps a whole field.
+    pub quotes: bool,
+}
+
+impl<const N: usize> Part<N> {
+    /// Where the value of the field after separator `j` starts, and its length.
+    #[inline(always)]
+    pub fn field(&self, j: usize) -> (usize, usize) {
+        let q = self.q[j];
+        (self.p[j] + 1 + q, self.p[j + 1] - self.p[j] - 1 - 2 * q)
+    }
+}
+
+/// The first `NA` fields of the line starting at `base[s]`, as `cut` finds
+/// them in its first window: `p[0]` is the newline before the line and
+/// `p[NA]` comma `NA`. `N` is `NA + 1`.
+#[inline(always)]
+pub unsafe fn cut_a<const NA: usize, const N: usize>(base: *const u8, s: usize) -> Part<N> {
+    debug_assert!(N == NA + 1);
+    let mut p = [0usize; N];
+    let mut q = [0usize; N];
+    let mut r = [0u32; N];
+    let a0 = s - 1;
+    let (nl, cm, qt) = masks(base.add(a0));
+    let mut m = cm;
+    for i in 1..=NA {
+        r[i] = m.trailing_zeros();
+        m &= m.wrapping_sub(1);
+    }
+    let last = r[NA];
+    let shape = last < (nl & !1).trailing_zeros();
+    let qa = quoted(1 | (cm ^ m), qt) & ((1 << NA) - 1);
+    for j in 0..=NA {
+        p[j] = a0 + r[j] as usize;
+    }
+    for j in 0..NA {
+        q[j] = ((qa >> j) & 1) as usize;
+    }
+    let nq = _bzhi_u64(qt, last).count_ones();
+    Part { p, q, shape, quotes: nq == 2 * qa.count_ones() }
+}
+
+/// The rest of the line, `NB + 1` fields, from comma `NA` at `base[b0]`, as
+/// `cut` finds it in its second window: `p[0]` is that comma and
+/// `p[NB + 1]` the newline that ends the line. `N` is `NB + 2`.
+#[inline(always)]
+pub unsafe fn cut_b<const NB: usize, const N: usize>(base: *const u8, b0: usize) -> Part<N> {
+    debug_assert!(N == NB + 2);
+    let mut p = [0usize; N];
+    let mut q = [0usize; N];
+    let mut t = [0u32; N];
+    let (nl, cm, qt) = masks(base.add(b0));
+    let end = nl.trailing_zeros();
+    let inside = _bzhi_u64(cm, end) & !1;
+    let mut m = inside;
+    for i in 1..=NB {
+        t[i] = m.trailing_zeros();
+        m &= m.wrapping_sub(1);
+    }
+    t[NB + 1] = end;
+    let shape = (end < 64) & (t[NB] < 64) & (m == 0);
+    let qb = quoted(1 | inside | 1u64.wrapping_shl(end), qt) & ((2 << NB) - 1);
+    for j in 0..=NB + 1 {
+        p[j] = b0 + t[j] as usize;
+    }
+    for j in 0..=NB {
+        q[j] = ((qb >> j) & 1) as usize;
+    }
+    let nq = _bzhi_u64(qt, end).count_ones();
+    Part { p, q, shape, quotes: nq == 2 * qb.count_ones() }
+}
+
 /// Which fields are wrapped in quotes, given the separators and the quotes
 /// of a window as bit masks: bit `j` of the result is for the field after
 /// the `j`th separator. Such a field has a quote right after that separator

@@ -227,12 +227,6 @@ pub mod sys {
     }
 }
 
-/// Whether this is an Intel processor.
-pub fn intel() -> bool {
-    let r = core::arch::x86_64::__cpuid(0);
-    (r.ebx, r.edx, r.ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e)
-}
-
 #[inline(always)]
 pub fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
     hay.iter().position(|&c| c == needle)

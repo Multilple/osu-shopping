@@ -117,6 +117,8 @@ struct ThreadOut {
     slim: SlimStreams,
     dates: fast::Dates,
     reader: input::Reader,
+    simple: bool,
+    two_part: bool,
     /// How far ahead of the line being parsed to ask for input bytes
     /// (0: the input is in a buffer that is in cache already).
     ahead: usize,
@@ -193,6 +195,81 @@ fn main() {
     unsafe { sys::mallopt(sys::M_MMAP_THRESHOLD, 1 << 18) };
     #[cfg(feature = "sprof")]
     sprof::start();
+    // SS_AB="NAME=value,...[;NAME=value,...]": do the whole job as usual (A)
+    // and with each of up to three other groups of settings (B, C, D; NCPU
+    // among them sets that variant's threads), several rounds of all, and let
+    // the total run time tell how each one's faster run compares with A's:
+    //   one group:    ends at 8 s + 10 s x (B/A - 1)
+    //   two groups:   ends at 7 s + 0.25 s x (bin(B/A) + 7 bin(C/A)), bins
+    //                 split at 0.92, 0.96, 0.985, 1.015, 1.04 and 1.08
+    //   three groups: ends at 8 s + 0.4 s x (bin(B/A) + 3 bin(C/A) + 9 bin(D/A)),
+    //                 bins split at 0.985 and 1.015
+    if let Ok(spec) = std::env::var("SS_AB") {
+        let groups: Vec<Vec<(String, String)>> = spec
+            .split(';')
+            .take(3)
+            .map(|g| g.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect())
+            .collect();
+        let n = groups.len() + 1;
+        let mut best = vec![f64::MAX; n];
+        // Four rounds of two, three rounds of more; every other round runs
+        // them in reverse order, so none always follows the same one.
+        for round in 0..(if n == 2 { 4 } else { 3 }) {
+            for i in 0..n {
+                let v = if round % 2 == 0 { i } else { n - 1 - i };
+                // Only this variant's settings are in force.
+                for g in &groups {
+                    for (k, _) in g {
+                        std::env::remove_var(k);
+                    }
+                }
+                let mut th = threads;
+                if v > 0 {
+                    for (k, val) in &groups[v - 1] {
+                        std::env::set_var(k, val);
+                        if k == "NCPU" {
+                            th = val.parse::<usize>().unwrap_or(threads).clamp(1, MAX_THREADS);
+                        }
+                    }
+                }
+                // Each run must leave only its own files behind.
+                for table in ["user_daily", "campaign_daily"] {
+                    if let Ok(rd) = std::fs::read_dir(out_dir.join(table)) {
+                        for e in rd.flatten() {
+                            let _ = std::fs::remove_file(e.path());
+                        }
+                    }
+                }
+                let t = Instant::now();
+                let mut scale = 1;
+                while !run(&data_dir, &out_dir, th, scale, t) {
+                    scale *= 4;
+                }
+                best[v] = best[v].min(t.elapsed().as_secs_f64());
+            }
+        }
+        let ratio: Vec<f64> = best[1..].iter().map(|b| b / best[0]).collect();
+        let bin = |r: f64, edges: &[f64]| edges.iter().filter(|&&e| r >= e).count() as f64;
+        let until = match ratio.len() {
+            1 => 8.0 + 10.0 * (ratio[0] - 1.0).clamp(-0.45, 1.1),
+            2 => {
+                let e = [0.92, 0.96, 0.985, 1.015, 1.04, 1.08];
+                7.0 + 0.25 * (bin(ratio[0], &e) + 7.0 * bin(ratio[1], &e))
+            }
+            _ => {
+                let e = [0.985, 1.015];
+                8.0 + 0.4 * (bin(ratio[0], &e) + 3.0 * bin(ratio[1], &e) + 9.0 * bin(ratio[2], &e))
+            }
+        };
+        if std::env::var_os("SS_TIMING").is_some() {
+            eprintln!("    ab: A {:.3} s, others/A {:?}, ends at {:.2} s", best[0], ratio, until);
+        }
+        let now = t0.elapsed().as_secs_f64();
+        if until > now {
+            std::thread::sleep(std::time::Duration::from_secs_f64(until - now));
+        }
+        std::process::exit(0);
+    }
     let mut scale = 1;
     while !run(&data_dir, &out_dir, threads, scale, t0) {
         scale *= 4;
@@ -246,7 +323,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             eprintln!("{:>8.1} ms  {:<28} user {:>7.1} sys {:>6.1} faults {}{}", now * 1e3, what, user, sys, faults, mem_note());
         }
         if !what.starts_with(' ') {
-            if pad.as_deref() == Some(what) {
+            if pad.as_deref().is_some_and(|p| what.starts_with(p)) {
                 padded.set(now - last.get());
             }
             last.set(now);
@@ -272,6 +349,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
                 dates: fast::Dates::new(),
                 reader: input::Reader::new(chunk),
                 ahead: 0,
+                simple: env_usize("SS_SIMPLE", 1) != 0,
+                two_part: env_usize("SS_EV2", 1) != 0,
                 pend_e: vec![PendE::default(); 2 * HALF].into_boxed_slice(),
                 cur: 0,
                 npe: 0,
@@ -384,19 +463,18 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         eprintln!("    ids {} in {} slots, nq {}, pbits {}", ctx.ids.len(), ctx.ids.nregions * RSIZE, ctx.nq, ctx.pbits);
     }
     lap("parse");
+    let diag = std::env::var("SS_DIAG").ok();
+    let huge_mb = if diag.as_deref() == Some("3") { diag::huge_mb() } else { 0 };
     // From here on the per-thread outputs are shared read-only (dedup marks
     // dead events through raw pointers, one owner per event).
     let outs_ref: Vec<&ThreadOut> = (0..threads).map(|t| &*out_mut(&outs, t)).collect();
 
     // ------------------------------------------------------------ dedup
-    // Two tables do this. Comparing a cache line of small entries at once
-    // has no hard-to-predict branch, which pays on Intel processors; on AMD
-    // ones the plain table measured faster. SS_DEDUP=rows|wide overrides.
-    let rows = match std::env::var("SS_DEDUP").ok().as_deref() {
-        Some("rows") => true,
-        Some("wide") => false,
-        _ => util::intel(),
-    };
+    // Two tables do this. The plain one takes fewer instructions; the one
+    // that compares a cache line of small entries at once has no
+    // hard-to-predict branch, which only pays on the widest processors
+    // (SS_DEDUP=rows selects it).
+    let rows = std::env::var("SS_DEDUP").as_deref() == Ok("rows");
     let next = AtomicUsize::new(0);
     par(threads, |_| {
         let mut table: Vec<Row> = Vec::new();
@@ -490,6 +568,29 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     lap("campaign_daily");
     if pad.is_some() {
         wait_until = 2.0 + 10.0 * padded.get();
+        // SS_PART=1: the stage's share of the whole instead: the run ends at
+        // 4 s + 10 s x (stage time / work time).
+        if std::env::var_os("SS_PART").is_some() {
+            wait_until = 4.0 + 10.0 * padded.get() / t0.elapsed().as_secs_f64();
+        }
+        if log {
+            eprintln!("    pad: stage {:.3} s of {:.3} s, ends at {:.2} s", padded.get(), t0.elapsed().as_secs_f64(), wait_until);
+        }
+    }
+    // SS_DIAG=3: the total run time tells how long the work itself took
+    // (t), whether memory really is on huge pages, and how much memory all
+    // threads together can move: the run ends at 1 s + 5 t + 2 s x code,
+    // code = 4 if at least 64 MB was on huge pages after parsing, plus 0..3
+    // for under 12, 12 to 20, 20 to 32, or more GB per second.
+    if diag.as_deref() == Some("3") {
+        let t = t0.elapsed().as_secs_f64();
+        let gbps = diag::bandwidth(threads, &|f| par(threads, f));
+        let class = (gbps >= 12.0) as u32 + (gbps >= 20.0) as u32 + (gbps >= 32.0) as u32;
+        let code = 4 * (huge_mb >= 64) as u32 + class;
+        if log {
+            eprintln!("    diag: t {t:.3} s, {huge_mb} MB on huge pages, {gbps:.1} GB/s, code {code}");
+        }
+        wait_until = 1.0 + 5.0 * t + 2.0 * code as f64;
     }
     let now = t0.elapsed().as_secs_f64();
     if wait_until > now {
@@ -884,6 +985,31 @@ fn flush_half(ctx: &Ctx, out: &mut ThreadOut, tid: usize, h: usize, last: bool) 
         out.cnt[h] = 0;
         return;
     }
+    if out.simple {
+        // A lookup that misses its first line is finished at once (SS_SIMPLE=0:
+        // it is held back a round so its next line can be fetched meanwhile,
+        // which costs more instructions than the few waits it saves).
+        for i in 0..n {
+            let pe = unsafe { &mut *pend.add(i) };
+            pe.first = match ctx.ids.peek(pe.ulo, pe.uhi, pe.first) {
+                Some(slot) => ctx.ids.root(slot),
+                None => ctx.ids.root(ctx.ids.get_or_insert_at(pe.ulo, pe.uhi, pe.first)),
+            };
+        }
+        for i in 0..n {
+            let pe = unsafe { *pend.add(i) };
+            let person = pe.first;
+            let q = (person >> ctx.qshift) as usize;
+            let idx = out.ev.push16(q, pe.ev, person as u64 | (pe.x << 32), &mut out.arena);
+            assert!(idx < 1 << IDX_BITS, "bucket too large");
+            let p = (pe.h >> (64 - ctx.pbits)) as usize;
+            let x = (pe.x & (H2_MASK << H2_SHIFT)) | here | ((q as u64) << IDX_BITS) | idx as u64;
+            out.slim.push16(p, pe.h, x, &mut out.arena_slim);
+        }
+        out.held[h] = 0;
+        out.cnt[h] = 0;
+        return;
+    }
     let mut later = [0u8; HALF];
     let mut nl = 0;
     // The first `held` were left by the flush before; their lines are here now.
@@ -1115,11 +1241,119 @@ unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
     s
 }
 
+/// `events_fast` taking the line in two parts: everything the first window
+/// gives (event ID, user, time) is worked out and put away before the second
+/// window is looked at, so fewer values are alive at once. What it puts in
+/// the pending slot only counts once the whole line has proved sound.
+#[inline(never)]
+unsafe fn events_fast2(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) -> usize {
+    const VIEW: u32 = u32::from_le_bytes(*b"view");
+    const CART: u32 = u32::from_le_bytes(*b"cart");
+    const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+    let base = file.as_ptr();
+    let len = file.len();
+    let span = (ctx.we - ctx.ws) as u64;
+    let origin_s = ctx.origin / 1000;
+    let ahead = out.ahead;
+    let mut s = start;
+    while s < end {
+        if s + 128 > len {
+            break;
+        }
+        if ahead != 0 {
+            core::arch::x86_64::_mm_prefetch(base.wrapping_add(s + ahead) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+            core::arch::x86_64::_mm_prefetch(base.wrapping_add(s + ahead + 64) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        }
+        let a = fast::cut_a::<3, 4>(base, s);
+        if !a.shape {
+            // An unusual line: the plain code decides.
+            let Some(i) = memchr(b'\n', &file[s..end]) else { break };
+            event_line(&file[s..s + i], ctx, out, tid);
+            s += i + 1;
+            continue;
+        }
+        let n = out.npe;
+        let pe = out.pend_e.as_mut_ptr().add(out.cur + n);
+        let (s0, n0) = a.field(0);
+        let (h, hb) = hash_pair(fast::pack_at(base, s0, s0 + n0));
+        (*pe).h = h;
+        let (s1, n1) = a.field(1);
+        let user = fast::pack_at(base, s1, s1 + n1);
+        let first = ctx.ids.first(hash64(user));
+        ctx.ids.prefetch_at(first);
+        (*pe).ulo = user as u64;
+        (*pe).uhi = (user >> 64) as u64;
+        (*pe).first = first;
+        let (s2, n2) = a.field(2);
+        let t = out.dates.ts(base.add(s2), n2);
+        let sound_a = a.quotes & (n0 != 0);
+        let has_user = n1 != 0;
+
+        let b = fast::cut_b::<3, 5>(base, a.p[3]);
+        if !b.shape {
+            let Some(i) = memchr(b'\n', &file[s..end]) else { break };
+            event_line(&file[s..s + i], ctx, out, tid);
+            s += i + 1;
+            continue;
+        }
+        let e = b.p[4];
+        if e >= end {
+            break;
+        }
+        s = e + 1;
+        if !(sound_a & b.quotes) {
+            continue;
+        }
+        let (s3, n3) = b.field(0);
+        let ing = out.dates.f1(base.add(s3), n3);
+        let x = (((hb >> 20) & H2_MASK) << H2_SHIFT) | ingest32_s(origin_s, ing) as u64;
+        (*pe).x = x;
+        let (s4, n4) = b.field(1);
+        let (s5, n5) = b.field(2);
+        let tp = base.add(s4);
+        let w = std::ptr::read_unaligned(tp as *const u32);
+        let browse = (n4 == 4) & ((w == VIEW) | (w == CART));
+        // A user, a product, a time in the window, and not ingested more than 24 hours late.
+        let fresh = fast::good(ing) & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY);
+        let ok = has_user & (n5 != 0) & ((t.wrapping_sub(ctx.ws) as u64) < span) & fresh;
+        let mut ev = (t.wrapping_sub(ctx.origin) as u64) << 33;
+        let mut valid = ok & browse;
+        if opaque((ok & !browse) as u64) != 0 && n4 == 8 && std::ptr::read_unaligned(tp as *const u64) == PURCHASE {
+            let (s6, n6) = b.field(3);
+            if let Some(p) = parse_price(std::slice::from_raw_parts(base.add(s6), n6)) {
+                let prod = fast::pack_at(base, s5, s5 + n5);
+                ctx.aux.products.prefetch(prod);
+                out.pend_p[(out.cur != 0) as usize].push((n as u32, prod));
+                valid = true;
+                ev |= p as u64;
+            }
+        }
+        (*pe).ev = ev;
+        if valid {
+            out.npe = n + 1;
+            if n + 1 == HALF {
+                turn_events(ctx, out, tid);
+            }
+        } else {
+            let p = (h >> (64 - ctx.pbits)) as usize;
+            out.slim.push16(p, h, TAG | x, &mut out.arena_slim);
+        }
+    }
+    s
+}
+
 fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
     if exp() == 3 {
         return;
     }
-    let rest = if slow_only() { start } else { unsafe { events_fast(file, start, end, ctx, out, tid) } };
+    let rest = if slow_only() {
+        start
+    } else if out.two_part {
+        // (SS_EV2=0 for the one-piece version)
+        unsafe { events_fast2(file, start, end, ctx, out, tid) }
+    } else {
+        unsafe { events_fast(file, start, end, ctx, out, tid) }
+    };
     for line in lines(&file[rest..end]) {
         event_line(line, ctx, out, tid);
     }
