@@ -18,6 +18,7 @@ mod lab;
 mod dense_ck;
 mod dense_lk;
 mod dense_ev;
+mod dense_ka;
 mod diag;
 mod fast;
 mod input;

@@ -171,6 +171,11 @@ for name in os.listdir(src):
 for old in glob.glob(os.path.join(dst, "events", "*.csv")):
     os.remove(old)
 
+# BYTES=1: no field dirt; half the lines get one or two single-byte edits.
+bytes_only = bool(os.environ.get("BYTES"))
+EDIT = list(b'",,,"""\n\n0123456789abcdefghijklmnopqrstuvwxyz0019-:TZ+--::  \r\x00/.zZtTeupP')
+if answer:
+    EDIT = [c for c in EDIT if 0 < c < 128]
 plans = [(0.0, 0.02, 0.0), (0.2, 0.02, 0.0), (0.2, 0.2, 0.01), (0.5, 0.2, 0.0), (1.0, 0.02, 0.0), (0.2, 0.6, 0.1), (0.5, 0.05, 0.01), (0.0, 0.2, 0.0), None, None]
 total = dirty = 0
 for fi, path in enumerate(files):
@@ -195,6 +200,24 @@ for fi, path in enumerate(files):
                 total += 1
                 continue
             dirty += 1
+            if bytes_only:
+                # One or two edits anywhere in the line as it is, structure bytes favoured.
+                b = bytearray(line.rstrip(b"\n"))
+                for _ in range(1 if rng.random() < 0.8 else 2):
+                    if not b: break
+                    pos = rng.randrange(len(b))
+                    c = rng.choice(EDIT)
+                    k = rng.randrange(4)
+                    if k <= 1: b[pos] = c
+                    elif k == 2: b.insert(pos, c)
+                    else: del b[pos]
+                if b.count(b"\n") == 0 or rng.random() < 0.5:
+                    buf += b + b"\n"
+                    total += 1
+                    continue
+                buf += b + b"\n"
+                total += 1
+                continue
             if rng.random() < 0.3: ms += rng.randrange(1000)
             if rng.random() < 0.5: f[2] = ts_field(ms) if rng.random() < max(field_dirt, 0.05) * 3 else rng.choice([utc(ms - ms % 1000) + "Z", with_offset(ms - ms % 1000, rng.choice(OFFSETS)), str(ms)])
             if rng.random() < field_dirt: f[3] = ingest_field(ms)
