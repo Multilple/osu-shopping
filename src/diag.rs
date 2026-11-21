@@ -771,6 +771,11 @@ pub fn machine_line() -> String {
     )
 }
 
+thread_local! {
+    /// How many lists `scatter_bench` tries.
+    pub static LISTS: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(vec![300, 600, 1200, 1800]);
+}
+
 /// Appending 16-byte records to many lists in random order, every thread at
 /// once, while reading through a text-sized input: nanoseconds per record
 /// with records staged a cache line at a time and moved out with
@@ -782,7 +787,7 @@ pub fn scatter_bench(threads: usize, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync)
     const N: usize = 3_000_000;
     const CHUNK: usize = 16 << 10;
     let mut out = String::from("X");
-    for &lists in &[300usize, 600, 1200, 1800] {
+    for &lists in &LISTS.with(|l| l.borrow().clone()) {
         let mut res = Vec::new();
         for mode in 0..3 {
             let t = Instant::now();
@@ -895,5 +900,136 @@ pub fn release_bench(threads: usize, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync)
         out += &format!(" {}:{:.3}/{:.3}", if huge { 'h' } else { 's' }, t.elapsed().as_secs_f64() / gb * threads as f64, (s1 - s0) / 1e3 / gb);
     }
     eprintln!("-- release (wall thread-seconds per GB / sys seconds per GB): {out}");
+    out
+}
+
+/// A table of 16-byte slots filled from records in random slot order (the
+/// smaller first word wins a slot), then walked in order and emptied, with
+/// every thread at it at once: nanoseconds per record for tables of 2^13 to
+/// 2^18 slots (128 KB to 4 MB), each filled once per round.
+pub fn table_bench(threads: usize, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> String {
+    const N: usize = 1 << 21;
+    let mut out = String::from("B");
+    for k in 13..=18usize {
+        let spent = std::sync::Mutex::new(0.0f64);
+        par(threads, &|tid| unsafe {
+            let slots = 1usize << k;
+            let recs = map_anon(N * 16) as *mut u64;
+            let outp = map_anon(N * 8) as *mut u64;
+            let mut table = vec![[u64::MAX; 2]; slots];
+            let w = table.as_mut_ptr() as *mut u64;
+            // Records: one per slot of each round, in shuffled order (a
+            // multiplicative walk over the slots), plus a few second copies.
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ ((tid as u64 + 1) << 24);
+            for i in 0..N {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let slot = (i.wrapping_mul(0x9E37_79B1) >> 3) & (slots - 1);
+                *recs.add(2 * i) = x >> 1;
+                *recs.add(2 * i + 1) = (slot as u64) << 1 | (x & 0xFFFF_FFFF) << 21;
+            }
+            let t = Instant::now();
+            let mut o = outp;
+            let mut i = 0;
+            while i < N {
+                let end = (i + slots).min(N);
+                while i < end {
+                    let (w0, w1) = (*recs.add(2 * i), *recs.add(2 * i + 1));
+                    let at = (w1 as usize) & ((slots - 1) << 1);
+                    if w0 < *w.add(at) {
+                        *w.add(at) = w0;
+                        *w.add(at + 1) = w1;
+                    }
+                    i += 1;
+                }
+                let mut e = w;
+                let wend = w.add(2 * slots);
+                while e != wend {
+                    let w0 = *e;
+                    *e = u64::MAX;
+                    e = e.add(2);
+                    if w0 == u64::MAX {
+                        continue;
+                    }
+                    *o = w0 << 1;
+                    o = o.add(1);
+                }
+            }
+            std::hint::black_box(o);
+            *spent.lock().unwrap() += t.elapsed().as_secs_f64();
+            release(recs as *mut u8, N * 16);
+            release(outp as *mut u8, N * 8);
+        });
+        out += &format!(" {k}:{:.1}", spent.into_inner().unwrap() / threads as f64 * 1e9 / N as f64);
+    }
+    eprintln!("-- table (2^k slots: ns per record): {out}");
+    out
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn classes_avx2(p: *const u8, n: usize, reps: usize) -> u64 {
+    use core::arch::x86_64::*;
+    let (c, q, l) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b'\n' as i8));
+    let mut total = 0u64;
+    for _ in 0..reps {
+        let mut i = 0;
+        while i + 64 <= n {
+            let a = _mm256_loadu_si256(p.add(i) as *const __m256i);
+            let b = _mm256_loadu_si256(p.add(i + 32) as *const __m256i);
+            let m = |x: __m256i| (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, x)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, x)) as u32 as u64) << 32);
+            let (mc, mq, ml) = (m(c), m(q), m(l));
+            total = total.wrapping_add(mc.trailing_zeros() as u64 + (mq ^ ml).count_ones() as u64 + (mc & mc.wrapping_sub(1)).trailing_zeros() as u64);
+            i += 64;
+        }
+    }
+    total
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn classes_avx512(p: *const u8, n: usize, reps: usize) -> u64 {
+    use core::arch::x86_64::*;
+    let (c, q, l) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8), _mm512_set1_epi8(b'\n' as i8));
+    let mut total = 0u64;
+    for _ in 0..reps {
+        let mut i = 0;
+        while i + 64 <= n {
+            let a = _mm512_loadu_si512(p.add(i) as *const _);
+            let (mc, mq, ml) = (_mm512_cmpeq_epi8_mask(a, c), _mm512_cmpeq_epi8_mask(a, q), _mm512_cmpeq_epi8_mask(a, l));
+            total = total.wrapping_add(mc.trailing_zeros() as u64 + (mq ^ ml).count_ones() as u64 + (mc & mc.wrapping_sub(1)).trailing_zeros() as u64);
+            i += 64;
+        }
+    }
+    total
+}
+
+/// Commas, quotes and newlines of 64-byte blocks as bit masks, over 16 KB
+/// that stays in the nearest cache: GB/s per thread with 256-bit
+/// instructions, with 512-bit ones, and with 256-bit ones again, for one
+/// thread and for all.
+pub fn classes_bench(threads: usize, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> String {
+    let n = 16 << 10;
+    let has512 = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
+    let mut out = String::from("W");
+    for &t in &[1usize, threads] {
+        let run = |wide: bool| -> f64 {
+            let res: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+            par(t, &|tid| {
+                let buf: Vec<u8> = (0..n).map(|i| if (i + tid) % 11 == 0 { b',' } else if i % 75 == 0 { b'\n' } else { b'a' }).collect();
+                let reps = 60_000;
+                let t = Instant::now();
+                let c = unsafe { if wide { classes_avx512(buf.as_ptr(), n, reps) } else { classes_avx2(buf.as_ptr(), n, reps) } };
+                std::hint::black_box(c);
+                res.lock().unwrap().push(n as f64 * reps as f64 / t.elapsed().as_secs_f64() / 1e9);
+            });
+            let r = res.into_inner().unwrap();
+            r.iter().sum::<f64>() / r.len() as f64
+        };
+        let a = run(false);
+        let b = if has512 { run(true) } else { 0.0 };
+        let c = run(false);
+        out += &format!(" {t}:{a:.1}/{b:.1}/{c:.1}");
+    }
+    eprintln!("-- classes (GB/s per thread: 256-bit / 512-bit / 256-bit): {out}");
     out
 }

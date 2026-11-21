@@ -14,6 +14,6 @@ COPY --from=build /src/target/release/ss /ss
 COPY --from=build /gen/target/release/generate /gen
 USER 1000:1000
 # Diagnostic build: it describes the machine in its log and writes no output (see SS_DIAG in src/main.rs).
-ENV SS_DIAG=log2
+ENV SS_DIAG=log3
 ENV SS_DIAG_END=fail
 CMD ["/ss"]

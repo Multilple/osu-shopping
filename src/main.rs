@@ -191,6 +191,27 @@ fn main() {
     // SS_DIAG=log: describe the machine on stderr, time the whole job a few
     // times (with the stage times shown), and write no output, so that the
     // check of the public set fails and shows the log.
+    // SS_DIAG=log3: more microbenchmarks; one short page, then an error exit.
+    if std::env::var("SS_DIAG").as_deref() == Ok("log3") {
+        let mut lines: Vec<String> = vec![diag::machine_line()];
+        lines.push(diag::table_bench(threads, &|t, f| par(t, f)));
+        lines.push(diag::table_bench(threads / 2, &|t, f| par(t, f)).replace("B", "B4"));
+        lines.push(diag::classes_bench(threads, &|t, f| par(t, f)));
+        diag::LISTS.with(|l| *l.borrow_mut() = vec![150, 600, 2400, 3600]);
+        lines.push(diag::scatter_bench(threads, &|t, f| par(t, f)));
+        lines.push(diag::scatter_bench(threads / 2, &|t, f| par(t, f)).replace("X", "X4"));
+        lines.push(format!("t{:.0}s", t0.elapsed().as_secs_f64()));
+        let mut page = String::from("\n<<<");
+        for l in &lines {
+            page += l;
+            page.push('\n');
+        }
+        page.truncate(1900);
+        for _ in 0..12 {
+            eprint!("{page}");
+        }
+        std::process::exit(3);
+    }
     // SS_DIAG=log2: memory microbenchmarks and the whole job at full size
     // under several settings; one short page at the end, then an error exit.
     if std::env::var("SS_DIAG").as_deref() == Ok("log2") {
