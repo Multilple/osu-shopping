@@ -1736,7 +1736,12 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
         me.serial += 1;
         let serial = me.serial;
         let cov = me.cov.as_mut_ptr();
-        let mut have_days = false;
+        let nch = (nd + 7) / 8;
+        let df = day_index(me, nch);
+        for i in 0..ns {
+            *df.add((*sess.add(i)).day as usize + 1) = i as i32 + 1;
+        }
+        day_prefix(df, nch);
         for j in 0..live {
             let c = ((*kp.add(j) >> ob) & cmask) as usize;
             let (a, b) = (*ca.add(j), *cb.add(j) as usize);
@@ -1753,34 +1758,51 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
             let row = assist.add(c * nd);
             *row.add((*sess.add(from)).day as usize) += (n > 0) as u32;
             *row.add((*sess.add(from + 1)).day as usize) += (n > 1) as u32;
-            if n <= 2 {
-                continue;
-            }
-            let from = from + 2;
-            if b - from <= 12 {
-                for k in from..b {
-                    *assist.add(c * nd + (*sess.add(k)).day as usize) += 1;
-                }
-            } else {
-                // Many sessions at once (a very busy person): count them day by day.
-                if !have_days {
-                    have_days = true;
-                    // dayfirst[d]: the index of the first session on day d or later.
-                    me.dayfirst.clear();
-                    me.dayfirst.resize(nd + 1, ns as u32);
-                    for k in (0..ns).rev() {
-                        me.dayfirst[(*sess.add(k)).day as usize] = k as u32;
-                    }
-                    for d in (0..nd).rev() {
-                        me.dayfirst[d] = me.dayfirst[d].min(me.dayfirst[d + 1]);
-                    }
-                }
-                for d in (*sess.add(from)).day as usize..=(*sess.add(b - 1)).day as usize {
-                    let cnt = b.min(me.dayfirst[d + 1] as usize).saturating_sub(from.max(me.dayfirst[d] as usize));
-                    *assist.add(c * nd + d) += cnt as u32;
-                }
+            if n > 2 {
+                add_days(row, df, from as i32 + 2, b as i32, nch);
             }
         }
+    }
+}
+
+/// The scratch for `add_days`, cleared: `nch` vectors of days and one more.
+#[inline(always)]
+unsafe fn day_index(me: &mut BOut, nch: usize) -> *mut i32 {
+    use std::arch::x86_64::*;
+    if me.dayfirst.len() < nch * 8 + 16 {
+        me.dayfirst.resize(nch * 8 + 16, 0);
+    }
+    let df = me.dayfirst.as_mut_ptr() as *mut i32;
+    for t in 0..=nch {
+        _mm256_storeu_si256(df.add(t * 8) as *mut __m256i, _mm256_setzero_si256());
+    }
+    df
+}
+
+/// After each session `i` stored `i + 1` at its day plus one: `df[d]` is
+/// the number of sessions before day `d` (for every `d` up to `nch * 8`).
+#[inline(always)]
+unsafe fn day_prefix(df: *mut i32, nch: usize) {
+    let mut m = 0;
+    for d in 1..=nch * 8 {
+        m = m.max(*df.add(d));
+        *df.add(d) = m;
+    }
+}
+
+/// Adds to `row[d]`, for every day `d`, how many of the sessions `a..b` are
+/// on day `d` (see `day_prefix`). No branch; the row may run up to `nch * 8`
+/// days, adding 0 past the last (the table has room after its last row).
+#[inline(always)]
+unsafe fn add_days(row: *mut u32, df: *const i32, a: i32, b: i32, nch: usize) {
+    use std::arch::x86_64::*;
+    let (va, vb) = (_mm256_set1_epi32(a), _mm256_set1_epi32(b));
+    for t in 0..nch {
+        let lo = _mm256_loadu_si256(df.add(t * 8) as *const __m256i);
+        let hi = _mm256_loadu_si256(df.add(t * 8 + 1) as *const __m256i);
+        let c = _mm256_max_epi32(_mm256_sub_epi32(_mm256_min_epi32(vb, hi), _mm256_max_epi32(va, lo)), _mm256_setzero_si256());
+        let r = row.add(t * 8) as *mut __m256i;
+        _mm256_storeu_si256(r, _mm256_add_epi32(_mm256_loadu_si256(r), c));
     }
 }
 
@@ -2238,7 +2260,8 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             dayfirst: Vec::new(),
             big: Vec::new(),
             credit: vec![Credit::default(); ncell],
-            assist: vec![0; ncell],
+            // (Room past the last row: see `add_days`.)
+            assist: vec![0; ncell + ctx.nd + 16],
             hi: Vec::new(),
             ca: Vec::new(),
             cb: Vec::new(),
