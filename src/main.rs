@@ -604,6 +604,21 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         }
         wait_until = 2.0 + 0.05 * code as f64;
     }
+    // SS_DIAG=rus1, rus2 or rus3: the run ends at 2 s plus this process's
+    // system CPU seconds times 4 (rus1), its user CPU seconds times 2 (rus2),
+    // or its page faults in millions times 4 (rus3).
+    if let Some(which) = diag.as_deref().filter(|d| d.starts_with("rus")) {
+        let (user_ms, sys_ms, faults) = util::sys::usage();
+        if log {
+            eprintln!("    diag: user {user_ms:.0} ms, sys {sys_ms:.0} ms, faults {faults}");
+        }
+        wait_until = 2.0
+            + match which {
+                "rus1" => 4.0 * sys_ms / 1000.0,
+                "rus2" => 2.0 * user_ms / 1000.0,
+                _ => 4.0 * faults as f64 / 1e6,
+            };
+    }
     let now = t0.elapsed().as_secs_f64();
     if wait_until > now {
         std::thread::sleep(std::time::Duration::from_secs_f64(wait_until - now));
