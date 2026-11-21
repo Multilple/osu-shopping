@@ -85,3 +85,56 @@ pub fn costs(ids: &IdTable, par: &dyn Fn(&(dyn Fn(usize) + Sync))) -> (u32, u32)
     }
     ((ns.round() as u32).min(63), ((per_gb / 0.05) as u32).min(7))
 }
+
+/// Megabytes of this process's memory that are on huge pages right now.
+pub fn huge_mb() -> u64 {
+    let kb = |text: &str| -> u64 {
+        text.lines()
+            .filter(|l| l.starts_with("AnonHugePages:"))
+            .filter_map(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+            .sum()
+    };
+    let rollup = read("/proc/self/smaps_rollup");
+    (if rollup.is_empty() { kb(&read("/proc/self/smaps")) } else { kb(&rollup) }) / 1024
+}
+
+/// GB per second that `threads` threads move together, each filling 128 MB
+/// with non-temporal stores and then reading it back (the better of two
+/// rounds; the memory is touched beforehand).
+pub fn bandwidth(threads: usize, par: &dyn Fn(&(dyn Fn(usize) + Sync))) -> f64 {
+    use core::arch::x86_64::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const BYTES: usize = 128 << 20;
+    let bufs: Vec<AtomicUsize> = (0..threads).map(|_| AtomicUsize::new(0)).collect();
+    par(&|tid| {
+        let p = map_anon(BYTES);
+        let mut o = 0;
+        while o < BYTES {
+            unsafe { std::ptr::write_volatile(p.add(o), 1) };
+            o += 4096;
+        }
+        bufs[tid].store(p as usize, Ordering::Relaxed);
+    });
+    let mut best = 0.0f64;
+    for _ in 0..2 {
+        let t = Instant::now();
+        par(&|tid| unsafe {
+            let p = bufs[tid].load(Ordering::Relaxed) as *mut __m256i;
+            let v = _mm256_set1_epi8(tid as i8 + 1);
+            for i in 0..BYTES / 32 {
+                _mm256_stream_si256(p.add(i), v);
+            }
+            _mm_sfence();
+            let mut s = _mm256_setzero_si256();
+            for i in 0..BYTES / 32 {
+                s = _mm256_add_epi64(s, _mm256_load_si256(p.add(i)));
+            }
+            std::hint::black_box(s);
+        });
+        best = best.max(threads as f64 * 2.0 * BYTES as f64 / t.elapsed().as_secs_f64() / 1e9);
+    }
+    for b in &bufs {
+        release(b.load(Ordering::Relaxed) as *mut u8, BYTES);
+    }
+    best
+}
