@@ -1,5 +1,24 @@
-# pipeline
+# osu-shopping
 
-One static Rust binary, no dependencies.
+Team Wix's entry for the Databricks Shopping Sessions track of the Builders Buildathon 2026.
 
-    docker build -t app .
+It reads shopping events, ad clicks and linked user IDs from `/data` and writes the
+`user_daily` and `campaign_daily` Parquet tables under `/output`.
+
+## Credit
+
+This entry is built on **Team 67's Express Lane**
+(https://github.com/jason-scheffel/express-lane), commit
+`498cef62bb42b3a015be9a4ae7b5985a56c3ca24`, released under the MIT License.
+The Rust sources in `src/`, the build settings in `.cargo/` and the Dockerfile
+come from that project. Changes made by Team Wix are listed in `CHANGES.md`.
+See `THIRD_PARTY_NOTICES.md` and `LICENSE`.
+
+## Build and run
+
+Needs a Linux x86-64 host with Cascade Lake class AVX-512.
+
+```sh
+docker build --platform linux/amd64 -t osu-shopping .
+docker run --rm --network none -v "$PWD/data:/data:ro" -v "$PWD/output:/output" osu-shopping
+```
