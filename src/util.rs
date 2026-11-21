@@ -219,6 +219,14 @@ pub mod sys {
         pub fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
     }
 
+    /// This thread's CPU time so far (user and kernel), in seconds.
+    pub fn thread_cpu() -> f64 {
+        let mut r = [0i64; 18];
+        // RUSAGE_THREAD
+        unsafe { getrusage(1, &mut r) };
+        (r[0] + r[2]) as f64 + (r[1] + r[3]) as f64 / 1e6
+    }
+
     /// CPU time in user mode and in the kernel (ms), and page faults so far.
     pub fn usage() -> (f64, f64, i64) {
         let mut r = [0i64; 18];

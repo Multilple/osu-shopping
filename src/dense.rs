@@ -465,6 +465,36 @@ struct BOut {
     serial: u32,
     dayfirst: Vec<u32>,
     big: Vec<Ckd>,
+    /// Credit and assists per (campaign, day): what `Cells` holds, laid out
+    /// so that crediting a session touches one cache line.
+    credit: Vec<Credit>,
+    assist: Vec<u32>,
+    /// Scratch for one person: per session, how many clicks are at or
+    /// before its start; per click, the sessions it can assist (from, to).
+    hi: Vec<u32>,
+    ca: Vec<u32>,
+    cb: Vec<u32>,
+    /// Scratch for one person: each session's start and event count, and
+    /// the purchases (session << 40 | category << 24 | price).
+    sstart: Vec<u32>,
+    scount: Vec<u32>,
+    spurch: Vec<u64>,
+    /// Seconds spent: sorting clicks by person, on persons whose events
+    /// came as one run, on the others (CPU time, kept only when `timed`);
+    /// then counts of events of each kind.
+    prof: [f64; 8],
+    timed: bool,
+}
+
+static STATS: [AtomicUsize; 12] = [const { AtomicUsize::new(0) }; 12];
+
+/// Sessions credited to a campaign on a day.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Credit {
+    sessions: u32,
+    purch: u32,
+    rev: u64,
 }
 
 type Cell<T> = Shared<UnsafeCell<T>>;
@@ -961,23 +991,6 @@ fn dedup_bucket(b: usize, outs: &[&DOut], dn: &Dn, me: &mut AOut) {
 
 // ---------------------------------------------------------------- persons
 
-/// Take back the rows written since `mark`, and the unfinished day's sums.
-fn rollback(tl: &mut Tl, mark: (usize, usize)) {
-    let (n, user) = mark;
-    let rows = &mut tl.rows;
-    rows.n = n;
-    rows.user.truncate(user);
-    rows.day.truncate(n * 4);
-    rows.sessions.truncate(n * 4);
-    rows.events.truncate(n * 4);
-    rows.rev.truncate(n * 8);
-    rows.cat.truncate(n);
-    for &c in &tl.touched {
-        tl.catsum[c as usize] = 0;
-    }
-    tl.touched.clear();
-}
-
 /// Room in every column for `n` more rows (so that `push_row` need not check).
 #[inline(always)]
 fn reserve_rows(rows: &mut Rows, n: usize) {
@@ -991,29 +1004,20 @@ fn reserve_rows(rows: &mut Rows, n: usize) {
         rows.rev.reserve(n * 8);
         rows.cat.reserve(n);
     }
-    // (All columns but `user` grow in step, so two checks cover them.)
-    if rows.user.capacity() - rows.user.len() < n * 20 + 16 || rows.cat.capacity() - rows.cat.len() < n || rows.rev.capacity() - rows.rev.len() < n * 8 || rows.day.capacity() - rows.day.len() < n * 4 || rows.sessions.capacity() - rows.sessions.len() < n * 4 || rows.events.capacity() - rows.events.len() < n * 4 {
+    if rows.user.capacity() - rows.user.len() < n * 20 + 16
+        || rows.cat.capacity() - rows.cat.len() < n
+        || rows.rev.capacity() - rows.rev.len() < n * 8
+        || rows.day.capacity() - rows.day.len() < n * 4
+        || rows.sessions.capacity() - rows.sessions.len() < n * 4
+        || rows.events.capacity() - rows.events.len() < n * 4
+    {
         grow(rows, n);
     }
 }
 
-/// `flush_row` for a short name and columns with room (see `reserve_rows`).
+/// One user_daily row, for a short name and columns with room (see `reserve_rows`).
 #[inline(always)]
-unsafe fn push_row(who: Key, day: u32, sessions: u32, events: u32, rev: u64, tl: &mut Tl) {
-    let mut best = NOCAT;
-    if !tl.touched.is_empty() {
-        let mut best_sum = 0u64;
-        for &c in &tl.touched {
-            let s = tl.catsum[c as usize];
-            tl.catsum[c as usize] = 0;
-            // Categories are ranked byte-wise, so the smaller index wins a tie.
-            if s > best_sum || (s == best_sum && c < best) {
-                best = c;
-                best_sum = s;
-            }
-        }
-        tl.touched.clear();
-    }
+unsafe fn push_row(who: Key, day: u32, sessions: u32, events: u32, rev: u64, best: u16, tl: &mut Tl) {
     let rows = &mut tl.rows;
     let n = rows.n;
     rows.n = n + 1;
@@ -1036,73 +1040,104 @@ unsafe fn push_row(who: Key, day: u32, sessions: u32, events: u32, rev: u64, tl:
     rows.cat.set_len(n + 1);
 }
 
-/// `person_sorted` for events that should already be in time order, and a
-/// person with a short name. Returns false, part-way through, when they
-/// turn out not to be in order.
-fn person_stream(who: Key, evs: &[u64], tl: &mut Tl) -> bool {
+/// One person's sessions and user_daily rows from events that should
+/// already be in time order, for a person with a short name. Returns false,
+/// having written nothing, when they turn out not to be in order.
+///
+/// The loop over the events has no branch that depends on them (but for
+/// purchases): each event stores its session's start and running count at
+/// the session's number, and the last store for a number is the one that
+/// stays.
+fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
     let n = evs.len();
-    reserve_rows(&mut tl.rows, tl.nd);
-    tl.sess.clear();
-    tl.sess.reserve(n);
-    let sess = tl.sess.as_mut_ptr();
-    let mut ns = 0usize;
-    let mut cur_day = u32::MAX;
-    let (mut d_sessions, mut d_events, mut d_rev) = (0u32, 0u32, 0u64);
-    let mut last = 0u32;
+    me.sstart.clear();
+    me.sstart.reserve(n + 1);
+    me.scount.clear();
+    me.scount.reserve(n + 1);
+    me.spurch.clear();
+    let (start, count) = (me.sstart.as_mut_ptr(), me.scount.as_mut_ptr());
     let p = evs.as_ptr();
-    let mut i = 0;
+    let tl = &mut me.tl;
     unsafe {
-        while i < n {
-            let start = (*p.add(i) >> 33) as u32;
-            if start < last {
-                return false;
+        let mut sid = 0usize;
+        let mut prev = (*p >> 33) as u32;
+        let mut first = prev;
+        let mut cnt = 0u32;
+        let mut back = false;
+        for i in 0..n {
+            let e = *p.add(i);
+            let ts = (e >> 33) as u32;
+            back |= ts < prev;
+            // (A step back in time looks like a gap here; `back` catches it.)
+            let brk = ts.wrapping_sub(prev) > GAP;
+            sid += brk as usize;
+            first = if brk { ts } else { first };
+            cnt = if brk { 1 } else { cnt + 1 };
+            *start.add(sid) = first;
+            *count.add(sid) = cnt;
+            prev = ts;
+            if e & 0xFF_FFFF != 0 {
+                me.spurch.push((sid as u64) << 40 | (e & 0x1_FFFF_FFFF));
             }
-            let day = start / DAY_MS - 7;
-            if day != cur_day {
-                if cur_day != u32::MAX {
-                    push_row(who, cur_day, d_sessions, d_events, d_rev, tl);
-                }
-                cur_day = day;
-                d_sessions = 0;
-                d_events = 0;
-                d_rev = 0;
-            }
-            let mut prev = start;
-            let first = i;
-            let (mut rev, mut purch) = (0u64, false);
-            loop {
-                let e = *p.add(i);
-                let ts = (e >> 33) as u32;
-                // (A step back in time also ends the session; it is caught above.)
-                if ts.wrapping_sub(prev) > GAP {
-                    break;
-                }
-                prev = ts;
-                if e & 0xFF_FFFF != 0 {
-                    let price = e & 0xFF_FFFF;
-                    purch = true;
-                    rev += price;
-                    let cat = ((e >> 24) & 0x1FF) as usize;
-                    if tl.catsum[cat] == 0 {
-                        tl.touched.push(cat as u16);
-                    }
-                    tl.catsum[cat] += price;
-                }
-                i += 1;
-                if i == n {
-                    break;
-                }
-            }
-            last = prev;
-            let nev = (i - first) as u32;
-            sess.add(ns).write(Sess { start, day, purch, rev, events: nev });
-            ns += 1;
-            d_sessions += 1;
-            d_events += nev;
-            d_rev += rev;
+        }
+        if back {
+            return false;
+        }
+        let ns = sid + 1;
+        tl.sess.clear();
+        tl.sess.reserve(ns);
+        let sess = tl.sess.as_mut_ptr();
+        for k in 0..ns {
+            let st = *start.add(k);
+            sess.add(k).write(Sess { start: st, day: st / DAY_MS - 7, purch: false, rev: 0, events: *count.add(k) });
         }
         tl.sess.set_len(ns);
-        push_row(who, cur_day, d_sessions, d_events, d_rev, tl);
+
+        // Purchases: revenue per session, and the best category per day (as in `person_grid`).
+        if !me.spurch.is_empty() {
+            let ncat = tl.ncat;
+            for &pp in &me.spurch {
+                let s = &mut *sess.add((pp >> 40) as usize);
+                let cat = ((pp >> 24) & 0x1FF) as usize;
+                let price = pp & 0xFF_FFFF;
+                s.rev += price;
+                s.purch = true;
+                let k = s.day as usize * ncat + cat;
+                if tl.daycat[k] == 0 {
+                    tl.touched_dc.push(k as u32);
+                }
+                tl.daycat[k] += price;
+            }
+            for &k in &tl.touched_dc {
+                let (d, c) = (k as usize / ncat, (k as usize % ncat) as u16);
+                let sum = tl.daycat[k as usize];
+                tl.daycat[k as usize] = 0;
+                // Categories are ranked byte-wise, so the smaller index wins a tie.
+                if sum > tl.best_sum[d] || (sum == tl.best_sum[d] && c < tl.best[d]) {
+                    tl.best[d] = c;
+                    tl.best_sum[d] = sum;
+                }
+            }
+            tl.touched_dc.clear();
+        }
+
+        // One row per day with a session.
+        reserve_rows(&mut tl.rows, tl.nd);
+        let mut i = 0;
+        while i < ns {
+            let day = (*sess.add(i)).day;
+            let (mut d_sessions, mut d_events, mut d_rev) = (0u32, 0u32, 0u64);
+            while i < ns && (*sess.add(i)).day == day {
+                d_sessions += 1;
+                d_events += (*sess.add(i)).events;
+                d_rev += (*sess.add(i)).rev;
+                i += 1;
+            }
+            let best = tl.best[day as usize];
+            tl.best[day as usize] = NOCAT;
+            tl.best_sum[day as usize] = 0;
+            push_row(who, day, d_sessions, d_events, d_rev, best, tl);
+        }
     }
     true
 }
@@ -1167,21 +1202,26 @@ fn settle_ties(keys: &mut [u64], cids: &[u32], dn: &Dn) -> usize {
 /// What `attribute` in main.rs does, for clicks as sortable words. Clicks
 /// at the same time for the same campaign need not be told apart: neither
 /// credit nor assists can depend on which of them is which.
+///
+/// Sessions and clicks are both in time order, so two merges place every
+/// click among the sessions: one gives, per session, the clicks at or
+/// before its start (the last of them credits it, if within 7 days) and,
+/// per click, the first session it could assist; the other gives the last.
+/// The merges advance by arithmetic on a comparison, not by a branch on it.
 fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
-    let tl = &mut me.tl;
-    let (nd, organic) = (tl.nd, tl.organic);
-    let ns = tl.sess.len();
-    let sess = tl.sess.as_ptr();
-    let (c_sessions, c_purch, c_rev, c_assist) = (tl.cells.sessions.as_mut_ptr(), tl.cells.purch.as_mut_ptr(), tl.cells.rev.as_mut_ptr(), tl.cells.assisted.as_mut_ptr());
+    let (nd, organic) = (me.tl.nd, me.tl.organic);
+    let ns = me.tl.sess.len();
+    let sess = me.tl.sess.as_ptr();
+    let (credit, assist) = (me.credit.as_mut_ptr(), me.assist.as_mut_ptr());
     let n0 = keys.len();
     unsafe {
         if n0 == 0 {
             for i in 0..ns {
                 let s = &*sess.add(i);
-                let cell = organic * nd + s.day as usize;
-                *c_sessions.add(cell) += 1;
-                *c_purch.add(cell) += s.purch as u32;
-                *c_rev.add(cell) += s.rev;
+                let c = &mut *credit.add(organic * nd + s.day as usize);
+                c.sessions += 1;
+                c.purch += s.purch as u32;
+                c.rev += s.rev;
             }
             return;
         }
@@ -1190,8 +1230,16 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
             // More clicks than a key can number: the general code.
             me.big.clear();
             me.big.extend(keys.iter().zip(cids).map(|(&k, &cid)| Ckd { ts: (k >> 32) as u32, cid, camp: (k as u32) >> ob }));
-            crate::attribute(&mut me.big, tl);
+            crate::attribute(&mut me.big, &mut me.tl);
             return;
+        }
+        if me.timed {
+            // (statistics: persons and click x session pairs by size class)
+            let prod = n0 * ns;
+            let class = if prod <= 64 { 0 } else if prod <= 256 { 1 } else if prod <= 1024 { 2 } else { 3 };
+            STATS[class].fetch_add(1, Relaxed);
+            STATS[4 + class].fetch_add(prod, Relaxed);
+            STATS[8 + class].fetch_add(n0, Relaxed);
         }
         let kp = keys.as_mut_ptr();
         let mut n = n0;
@@ -1215,47 +1263,65 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
             }
         }
         let cmask = (1u64 << (32 - ob)) - 1;
+        me.hi.clear();
+        me.hi.reserve(ns);
+        me.ca.clear();
+        me.ca.reserve(n);
+        me.cb.clear();
+        me.cb.reserve(n);
+        let (hi, ca, cb) = (me.hi.as_mut_ptr(), me.ca.as_mut_ptr(), me.cb.as_mut_ptr());
+
+        // First merge: a click goes before the sessions that start at or after it.
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < ns && j < n {
+            let click = ((*kp.add(j) >> 32) as u32 <= (*sess.add(i)).start) as usize;
+            *hi.add(i) = j as u32;
+            *ca.add(j) = i as u32;
+            j += click;
+            i += 1 - click;
+        }
+        for k in i..ns {
+            *hi.add(k) = n as u32;
+        }
+        // (Clicks after the last session's start assist nothing.)
+        let live = j;
 
         // Credit: the latest click at or before the session's start, if within 7 days.
-        let mut hi = 0;
         for i in 0..ns {
             let s = &*sess.add(i);
-            while hi < n && (*kp.add(hi) >> 32) as u32 <= s.start {
-                hi += 1;
-            }
-            let mut camp = organic;
-            if hi > 0 {
-                let k = *kp.add(hi - 1);
-                if s.start - (k >> 32) as u32 <= WEEK {
-                    camp = ((k >> ob) & cmask) as usize;
-                }
-            }
-            let cell = camp * nd + s.day as usize;
-            *c_sessions.add(cell) += 1;
-            *c_purch.add(cell) += s.purch as u32;
-            *c_rev.add(cell) += s.rev;
+            let h = *hi.add(i) as usize;
+            // (With no click before it, the first one is looked at: it is later, so not within.)
+            let k = *kp.add(h.max(1) - 1);
+            let within = s.start.wrapping_sub((k >> 32) as u32) <= WEEK;
+            let camp = if within { ((k >> ob) & cmask) as usize } else { organic };
+            let c = &mut *credit.add(camp * nd + s.day as usize);
+            c.sessions += 1;
+            c.purch += s.purch as u32;
+            c.rev += s.rev;
         }
 
-        // Assists: a click assists the sessions that start in the 7 days from
-        // it, `a..b` below, and both ends only move forward from click to
-        // click. A campaign's clicks must count a session once, so each
-        // campaign remembers how far its earlier clicks reached.
+        // Second merge: a session goes before the clicks made less than 7 days before it or later.
+        let (mut i, mut j) = (0usize, 0usize);
+        while j < live && i < ns {
+            let first = ((*sess.add(i)).start <= (*kp.add(j) >> 32) as u32 + WEEK) as usize;
+            *cb.add(j) = i as u32;
+            i += first;
+            j += 1 - first;
+        }
+        for k in j..live {
+            *cb.add(k) = ns as u32;
+        }
+
+        // Assists: click j assists sessions ca[j]..cb[j]. A campaign's clicks
+        // must count a session once, so each campaign remembers how far its
+        // earlier clicks reached.
         me.serial += 1;
         let serial = me.serial;
         let cov = me.cov.as_mut_ptr();
         let mut have_days = false;
-        let (mut a, mut b) = (0usize, 0usize);
-        for i in 0..n {
-            let k = *kp.add(i);
-            let t = (k >> 32) as u32;
-            let c = ((k >> ob) & cmask) as usize;
-            while a < ns && (*sess.add(a)).start < t {
-                a += 1;
-            }
-            let lim = t + WEEK;
-            while b < ns && (*sess.add(b)).start <= lim {
-                b += 1;
-            }
+        for j in 0..live {
+            let c = ((*kp.add(j) >> ob) & cmask) as usize;
+            let (a, b) = (*ca.add(j) as usize, *cb.add(j) as usize);
             let e = &mut *cov.add(c);
             let from = if e[0] == serial { (e[1] as usize).max(a) } else { a };
             *e = [serial, b as u32];
@@ -1263,8 +1329,8 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
                 continue;
             }
             if b - from <= 12 {
-                for j in from..b {
-                    *c_assist.add(c * nd + (*sess.add(j)).day as usize) += 1;
+                for k in from..b {
+                    *assist.add(c * nd + (*sess.add(k)).day as usize) += 1;
                 }
             } else {
                 // Many sessions at once (a very busy person): count them day by day.
@@ -1273,8 +1339,8 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
                     // dayfirst[d]: the index of the first session on day d or later.
                     me.dayfirst.clear();
                     me.dayfirst.resize(nd + 1, ns as u32);
-                    for j in (0..ns).rev() {
-                        me.dayfirst[(*sess.add(j)).day as usize] = j as u32;
+                    for k in (0..ns).rev() {
+                        me.dayfirst[(*sess.add(k)).day as usize] = k as u32;
                     }
                     for d in (0..nd).rev() {
                         me.dayfirst[d] = me.dayfirst[d].min(me.dayfirst[d + 1]);
@@ -1282,7 +1348,7 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
                 }
                 for d in (*sess.add(from)).day as usize..=(*sess.add(b - 1)).day as usize {
                     let cnt = b.min(me.dayfirst[d + 1] as usize).saturating_sub(from.max(me.dayfirst[d] as usize));
-                    *c_assist.add(c * nd + d) += cnt as u32;
+                    *assist.add(c * nd + d) += cnt as u32;
                 }
             }
         }
@@ -1293,12 +1359,9 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
 #[inline(always)]
 fn person_run(p: u32, evs: &mut [u64], keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
     let who = dn.person_key(p);
-    let tl = &mut me.tl;
-    let mark = (tl.rows.n, tl.rows.user.len());
     // (A name too long for a key goes the general way.)
-    if is_long(who) || !person_stream(who, evs, tl) {
-        rollback(tl, mark);
-        person_sorted(who, evs, tl);
+    if is_long(who) || !person_stream(who, evs, me) {
+        person_sorted(who, evs, &mut me.tl);
     }
     attribute(keys, cids, dn, me);
 }
@@ -1320,6 +1383,8 @@ fn person_bucket(q: usize, segs: &[Seg], outs: &[&DOut], dn: &Dn, me: &mut BOut)
     let smask = (bslots - 1) as u32;
     let ob = dn.obits;
     let nck: usize = outs.iter().map(|o| o.ck.len(q)).sum();
+    let timed = me.timed;
+    let t_a = if timed { sys::thread_cpu() } else { 0.0 };
     me.keys.clear();
     me.cids.clear();
     if nck > 0 {
@@ -1388,6 +1453,8 @@ fn person_bucket(q: usize, segs: &[Seg], outs: &[&DOut], dn: &Dn, me: &mut BOut)
         }
     };
 
+    let t_b = if timed { sys::thread_cpu() } else { 0.0 };
+    me.prof[0] += t_b - t_a;
     me.irr.clear();
     for seg in segs {
         let mut p = seg.ptr;
@@ -1398,12 +1465,16 @@ fn person_bucket(q: usize, segs: &[Seg], outs: &[&DOut], dn: &Dn, me: &mut BOut)
             p = unsafe { p.add(1 + n) };
             if dn.one_run(person) {
                 let (k, c) = clicks(person);
+                me.prof[3] += n as f64;
                 person_run(person, evs, k, c, dn, me);
             } else {
+                me.prof[4] += n as f64;
                 me.irr.push((person, evs.as_mut_ptr(), n as u32));
             }
         }
     }
+    let t_c = if timed { sys::thread_cpu() } else { 0.0 };
+    me.prof[1] += t_c - t_b;
     if !me.irr.is_empty() {
         // Persons whose events came in several runs: put each one's together.
         me.irr.sort_unstable_by_key(|r| r.0);
@@ -1420,6 +1491,9 @@ fn person_bucket(q: usize, segs: &[Seg], outs: &[&DOut], dn: &Dn, me: &mut BOut)
             person_any(person, &mut gather, k, c, dn, me);
         }
         me.gather = gather;
+    }
+    if timed {
+        me.prof[2] += sys::thread_cpu() - t_c;
     }
 }
 
@@ -1705,6 +1779,16 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             serial: 0,
             dayfirst: Vec::new(),
             big: Vec::new(),
+            credit: vec![Credit::default(); ncell],
+            assist: vec![0; ncell],
+            hi: Vec::new(),
+            ca: Vec::new(),
+            cb: Vec::new(),
+            sstart: Vec::new(),
+            scount: Vec::new(),
+            spurch: Vec::new(),
+            prof: [0.0; 8],
+            timed: log,
         });
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -1719,14 +1803,39 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     par(threads, |tid| {
         // (Each thread reads every thread's forwarded clicks and writes only its own rows.)
         let me = mine(&bouts, tid).as_mut().unwrap();
+        let t_s = sys::thread_cpu();
         special_persons(tid, threads, &outs_ref, &aouts_ref, &sp_ck, &dn, me);
+        let t_w = sys::thread_cpu();
         if tid == 0 || me.tl.rows.n > 0 {
             write_user_daily(&user_dir.join(format!("part-{tid:03}.parquet")), &mut me.tl.rows, &ctx);
         }
-        let tl = mine(&bouts, tid).take().unwrap().tl;
+        if log {
+            eprintln!(
+                "    t{tid}: CPU ms: clicks {:.1} one-run {:.1} others {:.1} special {:.1} write {:.1} | events one-run {:.0} others {:.0}",
+                me.prof[0] * 1e3,
+                me.prof[1] * 1e3,
+                me.prof[2] * 1e3,
+                (t_w - t_s) * 1e3,
+                (sys::thread_cpu() - t_w) * 1e3,
+                me.prof[3],
+                me.prof[4]
+            );
+        }
+        let done = mine(&bouts, tid).take().unwrap();
+        let mut tl = done.tl;
+        for (i, c) in done.credit.iter().enumerate() {
+            tl.cells.sessions[i] += c.sessions;
+            tl.cells.purch[i] += c.purch;
+            tl.cells.rev[i] += c.rev;
+            tl.cells.assisted[i] += done.assist[i];
+        }
         *mine(&cells, tid) = Some(tl.cells);
     });
     lap("persons + user_daily");
+    if log {
+        let v: Vec<usize> = STATS.iter().map(|x| x.swap(0, Relaxed)).collect();
+        eprintln!("    persons with clicks by clicks x sessions (<=64, <=256, <=1024, more): {:?}; pairs {:?}; clicks {:?}", &v[..4], &v[4..8], &v[8..]);
+    }
 
     // The last table is small: write it while the other threads give the big
     // buffers back, which is quicker than leaving it all to process exit.
