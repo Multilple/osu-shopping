@@ -171,19 +171,28 @@ pub fn main(threads: usize) -> ! {
                 ("a0", threads, vec![("SS_AHEAD", "0")]),
                 ("a1k", threads, vec![("SS_AHEAD", "1024")]),
                 ("a16k", threads, vec![("SS_AHEAD", "16384")]),
-                ("p0", threads, vec![("SS_POP", "0")]),
+                ("p1", threads, vec![("SS_POP", "1")]),
                 ("pc.25", threads, vec![("SS_PIECE", "262144")]),
                 ("pc1", threads, vec![("SS_PIECE", "1048576")]),
                 ("pc16", threads, vec![("SS_PIECE", "16777216")]),
                 ("nh", threads, vec![("SS_NOHUGE", "1")]),
+                ("kb13", threads, vec![("SS_KB", "13")]),
                 ("kb14", threads, vec![("SS_KB", "14")]),
                 ("kb16", threads, vec![("SS_KB", "16")]),
+                ("kb17", threads, vec![("SS_KB", "17")]),
                 ("ku10", threads, vec![("SS_KU", "10")]),
                 ("ku12", threads, vec![("SS_KU", "12")]),
                 ("m0", threads, vec![("SS_MMAP", "0")]),
             ]);
         } else {
-            variants.extend([("d16", threads * 2, vec![]), ("kb16", threads, vec![("SS_KB", "16")]), ("kb17", threads, vec![("SS_KB", "17")]), ("ku12", threads, vec![("SS_KU", "12")]), ("nh", threads, vec![("SS_NOHUGE", "1")])]);
+            variants.extend([
+                ("d16", threads * 2, vec![]),
+                ("kb14", threads, vec![("SS_KB", "14")]),
+                ("kb16", threads, vec![("SS_KB", "16")]),
+                ("kb17", threads, vec![("SS_KB", "17")]),
+                ("ku12", threads, vec![("SS_KU", "12")]),
+                ("ku13", threads, vec![("SS_KU", "13")]),
+            ]);
         }
         let mut best: Vec<Option<Run>> = variants.iter().map(|_| None).collect();
         let rounds = if big { 2 } else { 3 };
