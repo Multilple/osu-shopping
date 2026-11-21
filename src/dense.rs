@@ -1491,10 +1491,16 @@ fn person_run(p: u32, evs: &mut [u64], keys: &mut [u64], cids: &[u32], dn: &Dn, 
     let who = dn.person_key(p);
     // (A name too long for a key goes the general way.)
     if is_long(who) || !person_stream(who, evs, me) {
+        if me.timed {
+            UNORDERED.fetch_add(1, Relaxed);
+        }
         person_sorted(who, evs, &mut me.tl);
     }
     attribute(keys, cids, dn, me);
 }
+
+/// (Statistics: persons whose single run of events was not in time order.)
+static UNORDERED: AtomicUsize = AtomicUsize::new(0);
 
 /// One person whose events are in no particular order.
 fn person_any(p: u32, evs: &mut [u64], keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
@@ -1975,6 +1981,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     if log {
         let v: Vec<usize> = STATS.iter().map(|x| x.swap(0, Relaxed)).collect();
         eprintln!("    persons with clicks by clicks x sessions (<=64, <=256, <=1024, more): {:?}; pairs {:?}; clicks {:?}", &v[..4], &v[4..8], &v[8..]);
+        eprintln!("    one-run persons not in time order (or with a long name): {}", UNORDERED.swap(0, Relaxed));
     }
 
     // The last table is small: write it while the other threads give the big
