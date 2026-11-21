@@ -96,10 +96,9 @@ pub(crate) struct K {
     s_line: u64,
     /// (A register the loop borrows.)
     s_rbx: u64,
-    /// The next line's masks: commas, quotes, where its newline is.
+    /// The next line's masks: commas, quotes.
     n_c: u64,
     n_q: u64,
-    n_nl: u64,
     // Where a run of passes stops, and the event streams' states (`table::Slot16`).
     limit: u64,
     streams: u64,
@@ -413,22 +412,20 @@ macro_rules! define_events {
             // ---- The masks: where the first newline 41..104 bytes on is (r15, 64 for none); commas (rax) and quotes
             // (rdx) of the first 64. A pass finds them for the next line (`nhead`), this for the first.
             $($head,)*
-            "tzcnt r15, r15",
+            "tzcnt rbx, r15",           // rbx: where the newline is
             "mov qword ptr [rdi + {n_c}], rax",
             "mov qword ptr [rdi + {n_q}], rdx",
-            "mov qword ptr [rdi + {n_nl}], r15",
             "2:",
             "mov rax, qword ptr [rdi + {n_c}]",
             "mov rdx, qword ptr [rdi + {n_q}]",
-            "mov r15, qword ptr [rdi + {n_nl}]",
-            "mov rbx, rsi",             // rbx: the newline before the line
-            "cmp r15d, 63",
+            "mov qword ptr [rdi + {s_line}], rsi", // the newline before the line
+            "cmp ebx, 63",
             "ja 88f",                   // no newline in sight
             "prefetcht0 byte ptr [rsi + {ahead}]",
             "prefetcht0 byte ptr [rsi + {ahead} + 64]",
-            "add r15, rsi",             // r15: the newline that ends the line, less 41
-            "vpcmpeqb ymm4, ymm12, ymmword ptr [r15 + 9]",           // commas and quotes of the 32 bytes before it
-            "vpcmpeqb ymm5, ymm13, ymmword ptr [r15 + 9]",
+            "add rbx, rsi",             // rbx: the newline that ends the line, less 41
+            "vpcmpeqb ymm4, ymm12, ymmword ptr [rbx + 9]",           // commas and quotes of the 32 bytes before it
+            "vpcmpeqb ymm5, ymm13, ymmword ptr [rbx + 9]",
             // ---- Where values end and start.
             "lea r10, [rax + 1]",       // separators: the line's start and the commas
             "rorx r12, rdx, 1",
@@ -474,7 +471,7 @@ macro_rules! define_events {
             "and r12d, 1",              // ingest opens with a quote?
             "add r11, rsi",             // ts, less 1
             "add r13, rsi",             // ingest, less 1
-            "lea rsi, [r15 + 41]",      // rsi: the newline, where the next pass starts
+            "lea rsi, [rbx + 41]",      // rsi: the newline, where the next pass starts
             // ---- ts: the form the memo knows.
             "mov rax, qword ptr [r11 + 20]",
             "and rax, qword ptr [rdi + r10*8 + {t_fmask}]",
@@ -653,7 +650,6 @@ macro_rules! define_events {
             "jb 2b",
             "mov eax, 7",               // no line may start here
             "99:",
-            "mov qword ptr [rdi + {s_line}], rbx",
             "mov rbx, qword ptr [rdi + {s_rbx}]",
             // ---- Out of line.
             ".pushsection .text.unlikely.ss_ka,\"ax\",@progbits",
@@ -783,7 +779,6 @@ macro_rules! define_events {
             c_bias = const offset_of!(K, c_bias),
             n_c = const offset_of!(K, n_c),
             n_q = const offset_of!(K, n_q),
-            n_nl = const offset_of!(K, n_nl),
             xspan = const offset_of!(K, xspan),
             wso = const offset_of!(K, wso),
             rbias = const offset_of!(K, rbias),
@@ -864,8 +859,7 @@ define_events!(
         "vpcmpeqb ymm7, ymm13, ymmword ptr [rsi + 32]",
         "shl r10, 32",
         "or rax, r10",
-        "tzcnt rax, rax",
-        "mov qword ptr [rdi + {n_nl}], rax",
+        "tzcnt rbx, rax",           // (rbx: where the next line's newline is)
         "shl r14, 32",
         "or rdx, r14",
         "mov qword ptr [rdi + {n_c}], rdx",
@@ -896,8 +890,7 @@ define_events!(
         "vpcmpeqb k2, zmm12, zmmword ptr [rsi]",
         "vpcmpeqb k3, zmm13, zmmword ptr [rsi]",
         "kmovq rax, k1",
-        "tzcnt rax, rax",
-        "mov qword ptr [rdi + {n_nl}], rax",
+        "tzcnt rbx, rax",           // (rbx: where the next line's newline is)
         "kmovq rax, k2",
         "mov qword ptr [rdi + {n_c}], rax",
         "kmovq rax, k3",
