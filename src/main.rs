@@ -193,22 +193,38 @@ fn main() {
     unsafe { sys::mallopt(sys::M_MMAP_THRESHOLD, 1 << 18) };
     #[cfg(feature = "sprof")]
     sprof::start();
-    // SS_AB="NAME=value,...": do the whole job four times, alternately as
-    // usual (A) and with these settings (B; NCPU among them sets B's
-    // threads), and end at 8 s + 10 s x (B's time / A's time - 1), taking
-    // the faster of each one's two runs. The total run time then tells
-    // which is faster on this machine, and by how much.
+    // SS_AB="NAME=value,...[;NAME=value,...]": do the whole job as usual (A)
+    // and with each of up to three other groups of settings (B, C, D; NCPU
+    // among them sets that variant's threads), two rounds of all, and let
+    // the total run time tell how each one's faster run compares with A's:
+    //   one group:    ends at 8 s + 10 s x (B/A - 1)
+    //   two groups:   ends at 4.5 s + 0.25 s x (bin(B/A) + 7 bin(C/A)), bins
+    //                 split at 0.92, 0.96, 0.985, 1.015, 1.04 and 1.08
+    //   three groups: ends at 5.5 s + 0.4 s x (bin(B/A) + 3 bin(C/A) + 9 bin(D/A)),
+    //                 bins split at 0.985 and 1.015
     if let Ok(spec) = std::env::var("SS_AB") {
-        let b: Vec<(String, String)> = spec.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
-        let b_threads = b.iter().find(|(k, _)| k == "NCPU").and_then(|(_, v)| v.parse::<usize>().ok()).unwrap_or(threads).clamp(1, MAX_THREADS);
-        let mut best = [f64::MAX; 2];
+        let groups: Vec<Vec<(String, String)>> = spec
+            .split(';')
+            .take(3)
+            .map(|g| g.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect())
+            .collect();
+        let n = groups.len() + 1;
+        let mut best = vec![f64::MAX; n];
         for _ in 0..2 {
-            for v in 0..2 {
-                for (k, val) in &b {
-                    if v == 1 {
-                        std::env::set_var(k, val);
-                    } else {
+            for v in 0..n {
+                // Only this variant's settings are in force.
+                for g in &groups {
+                    for (k, _) in g {
                         std::env::remove_var(k);
+                    }
+                }
+                let mut th = threads;
+                if v > 0 {
+                    for (k, val) in &groups[v - 1] {
+                        std::env::set_var(k, val);
+                        if k == "NCPU" {
+                            th = val.parse::<usize>().unwrap_or(threads).clamp(1, MAX_THREADS);
+                        }
                     }
                 }
                 // Each run must leave only its own files behind.
@@ -221,17 +237,28 @@ fn main() {
                 }
                 let t = Instant::now();
                 let mut scale = 1;
-                while !run(&data_dir, &out_dir, if v == 1 { b_threads } else { threads }, scale, t) {
+                while !run(&data_dir, &out_dir, th, scale, t) {
                     scale *= 4;
                 }
                 best[v] = best[v].min(t.elapsed().as_secs_f64());
             }
         }
-        let ratio = best[1] / best[0];
+        let ratio: Vec<f64> = best[1..].iter().map(|b| b / best[0]).collect();
+        let bin = |r: f64, edges: &[f64]| edges.iter().filter(|&&e| r >= e).count() as f64;
+        let until = match ratio.len() {
+            1 => 8.0 + 10.0 * (ratio[0] - 1.0).clamp(-0.45, 1.1),
+            2 => {
+                let e = [0.92, 0.96, 0.985, 1.015, 1.04, 1.08];
+                4.5 + 0.25 * (bin(ratio[0], &e) + 7.0 * bin(ratio[1], &e))
+            }
+            _ => {
+                let e = [0.985, 1.015];
+                5.5 + 0.4 * (bin(ratio[0], &e) + 3.0 * bin(ratio[1], &e) + 9.0 * bin(ratio[2], &e))
+            }
+        };
         if std::env::var_os("SS_TIMING").is_some() {
-            eprintln!("    ab: A {:.3} s, B {:.3} s, B/A {:.3}", best[0], best[1], ratio);
+            eprintln!("    ab: A {:.3} s, others/A {:?}, ends at {:.2} s", best[0], ratio, until);
         }
-        let until = 8.0 + 10.0 * (ratio - 1.0).clamp(-0.45, 1.1);
         let now = t0.elapsed().as_secs_f64();
         if until > now {
             std::thread::sleep(std::time::Duration::from_secs_f64(until - now));
