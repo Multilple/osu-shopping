@@ -1027,10 +1027,10 @@ fn dedup_bucket(b: usize, outs: &[&DOut], dn: &Dn, me: &mut AOut) {
     }
     let ns = 1usize << dn.kb;
     let sm2 = ((ns - 1) << 1) as u64;
-    if me.w.len() != ns {
+    if me.w.len() != ns + 1 {
         // (Every later bucket finds the table as the walk below leaves it.)
         me.w.clear();
-        me.w.resize(ns, [u64::MAX; 2]);
+        me.w.resize(ns + 1, [u64::MAX; 2]);
     }
     me.purch.clear();
     let w = me.w.as_mut_ptr() as *mut u64;
@@ -1044,6 +1044,8 @@ fn dedup_bucket(b: usize, outs: &[&DOut], dn: &Dn, me: &mut AOut) {
         prices.push(ext);
         true
     };
+    // (The entry after the table's last: see below.)
+    let side = unsafe { w.add(2 * ns) };
     for o in outs {
         // Where the table holds a kept purchase whose price is in the next piece.
         let mut wants: Option<usize> = None;
@@ -1083,11 +1085,12 @@ fn dedup_bucket(b: usize, outs: &[&DOut], dn: &Dn, me: &mut AOut) {
                         continue;
                     }
                     let cur = w.add((w1 & sm2) as usize);
-                    // (Copies with equal ingest times are identical.)
-                    if w0 < *cur {
-                        *cur = w0;
-                        *cur.add(1) = w1;
-                    }
+                    // (Copies with equal ingest times are identical.) A copy
+                    // that is not kept is written to the side, not skipped
+                    // by a branch.
+                    let dst = std::hint::select_unpredictable(w0 < *cur, cur, side);
+                    *dst = w0;
+                    *dst.add(1) = w1;
                 }
             }
         }
