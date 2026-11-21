@@ -372,6 +372,7 @@ pub fn report(data_dir: &std::path::Path, threads: usize, par: &dyn Fn(usize, &(
 
     // How fast is a thread, alone and with the others busy?
     eprintln!("-- spin: seconds for 2e8 steps: chain (clock) and wide (throughput), slowest and fastest thread");
+    let mut spins: Vec<String> = Vec::new();
     for &t in &[1usize, 2, 4, 6, 8, 12, 16] {
         if t > threads.max(1) * 2 {
             break;
@@ -385,7 +386,9 @@ pub fn report(data_dir: &std::path::Path, threads: usize, par: &dyn Fn(usize, &(
         let mm = |f: fn(&(f64, f64)) -> f64| (r.iter().map(f).fold(0.0, f64::max), r.iter().map(f).fold(f64::MAX, f64::min));
         let (c, w) = (mm(|x| x.0), mm(|x| x.1));
         eprintln!("   {t:>2} threads: chain {:.3}..{:.3}  wide {:.3}..{:.3}", c.1, c.0, w.1, w.0);
+        spins.push(format!("{t}:{:.2}-{:.2}/{:.2}-{:.2}", c.1, c.0, w.1, w.0));
     }
+    put(format!("S {}", spins.join(" ")));
     eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
 
     // Counting commas in 2 MB, 400 times: AVX2 against AVX-512.
@@ -409,11 +412,13 @@ pub fn report(data_dir: &std::path::Path, threads: usize, par: &dyn Fn(usize, &(
         let b = if has512 { run(true) } else { 0.0 };
         let c = run(false);
         eprintln!("   {t:>2} threads: {a:.2}  {b:.2}  {c:.2}");
+        put(format!("V{t} {a:.2}/{b:.2}/{c:.2}"));
     }
     eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
 
     // Fresh memory: what a first touch costs, with small pages and with huge ones.
     eprintln!("-- first touch of 256 MB per thread: seconds (wall), system CPU seconds, faults");
+    let mut touches: Vec<String> = Vec::new();
     for &(t, huge) in &[(1usize, false), (1, true), (threads, false), (threads, true)] {
         let (_, s0, f0) = sys::usage();
         let w = Instant::now();
@@ -433,7 +438,9 @@ pub fn report(data_dir: &std::path::Path, threads: usize, par: &dyn Fn(usize, &(
         });
         let (_, s1, f1) = sys::usage();
         eprintln!("   {t:>2} threads, huge {huge}: {:.3} s, sys {:.3} s, faults {}", w.elapsed().as_secs_f64(), (s1 - s0) / 1e3, f1 - f0);
+        touches.push(format!("{t}{}:{:.3}/{:.3}/{}", if huge { 'h' } else { 's' }, w.elapsed().as_secs_f64(), (s1 - s0) / 1e3, f1 - f0));
     }
+    put(format!("T {}", touches.join(" ")));
     eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
 
     // Reading the input: mapped (plain, and populated ahead), and read into a buffer.
@@ -442,6 +449,7 @@ pub fn report(data_dir: &std::path::Path, threads: usize, par: &dyn Fn(usize, &(
     files.sort();
     files.reverse();
     eprintln!("-- input pages: seconds per GB, system CPU seconds per GB, faults per GB");
+    let mut inputs: Vec<String> = Vec::new();
     let total: u64 = files.iter().map(|f| f.0).sum();
     for mode in ["map", "map+populate", "read 64 KB", "map again"] {
         use std::os::unix::io::AsRawFd;
@@ -496,7 +504,9 @@ pub fn report(data_dir: &std::path::Path, threads: usize, par: &dyn Fn(usize, &(
         let (_, s1, f1) = sys::usage();
         let gb = total as f64 / 1e9;
         eprintln!("   {mode:<14}: {:.3} s/GB, sys {:.3} s/GB, {:.0} faults/GB", w.elapsed().as_secs_f64() / gb, (s1 - s0) / 1e3 / gb, (f1 - f0) as f64 / gb);
+        inputs.push(format!("{}:{:.3}/{:.3}/{:.0}", &mode[..mode.len().min(5)].replace(' ', ""), w.elapsed().as_secs_f64() / gb, (s1 - s0) / 1e3 / gb, (f1 - f0) as f64 / gb));
     }
+    put(format!("I {}", inputs.join(" ")));
     eprintln!("   [{:.2} s]", t0.elapsed().as_secs_f64());
 }
 
@@ -613,5 +623,116 @@ pub fn brief() -> Vec<String> {
         }
     }
     out.push(format!("mounts: {}", mounts.join(" | ")));
+    out
+}
+
+/// Stage laps of the timed runs (name, ms since the run's start, user ms, sys ms so far).
+pub static LAPS: std::sync::Mutex<Vec<(String, f64, f64, f64)>> = std::sync::Mutex::new(Vec::new());
+/// Short lines for the page (see `page`).
+pub static PAGE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn put(s: String) {
+    PAGE.lock().unwrap().push(s);
+}
+
+/// The stages recorded since lap `from` as `name wall/user/sys` (ms each, per stage).
+pub fn laps_since(from: usize, u0: f64, s0: f64) -> String {
+    let laps = LAPS.lock().unwrap();
+    let (mut w, mut u, mut s) = (0.0, u0, s0);
+    let mut out = Vec::new();
+    for (name, ms, user, sys) in laps[from.min(laps.len())..].iter() {
+        out.push(format!("{}{:.0}/{:.0}/{:.0}", &name[..2.min(name.len())], ms - w, user - u, sys - s));
+        (w, u, s) = (*ms, *user, *sys);
+    }
+    out.join(" ")
+}
+
+/// The essentials of the machine and of the measurements made, in at most
+/// 1900 characters, starting with a mark.
+pub fn page(resident: &str, secs: f64) -> String {
+    let cpuinfo = read("/proc/cpuinfo");
+    let first: Vec<&str> = cpuinfo.lines().take_while(|l| !l.trim().is_empty()).collect();
+    let field = |k: &str| first.iter().find(|l| l.starts_with(k)).and_then(|l| l.split(':').nth(1)).map(|v| v.trim().to_string()).unwrap_or_default();
+    let model = first.iter().find(|l| l.starts_with("model") && !l.starts_with("model name")).and_then(|l| l.split(':').nth(1)).map(|v| v.trim().to_string()).unwrap_or_default();
+    let mut out = String::from("\n<<<");
+    out += &format!(
+        "C {} f{}m{}s{} u{} n{} {:.0}MHz\n",
+        field("model name").replace("Intel(R) Xeon(R) ", "").replace("CPU ", ""),
+        field("cpu family"),
+        model,
+        field("stepping"),
+        field("microcode"),
+        cpuinfo.lines().filter(|l| l.starts_with("processor")).count(),
+        field("cpu MHz").parse::<f64>().unwrap_or(0.0)
+    );
+    let flags = field("flags");
+    let has: Vec<&str> = flags.split_whitespace().collect();
+    let want = [
+        "avx2", "bmi2", "adx", "avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd", "avx512_vnni", "avx512vbmi", "avx512_vbmi2", "avx512_bitalg", "avx512_vpopcntdq", "avx512ifma", "gfni", "vaes",
+        "vpclmulqdq", "sha_ni", "erms", "fsrm", "movdir64b", "amx_tile", "avx_vnni", "hypervisor", "pdpe1gb", "clwb", "rdpid",
+    ];
+    let short = |w: &str| w.replace("avx512_", "5").replace("avx512", "5");
+    out += &format!("F+ {} F- {}\n", want.iter().filter(|w| has.contains(w)).map(|w| short(w)).collect::<Vec<_>>().join(" "), want.iter().filter(|w| !has.contains(w)).map(|w| short(w)).collect::<Vec<_>>().join(" "));
+    let status = read("/proc/self/status");
+    let allowed = status.lines().find(|l| l.starts_with("Cpus_allowed_list:")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()).unwrap_or_default();
+    let mut cpus: Vec<u32> = Vec::new();
+    for part in allowed.split(',').filter(|p| !p.is_empty()) {
+        let (a, b) = match part.split_once('-') {
+            Some((a, b)) => (a.parse().unwrap_or(0), b.parse().unwrap_or(0)),
+            None => {
+                let a = part.parse().unwrap_or(0);
+                (a, a)
+            }
+        };
+        cpus.extend(a..=b.min(a + 255));
+    }
+    let mut sibs: Vec<String> = cpus.iter().take(32).map(|c| read(&format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")).trim().to_string()).collect();
+    sibs.dedup();
+    out += &format!("A {allowed} sib {}\n", sibs.join(" "));
+    if let Some(&c) = cpus.first() {
+        let caches: Vec<String> = (0..5)
+            .filter_map(|i| {
+                let f = |name: &str| read(&format!("/sys/devices/system/cpu/cpu{c}/cache/index{i}/{name}")).trim().to_string();
+                (!f("size").is_empty()).then(|| format!("{}{}{}[{}]", f("level"), &f("type")[..1.min(f("type").len())], f("size"), f("shared_cpu_list")))
+            })
+            .collect();
+        out += &format!("K {}\n", caches.join(" "));
+    }
+    let sel = |f: &str| {
+        let t = read(&format!("/sys/kernel/mm/transparent_hugepage/{f}"));
+        t.split('[').nth(1).and_then(|x| x.split(']').next()).unwrap_or("?").to_string()
+    };
+    let meminfo = read("/proc/meminfo");
+    let gb = |k: &str| meminfo.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 1048576.0;
+    let cg = |f: &str| read(&format!("/sys/fs/cgroup/{f}")).trim().replace('\n', ";");
+    out += &format!(
+        "OS {} thp {}/{} mem {:.0}G av{:.0} ca{:.1} cg {} {} {}\n",
+        read("/proc/sys/kernel/osrelease").trim(),
+        sel("enabled"),
+        sel("defrag"),
+        gb("MemTotal"),
+        gb("MemAvailable"),
+        gb("Cached"),
+        cg("cpu.max"),
+        cg("memory.max"),
+        cg("cpuset.cpus.effective")
+    );
+    let mut mounts = Vec::new();
+    for l in read("/proc/self/mounts").lines() {
+        let mut it = l.split_whitespace();
+        let (dev, at, fs) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
+        if ["/", "/data", "/output", "/scratch", "/tmp"].contains(&at) {
+            let mut buf = [0u64; 16];
+            let c = std::ffi::CString::new(at).unwrap();
+            unsafe { sys::statvfs(c.as_ptr(), &mut buf) };
+            mounts.push(format!("{at} {fs} {} {:.0}G", &dev[..dev.len().min(12)], buf[4] as f64 * buf[1] as f64 / 1e9));
+        }
+    }
+    out += &format!("FS {}\nR {resident} t{secs:.0}s\n", mounts.join("; "));
+    for l in PAGE.lock().unwrap().iter() {
+        out += l;
+        out.push('\n');
+    }
+    out.truncate(1900);
     out
 }

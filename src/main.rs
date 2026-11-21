@@ -198,10 +198,12 @@ fn main() {
         let scratch = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into())).join("diag-out");
         std::env::remove_var("SS_DIAG");
         std::env::set_var("SS_TIMING", "1");
+        let mut dev_runs: Vec<String> = Vec::new();
         for (n, th) in [(1, threads), (2, threads), (3, threads), (4, threads / 2), (5, threads / 2), (6, 1), (7, threads * 2), (8, threads)] {
             let _ = std::fs::remove_dir_all(&scratch);
             let t = Instant::now();
             let (u0, s0, f0) = util::sys::usage();
+            let l0 = diag::LAPS.lock().unwrap().len();
             eprintln!("==== run {n}: {th} threads");
             let mut scale = 1;
             while !run(&data_dir, &scratch, th.max(1), scale, t) {
@@ -209,7 +211,12 @@ fn main() {
             }
             let (u1, s1, f1) = util::sys::usage();
             eprintln!("==== run {n} took {:.1} ms, user {:.1} ms, sys {:.1} ms, faults {}", t.elapsed().as_secs_f64() * 1e3, u1 - u0, s1 - s0, f1 - f0);
+            dev_runs.push(format!("{th}:{:.0}/{:.0}/{:.0}", t.elapsed().as_secs_f64() * 1e3, u1 - u0, s1 - s0));
+            if n == 3 {
+                dev_runs.push(format!("[{}]", diag::laps_since(l0, u0, s0)));
+            }
         }
+        diag::put(format!("D {}", dev_runs.join(" ")));
         // The same at full size, on data made here by the kit's generator
         // (when it was shipped with this build and there is room for it).
         let scratch_root = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into()));
@@ -232,18 +239,20 @@ fn main() {
                 .arg(&big)
                 .status();
             eprintln!("==== generated in {:.1} s: {status:?}", t.elapsed().as_secs_f64());
-            let variants: [(&str, usize, &[(&str, &str)]); 9] = [
+            let mut big_runs: Vec<String> = vec![format!("gen{:.0}s", t.elapsed().as_secs_f64())];
+            let variants: [(&str, usize, &[(&str, &str)]); 10] = [
                 ("usual", threads, &[]),
                 ("usual", threads, &[]),
                 ("usual", threads, &[]),
                 ("read instead of map", threads, &[("SS_MMAP", "0")]),
                 ("no huge pages", threads, &[("SS_NOHUGE", "1")]),
                 ("half the threads", threads / 2, &[]),
+                ("six threads", threads * 3 / 4, &[]),
                 ("twice the threads", threads * 2, &[]),
                 ("usual", threads, &[]),
                 ("one thread", 1, &[]),
             ];
-            for (what, th, envs) in variants {
+            for (vi, (what, th, envs)) in variants.into_iter().enumerate() {
                 // (The check allows three minutes in all.)
                 if t0.elapsed().as_secs_f64() > 115.0 {
                     eprintln!("==== out of time");
@@ -255,6 +264,7 @@ fn main() {
                 let _ = std::fs::remove_dir_all(&scratch);
                 let t = Instant::now();
                 let (u0, s0, f0) = util::sys::usage();
+                let l0 = diag::LAPS.lock().unwrap().len();
                 eprintln!("==== 20M: {what}, {th} threads");
                 let mut scale = 1;
                 while !run(&big, &scratch, th.max(1), scale, t) {
@@ -262,11 +272,16 @@ fn main() {
                 }
                 let (u1, s1, f1) = util::sys::usage();
                 eprintln!("==== 20M: {what} took {:.1} ms, user {:.1} ms, sys {:.1} ms, faults {}", t.elapsed().as_secs_f64() * 1e3, u1 - u0, s1 - s0, f1 - f0);
+                big_runs.push(format!("{}{th}:{:.0}/{:.0}/{:.0}/{}k", &what[..1], t.elapsed().as_secs_f64() * 1e3, u1 - u0, s1 - s0, (f1 - f0) / 1000));
+                if vi == 2 || vi == 9 {
+                    big_runs.push(format!("[{}]", diag::laps_since(l0, u0, s0)));
+                }
                 for (k, _) in envs {
                     std::env::remove_var(k);
                 }
             }
             let _ = std::fs::remove_dir_all(&big);
+            diag::put(format!("G {}", big_runs.join(" ")));
         }
         let _ = std::fs::remove_dir_all(&scratch);
         eprintln!("==== brief (input pages in memory at the start: {resident})");
@@ -274,6 +289,12 @@ fn main() {
             eprintln!("{l}");
         }
         eprintln!("==== done after {:.1} s", t0.elapsed().as_secs_f64());
+        // The page: the essentials in under 1900 characters, many times over
+        // (only a window of the end of this log is shown).
+        let page = diag::page(&resident, t0.elapsed().as_secs_f64());
+        for _ in 0..12 {
+            eprint!("{page}");
+        }
         // SS_DIAG_END=fail: stop here with an error status, and no output.
         if std::env::var("SS_DIAG_END").as_deref() == Ok("fail") {
             std::process::exit(3);
@@ -422,6 +443,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         if log {
             let (user, sys, faults) = util::sys::usage();
             eprintln!("{:>8.1} ms  {:<28} user {:>7.1} sys {:>6.1} faults {}{}", now * 1e3, what, user, sys, faults, mem_note());
+            if !what.starts_with(' ') {
+                diag::LAPS.lock().unwrap().push((what.to_string(), now * 1e3, user, sys));
+            }
         }
         if !what.starts_with(' ') {
             if pad.as_deref().is_some_and(|p| what.starts_with(p)) {
