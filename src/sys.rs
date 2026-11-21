@@ -3,7 +3,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 extern "C" {
     pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    #[cfg(not(feature = "sp"))]
     pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    #[cfg(feature = "sp")]
+    #[link_name = "madvise"]
+    fn madvise_real(addr: *mut u8, len: usize, advice: i32) -> i32;
     pub fn _exit(code: i32) -> !;
     fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> i32;
     static environ: *const *const c_char;
@@ -60,6 +64,109 @@ pub unsafe fn release(p: *const u8, bytes: usize) {
     let b = (p as usize + bytes) & !4095;
     if b > a {
         madvise(a as *mut u8, b - a, MADV_DONTNEED);
+    }
+}
+
+#[cfg(xm)]
+pub static mut XM: [u64; 64] = [0; 64];
+#[cfg(xm)]
+static mut XM_PAGE: usize = 0;
+#[cfg(xm)]
+pub static mut XT: [u64; 128] = [0; 128];
+#[inline(always)]
+pub fn xt(_i: usize, _end: bool) {
+    #[cfg(xm)]
+    unsafe {
+        if _i < 64 {
+            XT[2 * _i + _end as usize] = std::arch::x86_64::_rdtsc()
+        }
+    }
+}
+#[inline(always)]
+pub fn xm(_i: usize) {
+    #[cfg(xm)]
+    unsafe {
+        XM[_i] = std::arch::x86_64::_rdtsc()
+    }
+}
+pub fn xm_page() {
+    #[cfg(xm)]
+    unsafe {
+        let p = mmap(std::ptr::null_mut(), 4096, 3, 1, 9, 0);
+        if (p as isize) > 4095 {
+            XM_PAGE = p as usize;
+        }
+    }
+}
+#[inline(always)]
+pub fn xm_end() {
+    #[cfg(xm)]
+    unsafe {
+        let t = std::arch::x86_64::_rdtsc();
+        if XM_PAGE != 0 {
+            let p = XM_PAGE as *mut u64;
+            for i in 0..63 {
+                p.add(8 + i).write_volatile(XM[i]);
+            }
+            for i in 0..128 {
+                p.add(128 + i).write_volatile(XT[i]);
+            }
+            p.add(8 + 63).write_volatile(t);
+        }
+    }
+}
+
+pub fn exit_release(nt: usize, fds: &[i32]) {
+    extern "C" {
+        fn close(fd: i32) -> i32;
+    }
+    if nt < 2 || POOL_N.load(Ordering::SeqCst) + 1 < nt {
+        return;
+    }
+    let mut fd = [-1i32; 2048];
+    let nf = fds.len().min(fd.len());
+    fd[..nf].copy_from_slice(&fds[..nf]);
+    let base = A_BASE.load(Ordering::Relaxed);
+    let zend = Z_END.load(Ordering::Relaxed);
+    let (z0, z1) = if base != 0 && zend != 0 { (zend - Z_SIZE, (Z_NEXT.load(Ordering::Relaxed) + 4095) & !4095) } else { (0, 0) };
+    let (h0, h1) = if base != 0 { (if zend != 0 { zend } else { base }, (A_NEXT.load(Ordering::Relaxed) + HP - 1) & !(HP - 1)) } else { (0, 0) };
+    let (fd, nh, nz) = (&fd, h1.saturating_sub(h0) / HP, z1.saturating_sub(z0) / 4096);
+    let kt = std::env::var("XL_XRELT").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(nt, |k| k.clamp(1, nt));
+    let job = |tid: usize| unsafe {
+        for &x in &fd[nf * tid / nt..nf * (tid + 1) / nt] {
+            if x >= 0 {
+                close(x);
+            }
+        }
+        if tid >= kt {
+            return;
+        }
+        let (x, y) = (h0 + nh * tid / kt * HP, h0 + nh * (tid + 1) / kt * HP);
+        if y > x {
+            madvise(x as *mut u8, y - x, MADV_DONTNEED);
+        }
+        let (x, y) = (z0 + nz * tid / kt * 4096, z0 + nz * (tid + 1) / kt * 4096);
+        if y > x {
+            madvise(x as *mut u8, y - x, MADV_DONTNEED);
+        }
+    };
+    let n = POOL_N.load(Ordering::SeqCst);
+    unsafe {
+        let r: &(dyn Fn(usize) + Sync) = &job;
+        JOB = Some(std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(r));
+        JOB_NT = nt;
+    }
+    DONE.store(0, Ordering::SeqCst);
+    GEN.fetch_add(1, Ordering::SeqCst);
+    if SLEEPERS.load(Ordering::SeqCst) != 0 {
+        unsafe { syscall(SYS_FUTEX, GEN.as_ptr(), FUTEX_WAKE_PRIVATE, i32::MAX as i64, 0usize, 0usize, 0usize) };
+    }
+    let t0 = rdtsc();
+    job(0);
+    let t1 = rdtsc();
+    let bound = 3 * (t1 - t0) + 200_000;
+    while DONE.load(Ordering::Acquire) != n && rdtsc() - t1 < bound {
+        std::hint::spin_loop();
     }
 }
 
@@ -1203,6 +1310,149 @@ unsafe impl std::alloc::GlobalAlloc for Alloc {
     }
 }
 
+
+#[cfg(feature = "sp")]
+pub unsafe fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32 {
+    let t = sp::ns();
+    let r = madvise_real(addr, len, advice);
+    let k = sp::cls(advice);
+    sp::MADV[k][0].fetch_add(1, Ordering::Relaxed);
+    sp::MADV[k][1].fetch_add(sp::ns() - t, Ordering::Relaxed);
+    sp::MADV[k][2].fetch_add(len as u64, Ordering::Relaxed);
+    r
+}
+#[cfg(feature = "sp")]
+pub mod sp {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static MADV: [[AtomicU64; 3]; 6] = [const { [const { AtomicU64::new(0) }; 3] }; 6];
+    pub const NAMES: [&str; 6] = ["DONTNEED", "POPW", "HUGE", "NOHUGE", "SEQ", "other"];
+    pub fn cls(a: i32) -> usize {
+        match a {
+            4 => 0,
+            23 => 1,
+            14 => 2,
+            15 => 3,
+            2 => 4,
+            _ => 5,
+        }
+    }
+    pub fn ns() -> u64 {
+        let mut t = super::Timespec { s: 0, ns: 0 };
+        unsafe { super::clock_gettime(1, &mut t) };
+        t.s as u64 * 1_000_000_000 + t.ns as u64
+    }
+    pub fn ru(who: i32) -> [i64; 3] {
+        extern "C" {
+            fn getrusage(who: i32, ru: *mut [i64; 18]) -> i32;
+        }
+        let mut r = [0i64; 18];
+        unsafe { getrusage(who, &mut r) };
+        [r[0] * 1_000_000 + r[1], r[2] * 1_000_000 + r[3], r[8]]
+    }
+    const VK: [&str; 5] = ["thp_fault_alloc", "nr_tlb_remote_flush", "nr_tlb_remote_flush_received", "pgfree", "thp_fault_fallback"];
+    fn vm() -> [i64; 5] {
+        let mut o = [0i64; 5];
+        if let Ok(s) = std::fs::read_to_string("/proc/vmstat") {
+            for l in s.lines() {
+                let mut it = l.split_whitespace();
+                let (k, v) = (it.next().unwrap_or(""), it.next().unwrap_or("0"));
+                if let Some(i) = VK.iter().position(|x| *x == k) {
+                    o[i] = v.parse().unwrap_or(0);
+                }
+            }
+        }
+        o
+    }
+    pub struct Row {
+        name: &'static str,
+        t: u64,
+        ru: [i64; 3],
+        vm: [i64; 5],
+        madv: [[u64; 3]; 6],
+    }
+    pub static mut ROWS: Vec<Row> = Vec::new();
+    pub static PT: [[AtomicU64; 3]; 16] = [const { [const { AtomicU64::new(0) }; 3] }; 16];
+    pub static ZT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    #[inline(never)]
+    pub fn zero_touch(p: *mut u8) {
+        let t = ns();
+        unsafe { std::ptr::write_volatile(p, 0) };
+        ZT[0].fetch_add(ns() - t, Ordering::Relaxed);
+        ZT[1].fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline(never)]
+    pub fn input_touch(p: *const u8, n: usize) {
+        let t = ns();
+        let mut o = 0;
+        let mut x = 0u8;
+        while o < n {
+            x = x.wrapping_add(unsafe { std::ptr::read_volatile(p.add(o)) });
+            o += 4096;
+        }
+        std::hint::black_box(x);
+        ZT[2].fetch_add(ns() - t, Ordering::Relaxed);
+        ZT[3].fetch_add((n / 4096) as u64, Ordering::Relaxed);
+    }
+    pub fn thread_add(tid: usize, a: [i64; 3], b: [i64; 3]) {
+        if tid < 16 {
+            for k in 0..3 {
+                PT[tid][k].fetch_add((b[k] - a[k]) as u64, Ordering::Relaxed);
+            }
+        }
+    }
+    #[allow(static_mut_refs)]
+    pub fn snap(name: &'static str) {
+        let mut madv = [[0u64; 3]; 6];
+        for k in 0..6 {
+            for j in 0..3 {
+                madv[k][j] = MADV[k][j].load(Ordering::Relaxed);
+            }
+        }
+        let r = Row { name, t: ns(), ru: ru(0), vm: vm(), madv };
+        unsafe { ROWS.push(r) };
+    }
+    #[allow(static_mut_refs)]
+    pub fn report() {
+        unsafe {
+            if ROWS.capacity() < 64 {
+            }
+            for w in ROWS.windows(2) {
+                let (a, b) = (&w[0], &w[1]);
+                let mut s = String::new();
+                for k in 0..6 {
+                    let n = b.madv[k][0] - a.madv[k][0];
+                    if n > 0 {
+                        s.push_str(&format!(" {}:{}x/{:.2}ms/{:.0}MB", NAMES[k], n, (b.madv[k][1] - a.madv[k][1]) as f64 / 1e6, (b.madv[k][2] - a.madv[k][2]) as f64 / 1048576.0));
+                    }
+                }
+                eprintln!(
+                    "[sp] {:>8} wall {:7.2} user {:7.2} sys {:6.2} minflt {:6} thp {:4} tlbfl {:4} tlbrecv {:5} pgfree {:7} thpfb {}{}",
+                    b.name,
+                    (b.t - a.t) as f64 / 1e6,
+                    (b.ru[0] - a.ru[0]) as f64 / 1e3,
+                    (b.ru[1] - a.ru[1]) as f64 / 1e3,
+                    b.ru[2] - a.ru[2],
+                    b.vm[0] - a.vm[0],
+                    b.vm[1] - a.vm[1],
+                    b.vm[2] - a.vm[2],
+                    b.vm[3] - a.vm[3],
+                    b.vm[4] - a.vm[4],
+                    s
+                );
+            }
+            let mut s = String::new();
+            for t in 0..16 {
+                let v: Vec<u64> = (0..3).map(|k| PT[t][k].load(Ordering::Relaxed)).collect();
+                if v[0] + v[1] > 0 {
+                    s.push_str(&format!(" t{t}:{:.1}/{:.1}/{}", v[0] as f64 / 1e3, v[1] as f64 / 1e3, v[2]));
+                }
+            }
+            eprintln!("[sp] parse per thread user/sys ms/minflt:{s}");
+            eprintln!("[sp] block first touch: {} blocks {:.2} thread-ms ({:.1} us each); input pre-touch {} pages {:.2} thread-ms", ZT[1].load(Ordering::Relaxed), ZT[0].load(Ordering::Relaxed) as f64 / 1e6, ZT[0].load(Ordering::Relaxed) as f64 / 1e3 / ZT[1].load(Ordering::Relaxed).max(1) as f64, ZT[3].load(Ordering::Relaxed), ZT[2].load(Ordering::Relaxed) as f64 / 1e6);
+        }
+    }
+}
+
 pub static mut LAPS: Vec<(&'static str, f64)> = Vec::new();
 pub static mut LAST: Option<std::time::Instant> = None;
 #[allow(static_mut_refs)]
@@ -1222,6 +1472,8 @@ pub fn lap(name: &'static str) {
             }
         }
         LAST = Some(now);
+        #[cfg(feature = "sp")]
+        sp::snap(name);
         #[cfg(feature = "tl")]
         mp::report(name);
     }

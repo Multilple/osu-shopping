@@ -9,7 +9,7 @@ It reads shopping events, ad clicks and linked user IDs from `/data` and writes 
 
 This entry is built on **Team 67's Express Lane**
 (https://github.com/jason-scheffel/express-lane), commit
-`498cef62bb42b3a015be9a4ae7b5985a56c3ca24`, released under the MIT License.
+`078e7606fe6ca92811cf941b0c8830c686cb1269`, released under the MIT License.
 The Rust sources in `src/`, the build settings in `.cargo/` and the Dockerfile
 come from that project. Changes made by Team Wix are listed in `CHANGES.md`.
 See `THIRD_PARTY_NOTICES.md` and `LICENSE`.
