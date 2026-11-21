@@ -1694,10 +1694,11 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         }
     }
     let mut tasks = Vec::new();
-    let piece = env_usize("SS_PIECE", if mapped { 256 << 10 } else { chunk });
+    let piece = env_usize("SS_PIECE", if mapped { 4 << 20 } else { chunk });
     grid_tasks(&event_files, true, piece, &mut tasks);
     grid_tasks(&click_files, false, piece, &mut tasks);
     let next = AtomicUsize::new(0);
+    let populate = env_usize("SS_POP", 1) != 0;
     {
         let (dn, ctx) = (&dn, &ctx);
         par(threads, |tid| {
@@ -1707,6 +1708,9 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
                 let Some(task) = tasks.get(i) else { break };
                 let src = if task.events { &event_files[task.file] } else { &click_files[task.file] };
                 if src.mapped() {
+                    if populate {
+                        src.populate(task.a, task.b);
+                    }
                     let (buf, start, end) = src.view(task.a, task.b);
                     if task.events {
                         parse_events(buf, start, end, ctx, dn, out);
