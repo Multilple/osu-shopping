@@ -666,6 +666,7 @@ fn settle_links(dn: &mut Dn, threads: usize) {
     }
     let odd: Vec<(u32, u32)> = found.into_iter().flat_map(|m| m.into_inner().unwrap()).collect();
     let n_ext = dn.users.read().unwrap().list.len();
+    let t_serial = std::time::Instant::now();
     // Every root of a set that holds an interned ID or spans persons.
     let mut person_of_root: HashMap<u32, u32> = HashMap::new();
     let mut roots: Vec<u32> = odd.iter().map(|&(_, r)| r).collect();
@@ -704,6 +705,9 @@ fn settle_links(dn: &mut Dn, threads: usize) {
     let total = dn.users.read().unwrap().list.len();
     dn.ext_person = (0..total).map(|k| if k < n_ext { person_of_root[&dn.find((d + k) as u32)] } else { (d + k) as u32 }).collect();
     dn.direct_special = direct_special;
+    if std::env::var_os("SS_TIMING").is_some() {
+        eprintln!("    settle: {} odd nodes, {} interned users, {} roots; serial part {:.2} ms", odd.len(), n_ext, roots.len(), t_serial.elapsed().as_secs_f64() * 1e3);
+    }
 }
 
 // ---------------------------------------------------------------- parse
