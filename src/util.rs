@@ -441,3 +441,59 @@ pub fn parse_price(b: &[u8]) -> Option<u32> {
         _ => None,
     }
 }
+
+// ---------------------------------------------------------------- link map
+
+/// user ID -> person name, for IDs that are not their own name. Key and value
+/// share a slot so a lookup touches one cache line.
+pub struct LinkMap {
+    slots: Vec<[Key; 2]>,
+    shift: u32,
+    mask: usize,
+}
+
+impl LinkMap {
+    pub fn with_capacity(n: usize) -> LinkMap {
+        let cap = (n.max(8) * 2).next_power_of_two();
+        LinkMap { slots: vec![[0, 0]; cap], shift: 64 - cap.trailing_zeros(), mask: cap - 1 }
+    }
+
+    pub fn set(&mut self, k: Key, v: Key) {
+        let mut i = (hash64(k) >> self.shift) as usize;
+        loop {
+            let s = &mut self.slots[i];
+            if s[0] == 0 || s[0] == k {
+                *s = [k, v];
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    pub fn prefetch(&self, k: Key) {
+        let i = (hash64(k) >> self.shift) as usize;
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(
+                self.slots.as_ptr().add(i) as *const i8,
+                core::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+    }
+
+    /// The person an ID belongs to.
+    #[inline(always)]
+    pub fn person(&self, k: Key) -> Key {
+        let mut i = (hash64(k) >> self.shift) as usize;
+        loop {
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s[0] == k {
+                return s[1];
+            }
+            if s[0] == 0 {
+                return k;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
