@@ -109,7 +109,7 @@ const ROW_F2_MINUS: usize = 7;
 const ROWS: usize = 9;
 
 /// Room for the direct campaign table: keys in the first half, values in the second.
-const CAMP_CAP: usize = 1 << 19;
+pub(crate) const CAMP_CAP: usize = 1 << 19;
 /// The most bits of a campaign field that index its block.
 const CAMP_BITS: u32 = 17;
 
@@ -311,7 +311,7 @@ fn ts_civil(sign: u8, q: usize, tbl: *const DayEnt) -> TsRow {
 }
 
 /// The date of day number `z` (days since 1970-01-01).
-fn civil_of_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_of_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -324,6 +324,12 @@ fn civil_of_days(z: i64) -> (i64, i64, i64) {
 }
 
 impl Cx {
+    /// The direct campaign table's rows by `raw length + 1`: the bytes that
+    /// are the field, the block, the bits that index it (see `Tables`).
+    pub(crate) fn camp_rows(&self) -> Option<(&[u64; 65], &[*const u64; 65], &[u64; 65])> {
+        self.t.as_deref().map(|t| (&t.cmask, &t.cbase, &t.cpm))
+    }
+
     pub(crate) fn new(ctx: &Ctx, dn: &Dn) -> Cx {
         let mut t: Box<Tables> = unsafe { Box::<Tables>::new_zeroed().assume_init() };
         let cws = ctx.cws;
@@ -691,7 +697,7 @@ unsafe fn camp_miss(p: *const u8, a2: usize, a3: usize, r3: usize, ctx: &Ctx, t:
 /// (so the first two commas are the ones around it), as a node and its stream.
 #[cold]
 #[inline(never)]
-unsafe fn user_slow(p: *const u8, dn: &Dn) -> (u64, u64) {
+pub(crate) unsafe fn user_slow(p: *const u8, dn: &Dn) -> (u64, u64) {
     let head = std::slice::from_raw_parts(p, 26);
     let c1 = memchr(b',', head).unwrap();
     let c2 = c1 + 1 + memchr(b',', &head[c1 + 1..]).unwrap();
@@ -903,6 +909,65 @@ unsafe fn kernel<S: Sink>(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: 
         p = z.add(r3 + 3);
     }
     p.offset_from(env.file.as_ptr()) as usize
+}
+
+/// The line starting at `file[s]` by the plain rules (for the assembly
+/// kernel): returns where the next line starts, or `usize::MAX` when it does
+/// not end before `end`.
+#[cold]
+#[inline(never)]
+pub(crate) unsafe fn plain_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
+    match memchr(b'\n', &file[s..end]) {
+        Some(i) => {
+            let line = &file[s..s + i];
+            if !dropped_at_a_glance(line) {
+                if let Some((stream, w0, w1)) = click_record(line, ctx, dn) {
+                    out.put(stream, w0, w1);
+                }
+            }
+            s + i + 1
+        }
+        None => usize::MAX,
+    }
+}
+
+/// The rest of the line at `file[s]` the way the fast path above takes it,
+/// for the assembly kernel, which has checked its IDs (the click's number
+/// `tc`, the user's `tu`, both as `unscramble_top` gives them) and found its
+/// commas at `a2`, `a3` and the newline `r3` after the third (as here), but
+/// not the campaign in the direct table (`camp` is `None`) or not the
+/// timestamp in its rows (`date_only`: its end was fine). Returns where the
+/// next line starts, or `usize::MAX` when the line does not end before `end`.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn slow_line(file: &[u8], s: usize, end: usize, a2: usize, a3: usize, r3: usize, camp: Option<u64>, date_only: bool, tc: u64, tu: u64, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
+    let t: &Tables = dn.ckx.t.as_deref().unwrap_unchecked();
+    let p = file.as_ptr().add(s);
+    let next = s + a3 + r3 + 3;
+    let camp = match camp {
+        Some(c) => c,
+        None => match camp_miss(p, a2, a3, r3, ctx, t) {
+            CAMP_COLD => return plain_line(file, s, end, ctx, dn, out),
+            CAMP_DROP => return next,
+            c => c,
+        },
+    };
+    let ms = match ts_cold(p.add(a3 + 2), r3, t, date_only) {
+        TS_COLD => return plain_line(file, s, end, ctx, dn, out),
+        TS_DROP => return next,
+        r => r as u64,
+    };
+    if ms >= t.span {
+        return next;
+    }
+    let mut node = _pext_u64(tu, t.node_mask);
+    let mut stream = _pext_u64(tu, t.stream_mask);
+    if (tu & t.alias_hi != 0) | (node >= t.max_node) {
+        (node, stream) = user_slow(p, dn);
+    }
+    out.put(stream as usize, (ms << 32).wrapping_add(camp), node | tc << 8);
+    next
 }
 
 /// SS_CKVERIFY: the kernel's records for `file[start..rest]` against the

@@ -17,6 +17,7 @@ mod dense;
 #[cfg(feature = "lab")]
 mod lab;
 mod dense_ck;
+mod dense_cka;
 mod dense_lk;
 mod dense_ev;
 mod dense_ka;
