@@ -1820,11 +1820,16 @@ impl Click for Ckl {
     }
 }
 
-/// user_daily rows, already in Parquet's PLAIN encoding except `cat`.
+/// user_daily rows, already in Parquet's PLAIN encoding except `cat` and
+/// `user`: that holds one PLAIN entry per run of rows of the same person,
+/// and `runs` the number of rows of each.
 #[derive(Default)]
 struct Rows {
     n: usize,
     user: Vec<u8>,
+    runs: Vec<u32>,
+    /// The person of the last entry of `user`.
+    last: Option<Key>,
     day: Vec<u8>,
     sessions: Vec<u8>,
     events: Vec<u8>,
@@ -1845,7 +1850,7 @@ impl Rows {
             }
             v
         }
-        Rows { n: 0, user: big(n * 14), day: big(n * 4), sessions: big(n * 4), events: big(n * 4), rev: big(n * 8), cat: big(n) }
+        Rows { n: 0, user: big(n * 6), runs: big(n / 2), last: None, day: big(n * 4), sessions: big(n * 4), events: big(n * 4), rev: big(n * 8), cat: big(n) }
     }
 }
 
@@ -2357,6 +2362,25 @@ fn flush_row(who: Key, day: u32, sessions: u32, events: u32, rev: u64, tl: &mut 
 fn emit_row(who: Key, day: u32, sessions: u32, events: u32, rev: u64, best: u16, tl: &mut Tl) {
     let rows = &mut tl.rows;
     rows.n += 1;
+    user_run(rows, who, 1);
+    rows.day.extend_from_slice(&(tl.day0 + day as i32).to_le_bytes());
+    rows.sessions.extend_from_slice(&sessions.to_le_bytes());
+    rows.events.extend_from_slice(&events.to_le_bytes());
+    rows.rev.extend_from_slice(&rev.to_le_bytes());
+    rows.cat.push(best);
+}
+
+/// The person of the next `k` rows (pushed before or after this): extends
+/// the last run when it is theirs, else starts one. (Equal keys are equal
+/// IDs, so a run is always one ID.)
+#[inline(always)]
+fn user_run(rows: &mut Rows, who: Key, k: u32) {
+    if rows.last == Some(who) {
+        *rows.runs.last_mut().unwrap() += k;
+        return;
+    }
+    rows.last = Some(who);
+    rows.runs.push(k);
     if is_long(who) {
         let mut bytes = Vec::new();
         key_bytes(who, &mut bytes);
@@ -2374,11 +2398,6 @@ fn emit_row(who: Key, day: u32, sessions: u32, events: u32, rev: u64, best: u16,
             rows.user.set_len(at + 4 + len);
         }
     }
-    rows.day.extend_from_slice(&(tl.day0 + day as i32).to_le_bytes());
-    rows.sessions.extend_from_slice(&sessions.to_le_bytes());
-    rows.events.extend_from_slice(&events.to_le_bytes());
-    rows.rev.extend_from_slice(&rev.to_le_bytes());
-    rows.cat.push(best);
 }
 
 // ====================================================================== output
@@ -2390,17 +2409,75 @@ fn plain_bytes<'a>(out: &mut Vec<u8>, values: impl Iterator<Item = &'a [u8]>) {
     }
 }
 
+/// user_id: a dictionary of the runs' entries and an RLE run per run of
+/// rows, when that is smaller than PLAIN (one entry per row).
+fn user_column(entries: Vec<u8>, runs: &[u32], n: usize) -> (Option<(Vec<u8>, usize)>, Vec<u8>) {
+    let d = runs.len();
+    debug_assert_eq!(runs.iter().map(|&r| r as usize).sum::<usize>(), n);
+    if d == 0 {
+        return (None, entries);
+    }
+    let width = parquet::bit_width(d as u32 - 1).max(1);
+    let vb = (width as usize).div_ceil(8);
+    let mut data: Vec<u8> = Vec::with_capacity(1 + d * (6 + vb) + 8);
+    let mut plain = 0usize;
+    let mut at = 0usize;
+    unsafe {
+        let (src, op) = (entries.as_ptr(), data.as_mut_ptr());
+        *op = width as u8;
+        let mut o = 1usize;
+        for (i, &r) in runs.iter().enumerate() {
+            let size = 4 + (src.add(at) as *const u32).read_unaligned() as usize;
+            plain += size * r as usize;
+            at += size;
+            let mut h = (r as u64) << 1;
+            while h >= 0x80 {
+                *op.add(o) = (h as u8) | 0x80;
+                o += 1;
+                h >>= 7;
+            }
+            // The header's last byte, then the index (vb of its 4 bytes).
+            (op.add(o) as *mut u64).write_unaligned(h | (i as u64) << 8);
+            o += 1 + vb;
+        }
+        data.set_len(o);
+    }
+    debug_assert_eq!(at, entries.len());
+    if entries.len() + data.len() < plain {
+        return (Some((entries, d)), data);
+    }
+    // Every entry once per row.
+    let mut out = Vec::with_capacity(plain);
+    let mut at = 0usize;
+    for &r in runs {
+        let size = 4 + u32::from_le_bytes(entries[at..at + 4].try_into().unwrap()) as usize;
+        for _ in 0..r {
+            out.extend_from_slice(&entries[at..at + size]);
+        }
+        at += size;
+    }
+    (None, out)
+}
+
 fn write_user_daily(path: &Path, rows: &mut Rows, ctx: &Ctx) {
     let n = rows.n;
     if SUM_ON.load(Relaxed) {
         let (mut at, mut sum) = (0usize, 0u64);
+        let (mut run, mut left, mut len) = (0usize, 0u32, 0usize);
         for i in 0..n {
-            let len = u32::from_le_bytes(rows.user[at..at + 4].try_into().unwrap()) as usize;
+            if left == 0 {
+                if run > 0 {
+                    at += 4 + len;
+                }
+                len = u32::from_le_bytes(rows.user[at..at + 4].try_into().unwrap()) as usize;
+                left = rows.runs[run];
+                run += 1;
+            }
+            left -= 1;
             let mut h = len as u64;
             for &b in &rows.user[at + 4..at + 4 + len] {
                 h = mix(h, b as u64);
             }
-            at += 4 + len;
             let w = |v: &Vec<u8>| u32::from_le_bytes(v[4 * i..4 * i + 4].try_into().unwrap()) as u64;
             for v in [w(&rows.day), w(&rows.sessions), w(&rows.events), u64::from_le_bytes(rows.rev[8 * i..8 * i + 8].try_into().unwrap()), rows.cat[i] as u64] {
                 h = mix(h, v);
@@ -2414,20 +2491,50 @@ fn write_user_daily(path: &Path, rows: &mut Rows, ctx: &Ctx) {
     plain_bytes(&mut dict, ctx.aux.cat_names.iter().map(|c| c.as_slice()));
     let width = parquet::bit_width(ctx.aux.cat_names.len() as u32 - 1).max(1);
     let mut cat = Vec::with_capacity(n);
-    parquet::def_levels(&mut cat, rows.cat.iter().map(|&c| c != NOCAT));
-    cat.push(width as u8);
+    parquet::def_levels(&mut cat, n, |i| rows.cat[i] != NOCAT);
     let present: Vec<u32> = rows.cat.iter().filter(|&&c| c != NOCAT).map(|&c| c as u32).collect();
     if !present.is_empty() {
-        parquet::bitpack_run(&mut cat, present.into_iter(), width);
+        parquet::dict_indices(&mut cat, present.len(), width, |i| present[i]);
+    } else {
+        cat.push(width as u8);
     }
     let col = |name, ptype, optional, logical, dict, data| Column { name, ptype, optional, logical, dict, data };
-    let take = std::mem::take::<Vec<u8>>;
+    // A column as a dictionary page and bit-packed indices when that is
+    // smaller, else PLAIN as it was pushed.
+    let enc = |dict: Option<(Vec<u8>, usize, Vec<u8>)>, plain: Vec<u8>| match dict {
+        Some((d, nd, data)) => (Some((d, nd)), data),
+        None => (None, plain),
+    };
+    let user = user_column(std::mem::take(&mut rows.user), &rows.runs, n);
+    rows.runs.clear();
+    rows.last = None;
+    let i32col = |plain: Vec<u8>| enc(parquet::dict_i32(&plain), plain);
+    let day = i32col(std::mem::take(&mut rows.day));
+    let sessions = i32col(std::mem::take(&mut rows.sessions));
+    let events = i32col(std::mem::take(&mut rows.events));
+    // revenue_cents as INT32 when every value fits (it is never negative).
+    let mut rev = std::mem::take(&mut rows.rev);
+    let narrow = rev.chunks_exact(8).fold(0u64, |m, c| m.max(u64::from_le_bytes(c.try_into().unwrap()))) <= i32::MAX as u64;
+    let (rev_type, rev) = if narrow {
+        // In place: value i moves from 8i to 4i, never ahead of a value not read yet.
+        unsafe {
+            let p = rev.as_mut_ptr();
+            for i in 0..n {
+                let v = (p.add(8 * i) as *const u64).read_unaligned();
+                (p.add(4 * i) as *mut u32).write_unaligned(v as u32);
+            }
+        }
+        rev.truncate(4 * n);
+        (parquet::T_INT32, i32col(rev))
+    } else {
+        (parquet::T_INT64, (None, rev))
+    };
     let columns = [
-        col("user_id", parquet::T_BYTE_ARRAY, false, Logical::String, None, take(&mut rows.user)),
-        col("day", parquet::T_INT32, false, Logical::Date, None, take(&mut rows.day)),
-        col("sessions", parquet::T_INT32, false, Logical::None, None, take(&mut rows.sessions)),
-        col("events", parquet::T_INT32, false, Logical::None, None, take(&mut rows.events)),
-        col("revenue_cents", parquet::T_INT64, false, Logical::None, None, take(&mut rows.rev)),
+        col("user_id", parquet::T_BYTE_ARRAY, false, Logical::String, user.0, user.1),
+        col("day", parquet::T_INT32, false, Logical::Date, day.0, day.1),
+        col("sessions", parquet::T_INT32, false, Logical::None, sessions.0, sessions.1),
+        col("events", parquet::T_INT32, false, Logical::None, events.0, events.1),
+        col("revenue_cents", rev_type, false, Logical::None, rev.0, rev.1),
         col("top_category", parquet::T_BYTE_ARRAY, true, Logical::String, Some((dict, ctx.aux.cat_names.len())), cat),
     ];
     parquet::write_file(path, &columns, n).unwrap();
