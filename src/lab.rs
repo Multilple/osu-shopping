@@ -266,6 +266,9 @@ pub fn main(threads: usize) -> ! {
             ("j!", threads, vec![], "3"),
             ("puf!", threads, vec![("SS_UNMAP", "final")], "2"),
             ("juf!", threads, vec![("SS_UNMAP", "final")], "3"),
+            // "a": "j" with the sessions made in the dedup walk.
+            ("a!", threads, vec![], "4"),
+            ("a", threads, vec![], "4"),
         ]);
         if !big {
             variants.extend([("p4!", 4, vec![], "2"), ("j4!", 4, vec![], "3"), ("p4", 4, vec![], "2"), ("j4", 4, vec![], "3")]);
