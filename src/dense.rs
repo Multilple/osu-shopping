@@ -1300,44 +1300,41 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
         rows.rev.set_len((r0 + nrows) * 8);
         rows.cat.set_len(r0 + nrows);
 
-        // Purchases: revenue per session and row, and the best category per day (as in `person_grid`).
-        if !me.spurch.is_empty() {
-            let ncat = tl.ncat;
-            for &pp in &me.spurch {
-                let si = (pp >> 40) as usize;
-                let s = &mut *sess.add(si);
-                let cat = ((pp >> 24) & 0x1FF) as usize;
-                let price = pp & 0xFF_FFFF;
-                s.rev += price;
-                s.purch = true;
-                let r = revp.add(*srow.add(si) as usize);
-                r.write_unaligned(r.read_unaligned() + price);
-                let k = s.day as usize * ncat + cat;
-                if tl.daycat[k] == 0 {
-                    tl.touched_dc.push(k as u32);
-                }
-                tl.daycat[k] += price;
-            }
-            for &k in &tl.touched_dc {
-                let (d, c) = (k as usize / ncat, (k as usize % ncat) as u16);
-                let sum = tl.daycat[k as usize];
-                tl.daycat[k as usize] = 0;
-                // Categories are ranked byte-wise, so the smaller index wins a tie.
-                if sum > tl.best_sum[d] || (sum == tl.best_sum[d] && c < tl.best[d]) {
-                    tl.best[d] = c;
-                    tl.best_sum[d] = sum;
-                }
-            }
-            // (A day may be here more than once: the first time leaves its
-            // best in the row, later ones find NOCAT, which is larger.)
-            for &k in &tl.touched_dc {
-                let d = k as usize / ncat;
-                let c = catp.add(*dayrow.add(d) as usize);
-                *c = (*c).min(tl.best[d]);
-                tl.best[d] = NOCAT;
-                tl.best_sum[d] = 0;
-            }
-            tl.touched_dc.clear();
+        // Purchases: revenue per session and row, and the best category per
+        // day (as in `person_grid`). Sums only grow, so the best of every
+        // sum on the way is the best of the final sums; categories are
+        // ranked byte-wise, so the smaller index wins a tie.
+        let ncat = tl.ncat;
+        let (daycat, best, best_sum) = (tl.daycat.as_mut_ptr(), tl.best.as_mut_ptr(), tl.best_sum.as_mut_ptr());
+        for &pp in &me.spurch {
+            let si = (pp >> 40) as usize;
+            let s = &mut *sess.add(si);
+            let cat = ((pp >> 24) & 0x1FF) as usize;
+            let price = pp & 0xFF_FFFF;
+            s.rev += price;
+            s.purch = true;
+            let r = revp.add(*srow.add(si) as usize);
+            r.write_unaligned(r.read_unaligned() + price);
+            let d = s.day as usize;
+            let dc = daycat.add(d * ncat + cat);
+            let sum = *dc + price;
+            *dc = sum;
+            let (bs, bc) = (*best_sum.add(d), *best.add(d));
+            let better = (sum > bs) | ((sum == bs) & ((cat as u16) < bc));
+            *best_sum.add(d) = std::hint::select_unpredictable(better, sum, bs);
+            *best.add(d) = std::hint::select_unpredictable(better, cat as u16, bc);
+        }
+        // (A day may be here more than once: the first time leaves its best
+        // in the row, later ones find NOCAT, which is larger.)
+        for &pp in &me.spurch {
+            let si = (pp >> 40) as usize;
+            let d = (*sess.add(si)).day as usize;
+            let cat = ((pp >> 24) & 0x1FF) as usize;
+            let c = catp.add(*srow.add(si) as usize);
+            *c = (*c).min(*best.add(d));
+            *best.add(d) = NOCAT;
+            *best_sum.add(d) = 0;
+            *daycat.add(d * ncat + cat) = 0;
         }
     }
     true
