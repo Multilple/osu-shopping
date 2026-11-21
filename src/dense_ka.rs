@@ -96,6 +96,10 @@ pub(crate) struct K {
     s_line: u64,
     /// (A register the loop borrows.)
     s_rbx: u64,
+    /// The next line's masks: commas, quotes, where its newline is.
+    n_c: u64,
+    n_q: u64,
+    n_nl: u64,
     // Where a run of passes stops, and the event streams' states (`table::Slot16`).
     limit: u64,
     streams: u64,
@@ -369,7 +373,7 @@ unsafe fn cold(k: &mut K, st: u64, a0: *const u8, file: &[u8], end: usize, ctx: 
 /// boundary or the end of the file; 128 bytes past `end` can be read.
 /// The kernel, once per way of finding a line's commas, quotes and end.
 macro_rules! define_events {
-    ($(#[$attr:meta])* $name:ident, $set1:ident, [$c:ident $q:ident $n:ident], [$($head:literal),* $(,)?], [$($regs:tt)*]) => {
+    ($(#[$attr:meta])* $name:ident, $set1:ident, [$c:ident $q:ident $n:ident], [$($head:literal),* $(,)?], [$($nhead:literal),* $(,)?], [$($regs:tt)*]) => {
 #[inline(never)]
         $(#[$attr])*
         pub(crate) unsafe fn $name(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> Option<usize> {
@@ -406,14 +410,16 @@ macro_rules! define_events {
         // Line after line, until one needs the code outside (or none is left).
         asm!(
             "mov qword ptr [rdi + {s_rbx}], rbx",
+            // ---- The masks: where the first newline 41..104 bytes on is (r15, 64 for none); commas (rax) and quotes
+            // (rdx) of the first 64. A pass finds them for the next line (`nhead`), this for the first.
+            $($head,)*
+            "tzcnt r15, r15",
             "2:",
             "prefetcht0 byte ptr [rsi + {ahead}]",
             "prefetcht0 byte ptr [rsi + {ahead} + 64]",
             "mov rbx, rsi",             // rbx: the newline before the line
-            // ---- The masks: newlines 41..104 bytes on (r15); commas (rax) and quotes (rdx) of the first 64.
-            $($head,)*
-            "tzcnt r15, r15",
-            "jc 88f",                   // no newline in sight
+            "cmp r15d, 63",
+            "ja 88f",                   // no newline in sight
             "add r15, rsi",             // r15: the newline that ends the line, less 41
             "vpcmpeqb ymm4, ymm12, ymmword ptr [r15 + 9]",           // commas and quotes of the 32 bytes before it
             "vpcmpeqb ymm5, ymm13, ymmword ptr [r15 + 9]",
@@ -513,6 +519,8 @@ macro_rules! define_events {
             "vpxor ymm8, ymm8, ymmword ptr [rdi + {c_range_ok}]",
             "vpor ymm15, ymm15, ymm8",
             "vpor ymm15, ymm15, ymm3",
+            // ---- The next line's masks (into n_*), early, so that its pass need not wait for them.
+            $($nhead,)*
             "vmovq rcx, xmm0",
             "vpextrq r8, xmm0, 1",
             "imul rcx, qword ptr [rdi + {binv}]",
@@ -635,6 +643,9 @@ macro_rules! define_events {
             "mov qword ptr [r8 + rax + 16], rdx",
             "mov qword ptr [r8 + rax + 24], rcx",
             "71:",
+            "mov rax, qword ptr [rdi + {n_c}]",
+            "mov rdx, qword ptr [rdi + {n_q}]",
+            "mov r15, qword ptr [rdi + {n_nl}]",
             "cmp rsi, qword ptr [rdi + {limit}]",
             "jb 2b",
             "mov eax, 7",               // no line may start here
@@ -767,6 +778,9 @@ macro_rules! define_events {
             ws = const offset_of!(K, ws),
             span = const offset_of!(K, span),
             c_bias = const offset_of!(K, c_bias),
+            n_c = const offset_of!(K, n_c),
+            n_q = const offset_of!(K, n_q),
+            n_nl = const offset_of!(K, n_nl),
             xspan = const offset_of!(K, xspan),
             wso = const offset_of!(K, wso),
             rbias = const offset_of!(K, rbias),
@@ -834,6 +848,30 @@ define_events!(
         "shl r8, 32",
         "or rdx, r8",
     ],
+    [
+        "vpcmpeqb ymm6, ymm14, ymmword ptr [rsi + 41]",
+        "vpcmpeqb ymm7, ymm14, ymmword ptr [rsi + 73]",
+        "vpcmpeqb ymm10, ymm12, ymmword ptr [rsi]",
+        "vpcmpeqb ymm3, ymm12, ymmword ptr [rsi + 32]",
+        "vpmovmskb eax, ymm6",
+        "vpmovmskb r10d, ymm7",
+        "vpmovmskb edx, ymm10",
+        "vpmovmskb r14d, ymm3",
+        "vpcmpeqb ymm6, ymm13, ymmword ptr [rsi]",
+        "vpcmpeqb ymm7, ymm13, ymmword ptr [rsi + 32]",
+        "shl r10, 32",
+        "or rax, r10",
+        "tzcnt rax, rax",
+        "mov qword ptr [rdi + {n_nl}], rax",
+        "shl r14, 32",
+        "or rdx, r14",
+        "mov qword ptr [rdi + {n_c}], rdx",
+        "vpmovmskb eax, ymm6",
+        "vpmovmskb r10d, ymm7",
+        "shl r10, 32",
+        "or rax, r10",
+        "mov qword ptr [rdi + {n_q}], rax",
+    ],
     [in("ymm12") commas, in("ymm13") quotes, in("ymm14") newlines,]
 );
 
@@ -849,6 +887,18 @@ define_events!(
         "kmovq r15, k1",
         "kmovq rax, k2",
         "kmovq rdx, k3",
+    ],
+    [
+        "vpcmpeqb k1, zmm14, zmmword ptr [rsi + 41]",
+        "vpcmpeqb k2, zmm12, zmmword ptr [rsi]",
+        "vpcmpeqb k3, zmm13, zmmword ptr [rsi]",
+        "kmovq rax, k1",
+        "tzcnt rax, rax",
+        "mov qword ptr [rdi + {n_nl}], rax",
+        "kmovq rax, k2",
+        "mov qword ptr [rdi + {n_c}], rax",
+        "kmovq rax, k3",
+        "mov qword ptr [rdi + {n_q}], rax",
     ],
     [in("zmm12") commas, in("zmm13") quotes, in("zmm14") newlines, out("k1") _, out("k2") _, out("k3") _,]
 );
