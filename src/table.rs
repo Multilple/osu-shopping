@@ -5,17 +5,21 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 
 use crate::util::*;
 
+/// Fresh zeroed memory, starting on a 2 MB boundary so that all of it can
+/// be backed by huge pages.
 pub fn map_anon(bytes: usize) -> *mut u8 {
+    const HUGE: usize = 2 << 20;
     unsafe {
         let p = sys::mmap(
             std::ptr::null_mut(),
-            bytes,
+            bytes + HUGE,
             sys::PROT_READ | sys::PROT_WRITE,
             sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
             -1,
             0,
         );
         assert!(p != sys::MAP_FAILED, "mmap of {bytes} bytes failed");
+        let p = ((p as usize + HUGE - 1) & !(HUGE - 1)) as *mut std::ffi::c_void;
         if std::env::var_os("SS_NOHUGE").is_none() {
             sys::madvise(p, bytes, sys::MADV_HUGEPAGE);
         }
@@ -69,6 +73,32 @@ impl IdTable {
         if b > a {
             release(unsafe { (self.slots as *mut u8).add(a) }, b - a);
         }
+    }
+
+    /// Write to every page of part `i` of `n` of the still empty table.
+    ///
+    /// A lookup reads a slot before anything is written near it, and memory
+    /// that is first read gets the shared zero page: a later write then makes
+    /// the kernel break the huge page up and fault its 4 KB pieces in one at
+    /// a time. Written first, each 2 MB comes in as one huge page and stays
+    /// one.
+    pub fn touch_part(&self, i: usize, n: usize) {
+        let bytes = self.bytes();
+        let (a, b) = (bytes * i / n / 4096 * 4096, if i + 1 == n { bytes } else { bytes * (i + 1) / n / 4096 * 4096 });
+        let mut o = a;
+        while o < b {
+            unsafe { std::ptr::write_volatile((self.slots as *mut u8).add(o), 0) };
+            o += 4096;
+        }
+    }
+
+    /// Where the table's memory starts, and its size.
+    pub fn base(&self) -> *const u8 {
+        self.slots as *const u8
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.nregions * RSIZE * std::mem::size_of::<Slot>()
     }
 
     /// IDs in the table (diagnostics; call between stages only).

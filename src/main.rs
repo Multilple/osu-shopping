@@ -12,6 +12,7 @@
 //!   4. persons per person bucket: group by person, sort, sessionize,
 //!              attribute, aggregate, and write Parquet.
 
+mod diag;
 mod fast;
 mod input;
 mod parquet;
@@ -73,9 +74,11 @@ struct Slim {
     x: u64,
 }
 
-type EvStreams = Streams<Ev, 12>;
-type SlimStreams = Streams<Slim, 12>;
-type CkStreams = Streams<Ck, 10>;
+// Lists grow 16 KB at a time: with hundreds of lists per thread, bigger
+// pieces would leave a lot of memory claimed (and zeroed) but unused.
+type EvStreams = Streams<Ev, 10>;
+type SlimStreams = Streams<Slim, 10>;
+type CkStreams = Streams<Ck, 9>;
 
 struct Ctx {
     ws: i64,
@@ -114,13 +117,19 @@ struct ThreadOut {
     slim: SlimStreams,
     dates: fast::Dates,
     reader: input::Reader,
-    /// Events and clicks waiting for their table lookups, `npe` and `npc` of them.
+    /// Events waiting for their table lookups, in two halves of `HALF`: the
+    /// one being filled starts at `cur` and holds `npe`; when it is full the
+    /// other one, whose table lines have had that long to arrive, is looked
+    /// up and emptied (see `flush_half`).
     pend_e: Box<[PendE]>,
+    cur: usize,
     npe: usize,
-    /// How many of them wait for a table line that was not at hand (see `flush_events`).
-    held: usize,
-    /// Purchases among `pend_e` (by index) and their product IDs.
-    pend_p: Vec<(u32, Key)>,
+    /// Per half: how many it holds (kept up to date only while it is not
+    /// being filled), and how many of them were held back by its last flush.
+    cnt: [usize; 2],
+    held: [usize; 2],
+    /// Per half: the purchases in it (by index) and their product IDs.
+    pend_p: [Vec<(u32, Key)>; 2],
     pend_c: Box<[PendC]>,
     npc: usize,
     pend_l: Vec<(Key, u64, Key, u64)>,
@@ -213,7 +222,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     let lap = |what: &str| {
         let now = t0.elapsed().as_secs_f64();
         if log {
-            eprintln!("{:>8.1} ms  {}", now * 1e3, what);
+            let (user, sys, faults) = util::sys::usage();
+            eprintln!("{:>8.1} ms  {:<28} user {:>7.1} sys {:>6.1} faults {}", now * 1e3, what, user, sys, faults);
         }
         if !what.starts_with(' ') {
             if pad.as_deref() == Some(what) {
@@ -241,16 +251,24 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
                 slim: Streams::new(1 << ctx.pbits),
                 dates: fast::Dates::new(),
                 reader: input::Reader::new(chunk),
-                pend_e: vec![PendE::default(); PEND].into_boxed_slice(),
+                pend_e: vec![PendE::default(); 2 * HALF].into_boxed_slice(),
+                cur: 0,
                 npe: 0,
-                held: 0,
-                pend_p: Vec::with_capacity(PEND),
+                cnt: [0; 2],
+                held: [0; 2],
+                pend_p: [Vec::with_capacity(HALF), Vec::with_capacity(HALF)],
                 pend_c: vec![PendC::default(); PEND].into_boxed_slice(),
                 npc: 0,
                 pend_l: Vec::with_capacity(PEND),
             }))
         })
         .collect();
+
+    // The ID table must be written before it is read (see `touch_part`).
+    if std::env::var_os("SS_NOTOUCH").is_none() {
+        par(threads, |tid| ctx.ids.touch_part(tid, threads));
+    }
+    lap("  table touched");
 
     // ------------------------------------------------------------ links
     // (products and campaigns load on the side meanwhile)
@@ -309,7 +327,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             }
             out.reader.buf = buf;
         }
-        flush_events(&ctx, out, tid, true);
+        flush_events(&ctx, out, tid);
         flush_clicks(&ctx, out);
         out.ev.finish(&mut out.arena);
         out.ck.finish(&mut out.arena);
@@ -329,14 +347,13 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     // ------------------------------------------------------------ dedup
     let next = AtomicUsize::new(0);
     par(threads, |_| {
-        let mut table: Vec<Row> = Vec::new();
-        let mut wide: Vec<u64> = Vec::new();
+        let mut table: Vec<u64> = Vec::new();
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
             if p >= 1 << ctx.pbits {
                 break;
             }
-            dedup_bucket(p, &outs_ref, &mut table, &mut wide);
+            dedup_bucket(p, &outs_ref, &mut table);
         }
     });
     lap("dedup");
@@ -373,6 +390,24 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     });
     lap("persons + user_daily");
 
+    // SS_DIAG=1 or 2: finish with a wait whose length tells, through the
+    // total run time, facts about the machine (1) or two memory costs (2).
+    let mut wait_until = 0.0f64;
+    match std::env::var("SS_DIAG").ok().as_deref() {
+        Some("1") => {
+            let a = diag::facts();
+            if log {
+                eprintln!("    diag: facts {a}");
+            }
+            wait_until = 2.0 + 4.0 * a as f64;
+        }
+        Some("2") => {
+            let (r, z) = diag::costs(&ctx.ids, &|f| par(threads, f));
+            wait_until = 2.0 + 0.2 * r as f64 + 16.0 * z as f64;
+        }
+        _ => {}
+    }
+
     // The last table is small: write it while the other threads give the big
     // buffers back, which is quicker than leaving it all to process exit.
     let cells: Vec<Cells> = cells.into_iter().map(|c| c.0.into_inner().unwrap()).collect();
@@ -385,11 +420,11 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     });
     lap("campaign_daily");
     if pad.is_some() {
-        let until = 2.0 + 10.0 * padded.get();
-        let now = t0.elapsed().as_secs_f64();
-        if until > now {
-            std::thread::sleep(std::time::Duration::from_secs_f64(until - now));
-        }
+        wait_until = 2.0 + 10.0 * padded.get();
+    }
+    let now = t0.elapsed().as_secs_f64();
+    if wait_until > now {
+        std::thread::sleep(std::time::Duration::from_secs_f64(wait_until - now));
     }
     true
 }
@@ -538,6 +573,18 @@ fn load_aux(data: &Path) -> Aux {
     Aux { products, unknown, cat_names, campaigns, camp_names, camp_channel }
 }
 
+/// Experiments (builds with the `exp` feature only): how far to take each line.
+#[inline(always)]
+fn exp() -> u32 {
+    #[cfg(feature = "exp")]
+    {
+        static EXP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        return *EXP.get_or_init(|| std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    }
+    #[cfg(not(feature = "exp"))]
+    0
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -550,6 +597,8 @@ fn slow_only() -> bool {
 // ====================================================================== links
 
 const PEND: usize = 32;
+/// Half the number of events that can wait for their table lookups.
+const HALF: usize = 16;
 
 #[inline(always)]
 fn emit_link(ctx: &Ctx, out: &mut ThreadOut, a: Key, b: Key) {
@@ -696,14 +745,14 @@ fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, ing32: u32, v
         let n = out.npe;
         if prod != 0 {
             ctx.aux.products.prefetch(prod);
-            out.pend_p.push((n as u32, prod));
+            out.pend_p[(out.cur != 0) as usize].push((n as u32, prod));
         }
         unsafe {
-            *out.pend_e.get_unchecked_mut(n) = PendE { ulo: user as u64, uhi: (user >> 64) as u64, ev, h, x, first, _pad: 0 };
+            *out.pend_e.get_unchecked_mut(out.cur + n) = PendE { ulo: user as u64, uhi: (user >> 64) as u64, ev, h, x, first, _pad: 0 };
         }
         out.npe = n + 1;
-        if n + 1 == PEND {
-            flush_events(ctx, out, tid, false);
+        if n + 1 == HALF {
+            turn_events(ctx, out, tid);
         }
     } else {
         let p = (h >> (64 - ctx.pbits)) as usize;
@@ -711,32 +760,67 @@ fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, ing32: u32, v
     }
 }
 
-/// Look up the pending events' users and append the events to their lists.
+/// The half being filled is full: look up and empty the other one, then fill that.
+#[inline(always)]
+fn turn_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
+    let h = (out.cur != 0) as usize;
+    out.cnt[h] = HALF;
+    flush_half(ctx, out, tid, h ^ 1, false);
+    out.cur = (h ^ 1) * HALF;
+    out.npe = out.cnt[h ^ 1];
+}
+
+/// Look up and append every pending event (at the end of the input).
+fn flush_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
+    let h = (out.cur != 0) as usize;
+    out.cnt[h] = out.npe;
+    flush_half(ctx, out, tid, h ^ 1, true);
+    flush_half(ctx, out, tid, h, true);
+    out.cur = 0;
+    out.npe = 0;
+}
+
+/// Look up the users of the pending events in half `h` and append the events
+/// to their lists.
 ///
 /// First every lookup, then every append: an append's address depends on the
 /// person found, and must not wait on a table line that is still on its way.
 /// A user who is not in the first cache line tried (a few in a hundred) has
-/// the next line fetched and stays pending until the following call, unless
+/// the next line fetched and stays in the half until its next flush, unless
 /// this is the `last` one.
-#[cfg_attr(feature = "prof", inline(never))]
-#[cfg_attr(not(feature = "prof"), inline(always))]
-fn flush_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize, last: bool) {
-    for &(i, prod) in &out.pend_p {
+#[inline(never)]
+fn flush_half(ctx: &Ctx, out: &mut ThreadOut, tid: usize, h: usize, last: bool) {
+    let base = h * HALF;
+    for k in 0..out.pend_p[h].len() {
+        let (i, prod) = out.pend_p[h][k];
         let cat = ctx.aux.products.get(prod).unwrap_or(ctx.aux.unknown);
-        out.pend_e[i as usize].ev |= (cat as u64) << 24;
+        out.pend_e[base + i as usize].ev |= (cat as u64) << 24;
     }
-    out.pend_p.clear();
-    let n = out.npe;
+    out.pend_p[h].clear();
+    let n = out.cnt[h];
     let here = (tid as u64) << (IDX_BITS + Q_BITS);
-    let mut later = [0u8; PEND];
+    let pend = unsafe { out.pend_e.as_mut_ptr().add(base) };
+    let exp = exp();
+    if exp == 4 || exp == 5 {
+        // bookkeeping only: no lookups, no appends
+        let mut acc = 0u64;
+        for i in 0..n {
+            let pe = unsafe { *pend.add(i) };
+            acc = acc.wrapping_add(pe.first as u64 + pe.h + pe.x + pe.ev);
+        }
+        std::hint::black_box(acc);
+        out.cnt[h] = 0;
+        return;
+    }
+    let mut later = [0u8; HALF];
     let mut nl = 0;
-    // The first `held` were left by the call before; their lines are here now.
-    for i in 0..out.held {
-        let pe = unsafe { out.pend_e.get_unchecked_mut(i) };
+    // The first `held` were left by the flush before; their lines are here now.
+    for i in 0..out.held[h] {
+        let pe = unsafe { &mut *pend.add(i) };
         pe.first = ctx.ids.root(ctx.ids.get_or_insert_at(pe.ulo, pe.uhi, pe.first));
     }
-    for i in out.held..n {
-        let pe = unsafe { out.pend_e.get_unchecked_mut(i) };
+    for i in out.held[h]..n {
+        let pe = unsafe { &mut *pend.add(i) };
         match ctx.ids.peek(pe.ulo, pe.uhi, pe.first) {
             Some(slot) => pe.first = ctx.ids.root(slot),
             None => {
@@ -746,9 +830,9 @@ fn flush_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize, last: bool) {
         }
     }
     let mut m = n;
-    if last || nl > PEND / 4 {
+    if last || nl > HALF / 4 {
         for &i in &later[..nl] {
-            let pe = unsafe { out.pend_e.get_unchecked_mut(i as usize) };
+            let pe = unsafe { &mut *pend.add(i as usize) };
             pe.first = ctx.ids.root(ctx.ids.get_or_insert_at(pe.ulo, pe.uhi, pe.first));
         }
         nl = 0;
@@ -757,23 +841,31 @@ fn flush_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize, last: bool) {
         // swap brings a looked-up event forward).
         for k in (0..nl).rev() {
             m -= 1;
-            out.pend_e.swap(later[k] as usize, m);
+            unsafe { std::ptr::swap(pend.add(later[k] as usize), pend.add(m)) };
         }
     }
     for i in 0..m {
-        let pe = unsafe { *out.pend_e.get_unchecked(i) };
+        let pe = unsafe { *pend.add(i) };
         let person = pe.first;
         let q = (person >> ctx.qshift) as usize;
+        if exp == 6 {
+            std::hint::black_box(q);
+            continue;
+        }
         // An `Ev`: the event word, then the person and the ingest time.
         let idx = out.ev.push16(q, pe.ev, person as u64 | (pe.x << 32), &mut out.arena);
         assert!(idx < 1 << IDX_BITS, "bucket too large");
         let p = (pe.h >> (64 - ctx.pbits)) as usize;
         let x = (pe.x & (H2_MASK << H2_SHIFT)) | here | ((q as u64) << IDX_BITS) | idx as u64;
+        if exp == 7 {
+            std::hint::black_box(x);
+            continue;
+        }
         out.slim.push16(p, pe.h, x, &mut out.arena_slim);
     }
-    out.pend_e.copy_within(m..n, 0);
-    out.held = nl;
-    out.npe = nl;
+    unsafe { std::ptr::copy(pend.add(m), pend, n - m) };
+    out.held[h] = nl;
+    out.cnt[h] = nl;
 }
 
 #[cfg_attr(feature = "prof", inline(never))]
@@ -862,6 +954,7 @@ unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
     let len = file.len();
     let span = (ctx.we - ctx.ws) as u64;
     let origin_s = ctx.origin / 1000;
+    let exp = exp();
     let mut s = start;
     while s < end {
         if s + 128 > len {
@@ -881,14 +974,14 @@ unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
         }
         s = e + 1;
         let (s0, n0) = c.field(0);
-        if !c.quotes | (n0 == 0) {
+        if !c.quotes | (n0 == 0) | (exp == 1) {
             continue;
         }
         // Each part goes into the next pending slot as soon as it is known
         // (few values then have to be kept at hand across the rest); the
         // slot only counts if the event turns out valid.
         let n = out.npe;
-        let pe = out.pend_e.as_mut_ptr().add(n);
+        let pe = out.pend_e.as_mut_ptr().add(out.cur + n);
         let (h, hb) = hash_pair(fast::pack_at(base, s0, s0 + n0));
         let (s3, n3) = c.field(3);
         let ing = out.dates.f1(base.add(s3), n3);
@@ -898,7 +991,9 @@ unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
         let (s1, n1) = c.field(1);
         let user = fast::pack_at(base, s1, s1 + n1);
         let first = ctx.ids.first(hash64(user));
-        ctx.ids.prefetch_at(first);
+        if exp != 4 {
+            ctx.ids.prefetch_at(first);
+        }
         (*pe).ulo = user as u64;
         (*pe).uhi = (user >> 64) as u64;
         (*pe).first = first;
@@ -919,16 +1014,20 @@ unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
             if let Some(p) = parse_price(std::slice::from_raw_parts(base.add(s6), n6)) {
                 let prod = fast::pack_at(base, s5, s5 + n5);
                 ctx.aux.products.prefetch(prod);
-                out.pend_p.push((n as u32, prod));
+                out.pend_p[(out.cur != 0) as usize].push((n as u32, prod));
                 valid = true;
                 ev |= p as u64;
             }
         }
         (*pe).ev = ev;
+        if exp == 2 {
+            std::hint::black_box((valid, ev, x, first));
+            continue;
+        }
         if valid {
             out.npe = n + 1;
-            if n + 1 == PEND {
-                flush_events(ctx, out, tid, false);
+            if n + 1 == HALF {
+                turn_events(ctx, out, tid);
             }
         } else {
             let p = (h >> (64 - ctx.pbits)) as usize;
@@ -939,6 +1038,9 @@ unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
 }
 
 fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
+    if exp() == 3 {
+        return;
+    }
     let rest = if slow_only() { start } else { unsafe { events_fast(file, start, end, ctx, out, tid) } };
     for line in lines(&file[rest..end]) {
         event_line(line, ctx, out, tid);
@@ -1003,6 +1105,9 @@ unsafe fn clicks_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
 }
 
 fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut) {
+    if exp() != 0 {
+        return;
+    }
     let rest = if slow_only() { start } else { unsafe { clicks_fast(file, start, end, ctx, out) } };
     for line in lines(&file[rest..end]) {
         click_line(line, ctx, out);
@@ -1011,145 +1116,7 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
 
 // ====================================================================== dedup
 
-/// One cache line of the dedup table: 16 entries.
-#[repr(C, align(64))]
-#[derive(Clone, Copy)]
-struct Row([u32; 16]);
-
-/// Marks the losing copies of every event ID in dedup bucket `p`.
-///
-/// The table holds one entry per event ID seen so far: some bits of its hash
-/// and the number of the note of its kept copy (smallest ingest_ts so far),
-/// counting the bucket's notes thread after thread. A note looks at one
-/// cache line of 16 entries at a time: all 16 are compared at once, a new ID
-/// takes the line's first free entry, and only a full line sends it on to
-/// the next.
-fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<Row>, wide: &mut Vec<u64>) {
-    use core::arch::x86_64::*;
-    const EMPTY: u32 = u32::MAX;
-    let n: usize = outs.iter().map(|o| o.slim.len(p)).sum();
-    if n < 2 {
-        return;
-    }
-    // Note numbers take `sb` bits (never all ones, so no entry looks empty); the hash gets the rest.
-    let sb = usize::BITS - n.leading_zeros();
-    if sb > 22 {
-        return dedup_bucket_wide(p, outs, wide);
-    }
-    let seq_mask = (1u32 << sb) - 1;
-    let tag_mask = (1u32 << (32 - sb)) - 1;
-    let rows = (n / 11 + 1).next_power_of_two();
-    table.clear();
-    table.resize(rows, Row([EMPTY; 16]));
-    let rmask = rows - 1;
-    // Where each thread's notes start in the numbering.
-    let mut first = [0u32; MAX_THREADS + 2];
-    for (t, o) in outs.iter().enumerate() {
-        first[t + 1] = first[t] + o.slim.len(p) as u32;
-    }
-    let nt = outs.len();
-    let note = |seq: u32| -> *mut Slim {
-        let mut t = 0;
-        while t + 1 < nt && first[t + 1] <= seq {
-            t += 1;
-        }
-        outs[t].slim.at(p, (seq - first[t]) as usize)
-    };
-    let ev_at = |x: u64| -> *mut Ev {
-        let t = (x >> (IDX_BITS + Q_BITS)) as usize & ((1 << T_BITS) - 1);
-        let q = (x >> IDX_BITS) as usize & ((1 << Q_BITS) - 1);
-        outs[t].ev.at(q, (x & ((1 << IDX_BITS) - 1)) as usize)
-    };
-    let ingest = |x: u64| -> u32 { if x & TAG != 0 { x as u32 } else { unsafe { (*ev_at(x)).ingest } } };
-    // A copy that is not the kept one goes (invalid copies have no event to drop).
-    let drop_copy = |x: u64| {
-        if x & TAG == 0 {
-            unsafe { (*ev_at(x)).ev = DEAD };
-        }
-    };
-    // A repeat is settled a little later, in arrival order, so the events
-    // it needs (far apart in memory) can be fetched meanwhile.
-    const LATER: usize = 16;
-    const AHEAD: usize = 12;
-    let mut later = [(0usize, Slim { h: 0, x: 0 }, 0u32); LATER];
-    let mut nl = 0;
-    let entries = table.as_mut_ptr() as *mut u32;
-    let settle = |later: &[(usize, Slim, u32)]| {
-        for &(i, s, seq) in later {
-            let v = unsafe { *entries.add(i) };
-            let kept = unsafe { *note(v & seq_mask) };
-            // The copy with the smallest ingest_ts is kept, valid or not;
-            // copies with equal ingest_ts are identical.
-            if ingest(s.x) < ingest(kept.x) {
-                drop_copy(kept.x);
-                unsafe { *entries.add(i) = (v & !seq_mask) | seq };
-            } else {
-                drop_copy(s.x);
-            }
-        }
-    };
-    let fetch = |x: u64| {
-        if x & TAG == 0 {
-            unsafe { _mm_prefetch(ev_at(x) as *const i8, _MM_HINT_T0) };
-        }
-    };
-    unsafe {
-        let shift = _mm_cvtsi32_si128(sb as i32);
-        let ones = _mm256_set1_epi32(-1);
-        let mut seq = 0u32;
-        for o in outs {
-            for (ptr, len) in o.slim.pieces(p) {
-                for k in 0..len {
-                    // The table may not fit in cache: ask for a later note's line now.
-                    if k + AHEAD < len {
-                        let h = (*ptr.add(k + AHEAD)).h;
-                        _mm_prefetch(entries.add((h as usize & rmask) * 16) as *const i8, _MM_HINT_T0);
-                    }
-                    let s = *ptr.add(k);
-                    let tag = (s.h >> 20) as u32 & tag_mask;
-                    let want = _mm256_set1_epi32(tag as i32);
-                    let mut r = s.h as usize & rmask;
-                    'probe: loop {
-                        let row = entries.add(r * 16);
-                        let (a, b) = (_mm256_load_si256(row as *const __m256i), _mm256_load_si256(row.add(8) as *const __m256i));
-                        let free = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a, ones))) as u32
-                            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(b, ones))) as u32) << 8;
-                        let same = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_srl_epi32(a, shift), want))) as u32
-                            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_srl_epi32(b, shift), want))) as u32) << 8;
-                        let mut same = same & !free;
-                        while same != 0 {
-                            let j = same.trailing_zeros() as usize;
-                            same &= same - 1;
-                            let kept = *note(*row.add(j) & seq_mask);
-                            // Copies of one event share the hash and the 20 extra hash bits.
-                            if kept.h == s.h && ((kept.x ^ s.x) >> H2_SHIFT) & H2_MASK == 0 {
-                                fetch(s.x);
-                                fetch(kept.x);
-                                later[nl] = (r * 16 + j, s, seq);
-                                nl += 1;
-                                if nl == LATER {
-                                    settle(&later);
-                                    nl = 0;
-                                }
-                                break 'probe;
-                            }
-                        }
-                        if free != 0 {
-                            *row.add(free.trailing_zeros() as usize) = (tag << sb) | seq;
-                            break;
-                        }
-                        r = (r + 1) & rmask;
-                    }
-                    seq += 1;
-                }
-            }
-        }
-    }
-    settle(&later[..nl]);
-}
-
-/// `dedup_bucket` for a bucket too large for 32-bit table entries.
-fn dedup_bucket_wide(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
+fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
     const EMPTY: u64 = u64::MAX;
     let n: usize = outs.iter().map(|o| o.slim.len(p)).sum();
     if n < 2 {

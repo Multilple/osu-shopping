@@ -215,6 +215,14 @@ pub mod sys {
         pub fn mallopt(param: i32, value: i32) -> i32;
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        pub fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+    }
+
+    /// CPU time in user mode and in the kernel (ms), and page faults so far.
+    pub fn usage() -> (f64, f64, i64) {
+        let mut r = [0i64; 18];
+        unsafe { getrusage(0, &mut r) };
+        (r[0] as f64 * 1e3 + r[1] as f64 / 1e3, r[2] as f64 * 1e3 + r[3] as f64 / 1e3, r[8])
     }
 }
 
