@@ -1722,7 +1722,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     let mut ctx = build_ctx(data_dir, 0, 0, 0, 1);
 
     let kb = env_usize("SS_KB", 15) as u32;
-    let ku = env_usize("SS_KU", 11) as u32;
+    let ku = env_usize("SS_KU", 10) as u32;
     let nq = (plan.max_user as usize).div_ceil(1 << ku);
     let d = nq << (ku + 3);
     let nodes = d + XCAP;
