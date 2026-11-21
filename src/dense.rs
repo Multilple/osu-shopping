@@ -432,8 +432,6 @@ pub(crate) struct DOut {
     pub(crate) ck: Plain<[u64; 2], 10>,
     pub(crate) reader: input::Reader,
     pub(crate) pend_l: Vec<(u32, u32)>,
-    /// The click kernel's memory of dates.
-    pub(crate) ckd: Box<crate::dense_ck::DateMemo>,
 }
 
 /// What a thread produces while removing duplicates.
@@ -1648,7 +1646,6 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
                 ck: Plain::new(nq + 1),
                 reader: input::Reader::new(chunk),
                 pend_l: Vec::with_capacity(PEND),
-                ckd: crate::dense_ck::DateMemo::new(ctx.origin),
             }))
         })
         .collect();
