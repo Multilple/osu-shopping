@@ -127,15 +127,9 @@ pub unsafe fn cut<const NA: usize, const NB: usize, const N: usize>(base: *const
     }
     let last_a = r[NA];
     let shape_a = last_a < (nl & !1).trailing_zeros();
-    // An opening quote sits right after a separator, a closing one right
-    // before the next; a field that is one lone quote is not quoted.
-    let seps = 1 | (cm ^ m);
-    let qa = (qt >> 1) & !(seps >> 2);
-    let qb = qt << 1;
-    let mut k = 0;
+    let qa = quoted(1 | (cm ^ m), qt) & ((1 << NA) - 1);
     for j in 0..NA {
-        q[j] = ((qa.wrapping_shr(r[j]) & qb.wrapping_shr(r[j + 1])) & 1) as usize;
-        k += q[j];
+        q[j] = ((qa >> j) & 1) as usize;
         p[j] = a0 + r[j] as usize;
     }
     let nq_a = _bzhi_u64(qt, last_a).count_ones();
@@ -153,18 +147,27 @@ pub unsafe fn cut<const NA: usize, const NB: usize, const N: usize>(base: *const
     }
     t[NB + 1] = end;
     let shape_b = (end < 64) & (t[NB] < 64) & (m == 0);
-    let seps = 1 | inside | 1u64.wrapping_shl(end);
-    let qa = (qt >> 1) & !(seps >> 2);
-    let qb = qt << 1;
+    let qb = quoted(1 | inside | 1u64.wrapping_shl(end), qt) & ((2 << NB) - 1);
     for j in 0..=NB {
-        q[NA + j] = ((qa.wrapping_shr(t[j]) & qb.wrapping_shr(t[j + 1])) & 1) as usize;
-        k += q[NA + j];
+        q[NA + j] = ((qb >> j) & 1) as usize;
         p[NA + j] = b0 + t[j] as usize;
     }
     p[NA + NB + 1] = b0 + end as usize;
     let nq_b = _bzhi_u64(qt, end).count_ones();
 
-    Cut { p, q, shape: shape_a & shape_b, quotes: (nq_a + nq_b) as usize == 2 * k }
+    Cut { p, q, shape: shape_a & shape_b, quotes: nq_a + nq_b == 2 * (qa.count_ones() + qb.count_ones()) }
+}
+
+/// Which fields are wrapped in quotes, given the separators and the quotes
+/// of a window as bit masks: bit `j` of the result is for the field after
+/// the `j`th separator. Such a field has a quote right after that separator
+/// and one right before the next, and is not one lone quote.
+#[inline(always)]
+unsafe fn quoted(seps: u64, qt: u64) -> u64 {
+    let open = _pext_u64(qt >> 1, seps);
+    let close = _pext_u64(qt << 1, seps);
+    let lone = _pext_u64(seps >> 2, seps);
+    open & (close >> 1) & !lone
 }
 
 #[repr(C, align(32))]
@@ -206,8 +209,24 @@ pub unsafe fn pack_at(base: *const u8, s: usize, e: usize) -> Key {
     }
 }
 
-/// The timestamp was not valid.
-pub const BAD: i64 = i64::MIN;
+/// What the parsers below give for a time that is not valid: seconds no
+/// lower than `BAD_S`, or any below `BAD_S / 2`, are not a time (the sum of a
+/// bad date and a time of day is still one); in milliseconds, `BAD_MS`, which
+/// is ages before any window.
+pub const BAD_S: i64 = -(1 << 53);
+pub const BAD_MS: i64 = BAD_S * 1000;
+
+/// Whether a time in seconds from `Dates::civil` or `Dates::f1` is valid.
+#[inline(always)]
+pub fn good(secs: i64) -> bool {
+    secs >= BAD_S / 2
+}
+
+#[cold]
+#[inline(never)]
+fn bad_time() -> i64 {
+    BAD_S
+}
 
 #[repr(C, align(16))]
 struct V16([u8; 16]);
@@ -228,14 +247,14 @@ static RIGHT: [V16; 17] = {
     t
 };
 
-/// 1..=16 ASCII digits at `p` (16 readable bytes) as a number, or `BAD`.
+/// 1..=16 ASCII digits at `p` (16 readable bytes) as a number, or `BAD_MS`.
 #[inline(always)]
 unsafe fn digits16(p: *const u8, n: usize) -> i64 {
     let v = _mm_sub_epi8(_mm_loadu_si128(p as *const __m128i), _mm_set1_epi8(b'0' as i8));
     let d = _mm_shuffle_epi8(v, _mm_load_si128(RIGHT.get_unchecked(n).0.as_ptr() as *const __m128i));
     let over = _mm_subs_epu8(d, _mm_set1_epi8(9));
     if _mm_testz_si128(over, over) == 0 {
-        return BAD;
+        return BAD_MS;
     }
     // Pairs, then fours, then eights of digits.
     let w = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
@@ -247,7 +266,7 @@ unsafe fn digits16(p: *const u8, n: usize) -> i64 {
 }
 
 /// Per-thread memo of calendar dates seen: the 11 bytes `YYYY-MM-DDT` ->
-/// seconds at midnight, or `BAD` when they are not a valid date followed by `T`.
+/// seconds at midnight, or `BAD_S` when they are not a valid date followed by `T`.
 pub struct Dates {
     key8: [u64; 64],
     key4: [u32; 64],
@@ -256,7 +275,7 @@ pub struct Dates {
 
 impl Dates {
     pub fn new() -> Dates {
-        Dates { key8: [0; 64], key4: [0; 64], val: [BAD; 64] }
+        Dates { key8: [0; 64], key4: [0; 64], val: [BAD_S; 64] }
     }
 
     #[cold]
@@ -293,7 +312,7 @@ impl Dates {
             }
             Some(days_from_civil(year, month, day) * 86_400)
         })()
-        .unwrap_or(BAD);
+        .unwrap_or(BAD_S);
         self.key8[idx] = k8;
         self.key4[idx] = k4;
         self.val[idx] = v;
@@ -301,7 +320,7 @@ impl Dates {
     }
 
     /// `YYYY-MM-DDTHH:MM:SS` at `p` (19+ readable bytes) to seconds since the
-    /// epoch, as if UTC; `BAD` when it is not a valid date and time.
+    /// epoch, as if UTC; not `good` when it is not a valid date and time.
     #[cfg_attr(feature = "prof", inline(never))]
     #[cfg_attr(not(feature = "prof"), inline(always))]
     pub unsafe fn civil(&mut self, p: *const u8) -> i64 {
@@ -328,31 +347,31 @@ impl Dates {
         let hour = _mm_cvtsi128_si32(w) as u32 & 0xFFFF;
         let d = _mm_cvtsi128_si64(_mm_madd_epi16(w, _mm_set_epi64x(0, 0x0001_003C_003C_0E10))) as u64;
         let tod = (d & 0xFFFF_FFFF) + (d >> 32);
-        if (date == BAD) | (_mm_testz_si128(over, over) == 0) | (hour > 23) {
-            return BAD;
+        if (_mm_testz_si128(over, over) == 0) | (hour > 23) {
+            return bad_time();
         }
+        // (A bad date plus a time of day is still not `good`.)
         date + tod as i64
     }
 
     /// A `ts` field of `n` bytes at `p` in any form, in milliseconds, or
-    /// `BAD`; 32 readable bytes at `p`.
+    /// `BAD_MS` or thereabouts (far before any window); 32 readable bytes at `p`.
     #[cfg_attr(feature = "prof", inline(never))]
     #[cfg_attr(not(feature = "prof"), inline(always))]
     pub unsafe fn ts(&mut self, p: *const u8, n: usize) -> i64 {
         if n == 20 && *p.add(19) == b'Z' {
-            let s = self.civil(p);
-            return if s == BAD { BAD } else { s * 1000 };
+            return self.civil(p) * 1000;
         }
         if n == 25 && (*p.add(19) == b'+' || *p.add(19) == b'-') {
             let local = self.civil(p);
             let d = |i: usize| (*p.add(i)).wrapping_sub(b'0') as i64;
             let (h1, h0, m1, m0) = (d(20), d(21), d(23), d(24));
-            if local == BAD || h1 > 9 || h0 > 9 || m1 > 9 || m0 > 9 || *p.add(22) != b':' {
-                return BAD;
+            if !good(local) || h1 > 9 || h0 > 9 || m1 > 9 || m0 > 9 || *p.add(22) != b':' {
+                return BAD_MS;
             }
             let (hh, mm) = (h1 * 10 + h0, m1 * 10 + m0);
             if hh > 23 || mm > 59 {
-                return BAD;
+                return BAD_MS;
             }
             let off = (hh * 60 + mm) * 60;
             return (if *p.add(19) == b'+' { local - off } else { local + off }) * 1000;
@@ -360,16 +379,16 @@ impl Dates {
         if (1..=16).contains(&n) {
             return digits16(p, n);
         }
-        parse_ts(std::slice::from_raw_parts(p, n)).unwrap_or(BAD)
+        parse_ts(std::slice::from_raw_parts(p, n)).unwrap_or(BAD_MS)
     }
 
-    /// An `ingest_ts` field (F1 only) in seconds, or `BAD`.
+    /// An `ingest_ts` field (F1 only) in seconds; not `good` when it is not valid.
     #[inline(always)]
     pub unsafe fn f1(&mut self, p: *const u8, n: usize) -> i64 {
         if n == 20 && *p.add(19) == b'Z' {
             self.civil(p)
         } else {
-            BAD
+            BAD_S
         }
     }
 }

@@ -258,6 +258,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             }
             flush_links(&ctx, out);
         });
+        lap("  links: parse and join");
         let next = AtomicUsize::new(0);
         par(threads, |_| loop {
             let r = next.fetch_add(1, Ordering::Relaxed);
@@ -266,6 +267,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             }
             ctx.ids.flatten_region(r);
         });
+        lap("  links: flatten");
         aux.join().unwrap()
     });
     if ctx.ids.overflow.load(Ordering::Relaxed) {
@@ -540,10 +542,20 @@ fn emit_link(ctx: &Ctx, out: &mut ThreadOut, a: Key, b: Key) {
 
 #[inline(always)]
 fn flush_links(ctx: &Ctx, out: &mut ThreadOut) {
-    for &(a, ha, b, hb) in &out.pend_l {
-        let ia = ctx.ids.get_or_insert(a, ha);
-        let ib = ctx.ids.get_or_insert(b, hb);
-        ctx.ids.union(ia, ib);
+    // Find both IDs of every line, ask for the lines their current parents
+    // are in, and only then join: a join walks from parent to parent, and
+    // would otherwise wait for each of them in turn.
+    for l in out.pend_l.iter_mut() {
+        let (ia, ib) = (ctx.ids.get_or_insert(l.0, l.1), ctx.ids.get_or_insert(l.2, l.3));
+        l.1 = ia as u64;
+        l.3 = ib as u64;
+    }
+    for l in &out.pend_l {
+        ctx.ids.prefetch_at(ctx.ids.root(l.1 as u32));
+        ctx.ids.prefetch_at(ctx.ids.root(l.3 as u32));
+    }
+    for l in &out.pend_l {
+        ctx.ids.union(l.1 as u32, l.3 as u32);
     }
     out.pend_l.clear();
 }
@@ -625,18 +637,26 @@ fn ingest32(ctx: &Ctx, ing: Option<i64>) -> u32 {
     }
 }
 
-/// `ingest32` for a time in whole seconds (`fast::BAD` when unparsable) and
-/// the time origin in seconds.
+/// `ingest32` for a time in whole seconds (not `fast::good` when unparsable)
+/// and the time origin in seconds.
 #[inline(always)]
 fn ingest32_s(origin_s: i64, secs: i64) -> u32 {
     const TOP: u32 = u32::MAX - 1;
+    #[cold]
+    #[inline(never)]
+    fn far(secs: i64, r: i64) -> u32 {
+        if !fast::good(secs) || r >= 0 {
+            TOP
+        } else {
+            0
+        }
+    }
+    // (An unparsable time lands far below zero here.)
     let r = secs.wrapping_sub(origin_s).wrapping_add(1i64 << 31);
-    if (secs != fast::BAD) & ((r as u64) < TOP as u64) {
+    if (r as u64) < TOP as u64 {
         r as u32
-    } else if secs == fast::BAD || r >= 0 {
-        TOP
     } else {
-        0
+        far(secs, r)
     }
 }
 
@@ -842,34 +862,56 @@ unsafe fn events_fast(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mu
         if !c.quotes | (n0 == 0) {
             continue;
         }
-        let (s1, n1) = c.field(1);
-        let (s2, n2) = c.field(2);
+        // Each part goes into the next pending slot as soon as it is known
+        // (few values then have to be kept at hand across the rest); the
+        // slot only counts if the event turns out valid.
+        let n = out.npe;
+        let pe = out.pend_e.as_mut_ptr().add(n);
+        let (h, hb) = hash_pair(fast::pack_at(base, s0, s0 + n0));
         let (s3, n3) = c.field(3);
+        let ing = out.dates.f1(base.add(s3), n3);
+        let x = (((hb >> 20) & H2_MASK) << H2_SHIFT) | ingest32_s(origin_s, ing) as u64;
+        (*pe).h = h;
+        (*pe).x = x;
+        let (s1, n1) = c.field(1);
+        let user = fast::pack_at(base, s1, s1 + n1);
+        let first = ctx.ids.first(hash64(user));
+        ctx.ids.prefetch_at(first);
+        (*pe).ulo = user as u64;
+        (*pe).uhi = (user >> 64) as u64;
+        (*pe).first = first;
         let (s4, n4) = c.field(4);
         let (s5, n5) = c.field(5);
-        let ek = fast::pack_at(base, s0, s0 + n0);
-        let ing = out.dates.f1(base.add(s3), n3);
-        let t = out.dates.ts(base.add(s2), n2);
-        // A user, a product, a time in the window, and not ingested more than 24 hours late.
-        let fresh = (ing != fast::BAD) & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY);
-        let ok = (n1 != 0) & (n5 != 0) & ((t.wrapping_sub(ctx.ws) as u64) < span) & fresh;
         let tp = base.add(s4);
         let w = std::ptr::read_unaligned(tp as *const u32);
-        let browse = ok & (n4 == 4) & ((w == VIEW) | (w == CART));
-        let (mut valid, mut ev, mut prod) = (false, 0u64, 0);
-        if opaque(browse as u64) != 0 {
-            valid = true;
-            ev = ((t - ctx.origin) as u64) << 33;
-        } else if ok && n4 == 8 && std::ptr::read_unaligned(tp as *const u64) == PURCHASE {
+        let browse = (n4 == 4) & ((w == VIEW) | (w == CART));
+        let (s2, n2) = c.field(2);
+        let t = out.dates.ts(base.add(s2), n2);
+        // A user, a product, a time in the window, and not ingested more than 24 hours late.
+        let fresh = fast::good(ing) & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY);
+        let ok = (n1 != 0) & (n5 != 0) & ((t.wrapping_sub(ctx.ws) as u64) < span) & fresh;
+        let mut ev = (t.wrapping_sub(ctx.origin) as u64) << 33;
+        let mut valid = ok & browse;
+        if opaque((ok & !browse) as u64) != 0 && n4 == 8 && std::ptr::read_unaligned(tp as *const u64) == PURCHASE {
             let (s6, n6) = c.field(6);
             if let Some(p) = parse_price(std::slice::from_raw_parts(base.add(s6), n6)) {
-                prod = fast::pack_at(base, s5, s5 + n5);
+                let prod = fast::pack_at(base, s5, s5 + n5);
+                ctx.aux.products.prefetch(prod);
+                out.pend_p.push((n as u32, prod));
                 valid = true;
-                ev = (((t - ctx.origin) as u64) << 33) | p as u64;
+                ev |= p as u64;
             }
         }
-        let user = fast::pack_at(base, s1, s1 + n1);
-        emit_event(ctx, out, tid, ek, ingest32_s(origin_s, ing), valid, user, ev, prod);
+        (*pe).ev = ev;
+        if valid {
+            out.npe = n + 1;
+            if n + 1 == PEND {
+                flush_events(ctx, out, tid, false);
+            }
+        } else {
+            let p = (h >> (64 - ctx.pbits)) as usize;
+            out.slim.push16(p, h, TAG | x, &mut out.arena_slim);
+        }
     }
     s
 }
@@ -1169,6 +1211,14 @@ impl Tl {
     }
 }
 
+/// Ask for the memory a few cache lines past `x` (lists are read front to back).
+#[inline(always)]
+fn ahead<T>(x: &T) {
+    unsafe {
+        core::arch::x86_64::_mm_prefetch((x as *const T as *const i8).wrapping_add(640), core::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
 fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
     let bslots = 1usize << ctx.qshift;
     let base = (q << ctx.qshift) as u32;
@@ -1182,6 +1232,7 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
     for o in outs {
         for (ptr, len) in o.ev.pieces(q) {
             for e in unsafe { std::slice::from_raw_parts(ptr, len) } {
+                ahead(e);
                 if e.ev != DEAD {
                     tl.cnt_e[(e.person & smask) as usize] += 1;
                     ne += 1;
@@ -1190,6 +1241,7 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
         }
         for (ptr, len) in o.ck.pieces(q) {
             for c in unsafe { std::slice::from_raw_parts(ptr, len) } {
+                ahead(c);
                 tl.cnt_c[(c.person & smask) as usize] += 1;
                 ncl += 1;
             }
@@ -1222,6 +1274,7 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
     for o in outs {
         for (ptr, len) in o.ev.pieces(q) {
             for e in unsafe { std::slice::from_raw_parts(ptr, len) } {
+                ahead(e);
                 if e.ev != DEAD {
                     let slot = (e.person & smask) as usize;
                     let at = tl.cnt_e[slot];
@@ -1232,6 +1285,7 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
         }
         for (ptr, len) in o.ck.pieces(q) {
             for c in unsafe { std::slice::from_raw_parts(ptr, len) } {
+                ahead(c);
                 let slot = (c.person & smask) as usize;
                 let at = tl.cnt_c[slot];
                 tl.cnt_c[slot] = at + 1;
@@ -1247,6 +1301,11 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
     let (mut pe, mut pc) = (0usize, 0usize);
     for i in 0..bslots {
         let (ee, ce) = (tl.cnt_e[i] as usize, tl.cnt_c[i] as usize);
+        // A person's name is read from the ID table, which is cold by now:
+        // ask for the names of the next few persons ahead of time.
+        if i + 24 < bslots && tl.cnt_e[i + 24] > tl.cnt_e[i + 23] {
+            ctx.ids.prefetch_at(base | (i + 24) as u32);
+        }
         if ee > pe {
             // Slots are visited in table order, so these reads are sequential.
             let big = ee - pe > 20_000;
@@ -1486,11 +1545,11 @@ fn attribute(cks: &mut [Ckl], tl: &mut Tl) {
             cells.rev[cell] += s.rev;
             serial += 1;
             for c in &cks[lo..hi] {
+                // (Counted without branching on whether the campaign is new here.)
                 let camp = c.camp as usize;
-                if stamp[camp] != serial {
-                    stamp[camp] = serial;
-                    cells.assisted[camp * nd + day] += 1;
-                }
+                let new = (stamp[camp] != serial) as u32;
+                stamp[camp] = serial;
+                cells.assisted[camp * nd + day] += new;
             }
         }
         tl.serial = serial;
