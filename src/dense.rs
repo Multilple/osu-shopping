@@ -1612,17 +1612,10 @@ unsafe fn attribute_small<const N: usize>(keys: &mut [u64], cids: &[u32], dn: &D
 fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
     let (nd, organic) = (me.tl.nd, me.tl.organic);
     let ns = me.tl.sess.len();
-    // Two spare sessions after the last, on day 0, so that the assist loop
-    // may look two sessions past a range it then adds nothing for.
-    me.tl.sess.reserve(2);
-    let sess = me.tl.sess.as_mut_ptr();
+    let sess = me.tl.sess.as_ptr();
     let (credit, assist) = (me.credit.as_mut_ptr(), me.assist.as_mut_ptr());
     let n0 = keys.len();
     unsafe {
-        let spare = Sess { start: 0, day: 0, purch: false, rev: 0, events: 0 };
-        sess.add(ns).write(spare);
-        sess.add(ns + 1).write(spare);
-        let sess = sess as *const Sess;
         if n0 == 0 {
             for i in 0..ns {
                 let s = &*sess.add(i);
@@ -1755,12 +1748,7 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
                 NHIST[n.min(15)].fetch_add(1, Relaxed);
             }
             // The first two sessions without a branch (see the two spare sessions above).
-            let row = assist.add(c * nd);
-            *row.add((*sess.add(from)).day as usize) += (n > 0) as u32;
-            *row.add((*sess.add(from + 1)).day as usize) += (n > 1) as u32;
-            if n > 2 {
-                add_days(row, df, from as i32 + 2, b as i32, nch);
-            }
+            add_days(assist.add(c * nd), df, from as i32, b as i32, nch);
         }
     }
 }
