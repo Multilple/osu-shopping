@@ -321,7 +321,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
             eprintln!("{:>8.1} ms  {:<28} user {:>7.1} sys {:>6.1} faults {}{}", now * 1e3, what, user, sys, faults, mem_note());
         }
         if !what.starts_with(' ') {
-            if pad.as_deref() == Some(what) {
+            if pad.as_deref().is_some_and(|p| what.starts_with(p)) {
                 padded.set(now - last.get());
             }
             last.set(now);
@@ -567,6 +567,14 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     lap("campaign_daily");
     if pad.is_some() {
         wait_until = 2.0 + 10.0 * padded.get();
+        // SS_PART=1: the stage's share of the whole instead: the run ends at
+        // 4 s + 10 s x (stage time / work time).
+        if std::env::var_os("SS_PART").is_some() {
+            wait_until = 4.0 + 10.0 * padded.get() / t0.elapsed().as_secs_f64();
+        }
+        if log {
+            eprintln!("    pad: stage {:.3} s of {:.3} s, ends at {:.2} s", padded.get(), t0.elapsed().as_secs_f64(), wait_until);
+        }
     }
     // SS_DIAG=3: the total run time tells how long the work itself took
     // (t), whether memory really is on huge pages, and how much memory all
