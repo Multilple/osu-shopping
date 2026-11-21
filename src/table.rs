@@ -8,16 +8,16 @@ use crate::util::*;
 
 pub fn map_anon(bytes: usize) -> *mut u8 {
     unsafe {
-        let p = libc::mmap(
+        let p = sys::mmap(
             std::ptr::null_mut(),
             bytes,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            sys::PROT_READ | sys::PROT_WRITE,
+            sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
             -1,
             0,
         );
-        assert!(p != libc::MAP_FAILED, "mmap of {bytes} bytes failed");
-        libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+        assert!(p != sys::MAP_FAILED, "mmap of {bytes} bytes failed");
+        sys::madvise(p, bytes, sys::MADV_HUGEPAGE);
         p as *mut u8
     }
 }

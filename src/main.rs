@@ -311,7 +311,7 @@ fn read_file(path: &Path) -> Vec<u8> {
 
 /// The lines after the header row.
 fn data_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let body = match memchr::memchr(b'\n', bytes) {
+    let body = match memchr(b'\n', bytes) {
         Some(i) => &bytes[i + 1..],
         None => &bytes[bytes.len()..],
     };
@@ -325,7 +325,7 @@ fn lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
         if pos >= data.len() {
             return None;
         }
-        let end = match memchr::memchr(b'\n', &data[pos..]) {
+        let end = match memchr(b'\n', &data[pos..]) {
             Some(i) => pos + i,
             None => data.len(),
         };
@@ -349,13 +349,13 @@ fn map_dir(dir: &Path) -> Vec<Mmap> {
 }
 
 fn manifest_time(text: &[u8], key: &str) -> i64 {
-    let at = memchr::memmem::find(text, key.as_bytes()).expect("manifest key");
+    let at = memfind(text, key.as_bytes()).expect("manifest key");
     let rest = &text[at + key.len()..];
-    let colon = memchr::memchr(b':', rest).expect("manifest colon");
+    let colon = memchr(b':', rest).expect("manifest colon");
     let rest = &rest[colon + 1..];
-    let q1 = memchr::memchr(b'"', rest).expect("manifest value");
+    let q1 = memchr(b'"', rest).expect("manifest value");
     let rest = &rest[q1 + 1..];
-    let q2 = memchr::memchr(b'"', rest).expect("manifest value end");
+    let q2 = memchr(b'"', rest).expect("manifest value end");
     parse_ts(&rest[..q2]).expect("manifest timestamp")
 }
 
@@ -440,12 +440,12 @@ fn build_ctx(data: &Path, event_bytes: usize, click_bytes: usize, link_bytes: us
 }
 
 fn chunk_tasks(bytes: &[u8], events: bool, file: usize, chunk: usize, tasks: &mut Vec<Task>) {
-    let Some(header) = memchr::memchr(b'\n', bytes) else { return };
+    let Some(header) = memchr(b'\n', bytes) else { return };
     let mut start = header + 1;
     while start < bytes.len() {
         let mut end = (start + chunk).min(bytes.len());
         if end < bytes.len() {
-            end = match memchr::memchr(b'\n', &bytes[end..]) {
+            end = match memchr(b'\n', &bytes[end..]) {
                 Some(i) => end + i + 1,
                 None => bytes.len(),
             };
@@ -453,6 +453,11 @@ fn chunk_tasks(bytes: &[u8], events: bool, file: usize, chunk: usize, tasks: &mu
         tasks.push(Task { events, file, start, end });
         start = end;
     }
+}
+
+fn exp() -> u32 {
+    static EXP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *EXP.get_or_init(|| std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 fn slow_only() -> bool {
@@ -601,12 +606,13 @@ fn flush_clicks(ctx: &Ctx, out: &mut ThreadOut) {
 
 fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
     let base = file.as_ptr();
+    let exp = exp();
     let rest = if slow_only() {
         start
     } else {
         unsafe {
             fast::scan(file, start, end, |ls, commas, nc, le, nq| {
-                if nc != 6 {
+                if nc != 6 || exp == 1 {
                     return;
                 }
                 let mut s = [ls, commas[0] + 1, commas[1] + 1, commas[2] + 1, commas[3] + 1, commas[4] + 1, commas[5] + 1];
@@ -645,6 +651,10 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
                     }
                 }
                 let user = if ev.is_some() { fast::pack_at(base, s[1], e[1]) } else { 0 };
+                if exp == 2 {
+                    std::hint::black_box((ek, user, ev, ing));
+                    return;
+                }
                 emit_event(ctx, out, tid, ek, user, ev, ing);
             })
         }

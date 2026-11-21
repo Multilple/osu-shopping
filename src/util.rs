@@ -231,6 +231,36 @@ impl<V: Copy> KMap<V> {
     }
 }
 
+// ---------------------------------------------------------------- libc
+
+/// The few libc calls and constants used (x86-64 Linux), declared here so the
+/// build needs no crates.
+pub mod sys {
+    use std::ffi::c_void;
+    pub const PROT_READ: i32 = 1;
+    pub const PROT_WRITE: i32 = 2;
+    pub const MAP_PRIVATE: i32 = 2;
+    pub const MAP_ANONYMOUS: i32 = 0x20;
+    pub const MAP_NORESERVE: i32 = 0x4000;
+    pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
+    pub const MADV_SEQUENTIAL: i32 = 2;
+    pub const MADV_WILLNEED: i32 = 3;
+    pub const MADV_HUGEPAGE: i32 = 14;
+    extern "C" {
+        pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+        pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+    }
+}
+
+#[inline(always)]
+pub fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
+    hay.iter().position(|&c| c == needle)
+}
+
+pub fn memfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 // ---------------------------------------------------------------- mmap
 
 pub struct Mmap {
@@ -253,20 +283,20 @@ impl Mmap {
             });
         }
         let ptr = unsafe {
-            libc::mmap(
+            sys::mmap(
                 std::ptr::null_mut(),
                 len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
+                sys::PROT_READ,
+                sys::MAP_PRIVATE,
                 file.as_raw_fd(),
                 0,
             )
         };
-        if ptr == libc::MAP_FAILED {
+        if ptr == sys::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
         unsafe {
-            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED);
+            sys::madvise(ptr, len, sys::MADV_SEQUENTIAL | sys::MADV_WILLNEED);
         }
         Ok(Mmap {
             ptr: ptr as *const u8,
@@ -286,11 +316,11 @@ impl Mmap {
 /// quote appears anywhere else.
 #[inline(always)]
 pub fn unquote(f: &[u8]) -> Option<&[u8]> {
-    if memchr::memchr(b'"', f).is_none() {
+    if memchr(b'"', f).is_none() {
         return Some(f);
     }
     let n = f.len();
-    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && memchr::memchr(b'"', &f[1..n - 1]).is_none() {
+    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && memchr(b'"', &f[1..n - 1]).is_none() {
         Some(&f[1..n - 1])
     } else {
         None
@@ -303,7 +333,10 @@ pub fn split<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut out: [&[u8]; N] = [&[]; N];
     let mut k = 0;
     let mut start = 0;
-    for i in memchr::memchr_iter(b',', line) {
+    for (i, &c) in line.iter().enumerate() {
+        if c != b',' {
+            continue;
+        }
         if k == N - 1 {
             return None;
         }
@@ -439,61 +472,5 @@ pub fn parse_price(b: &[u8]) -> Option<u32> {
     match parse_digits(b, 8) {
         Some(v) if (1..=10_000_000).contains(&v) => Some(v as u32),
         _ => None,
-    }
-}
-
-// ---------------------------------------------------------------- link map
-
-/// user ID -> person name, for IDs that are not their own name. Key and value
-/// share a slot so a lookup touches one cache line.
-pub struct LinkMap {
-    slots: Vec<[Key; 2]>,
-    shift: u32,
-    mask: usize,
-}
-
-impl LinkMap {
-    pub fn with_capacity(n: usize) -> LinkMap {
-        let cap = (n.max(8) * 2).next_power_of_two();
-        LinkMap { slots: vec![[0, 0]; cap], shift: 64 - cap.trailing_zeros(), mask: cap - 1 }
-    }
-
-    pub fn set(&mut self, k: Key, v: Key) {
-        let mut i = (hash64(k) >> self.shift) as usize;
-        loop {
-            let s = &mut self.slots[i];
-            if s[0] == 0 || s[0] == k {
-                *s = [k, v];
-                return;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-
-    #[inline(always)]
-    pub fn prefetch(&self, k: Key) {
-        let i = (hash64(k) >> self.shift) as usize;
-        unsafe {
-            core::arch::x86_64::_mm_prefetch(
-                self.slots.as_ptr().add(i) as *const i8,
-                core::arch::x86_64::_MM_HINT_T0,
-            );
-        }
-    }
-
-    /// The person an ID belongs to.
-    #[inline(always)]
-    pub fn person(&self, k: Key) -> Key {
-        let mut i = (hash64(k) >> self.shift) as usize;
-        loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            if s[0] == k {
-                return s[1];
-            }
-            if s[0] == 0 {
-                return k;
-            }
-            i = (i + 1) & self.mask;
-        }
     }
 }

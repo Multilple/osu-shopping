@@ -8,8 +8,6 @@ name = "ss"
 path = "src/main.rs"
 
 [dependencies]
-libc = "0.2"
-memchr = "2"
 
 [profile.release]
 opt-level = 3
