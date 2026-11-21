@@ -1346,6 +1346,209 @@ fn settle_ties(keys: &mut [u64], cids: &[u32], dn: &Dn) -> usize {
     n
 }
 
+/// Sorts the first N (4, 8 or 16) of 16 keys with a fixed network
+/// (Batcher's odd-even merge): no branch.
+#[inline(always)]
+fn sort_net<const N: usize>(k: &mut [u64; 16]) {
+    macro_rules! ce {
+        ($a:expr, $b:expr) => {{
+            let (x, y) = (k[$a], k[$b]);
+            k[$a] = x.min(y);
+            k[$b] = x.max(y);
+        }};
+    }
+    if N == 4 {
+        ce!(0, 1);
+        ce!(2, 3);
+        ce!(0, 2);
+        ce!(1, 3);
+        ce!(1, 2);
+    } else if N == 8 {
+        ce!(0, 1);
+        ce!(2, 3);
+        ce!(0, 2);
+        ce!(1, 3);
+        ce!(1, 2);
+        ce!(4, 5);
+        ce!(6, 7);
+        ce!(4, 6);
+        ce!(5, 7);
+        ce!(5, 6);
+        ce!(0, 4);
+        ce!(2, 6);
+        ce!(2, 4);
+        ce!(1, 5);
+        ce!(3, 7);
+        ce!(3, 5);
+        ce!(1, 2);
+        ce!(3, 4);
+        ce!(5, 6);
+    } else {
+        ce!(0, 1);
+        ce!(2, 3);
+        ce!(0, 2);
+        ce!(1, 3);
+        ce!(1, 2);
+        ce!(4, 5);
+        ce!(6, 7);
+        ce!(4, 6);
+        ce!(5, 7);
+        ce!(5, 6);
+        ce!(0, 4);
+        ce!(2, 6);
+        ce!(2, 4);
+        ce!(1, 5);
+        ce!(3, 7);
+        ce!(3, 5);
+        ce!(1, 2);
+        ce!(3, 4);
+        ce!(5, 6);
+        ce!(8, 9);
+        ce!(10, 11);
+        ce!(8, 10);
+        ce!(9, 11);
+        ce!(9, 10);
+        ce!(12, 13);
+        ce!(14, 15);
+        ce!(12, 14);
+        ce!(13, 15);
+        ce!(13, 14);
+        ce!(8, 12);
+        ce!(10, 14);
+        ce!(10, 12);
+        ce!(9, 13);
+        ce!(11, 15);
+        ce!(11, 13);
+        ce!(9, 10);
+        ce!(11, 12);
+        ce!(13, 14);
+        ce!(0, 8);
+        ce!(4, 12);
+        ce!(4, 8);
+        ce!(2, 10);
+        ce!(6, 14);
+        ce!(6, 10);
+        ce!(2, 4);
+        ce!(6, 8);
+        ce!(10, 12);
+        ce!(1, 9);
+        ce!(5, 13);
+        ce!(5, 9);
+        ce!(3, 11);
+        ce!(7, 15);
+        ce!(7, 11);
+        ce!(3, 5);
+        ce!(7, 9);
+        ce!(11, 13);
+        ce!(1, 2);
+        ce!(3, 4);
+        ce!(5, 6);
+        ce!(7, 8);
+        ce!(9, 10);
+        ce!(11, 12);
+        ce!(13, 14);
+    }
+}
+
+/// After `settle_ties`: the keys left, back into the padded array.
+#[cold]
+#[inline(never)]
+fn small_ties(k: &mut [u64; 16], keys: &mut [u64], cids: &[u32], dn: &Dn) -> usize {
+    let n0 = keys.len();
+    keys.copy_from_slice(&k[..n0]);
+    let n = settle_ties(keys, cids, dn);
+    k[..n].copy_from_slice(&keys[..n]);
+    for x in &mut k[n..] {
+        *x = u64::MAX;
+    }
+    n
+}
+
+/// `attribute` for a person with 1 to 16 clicks, with as few branches that
+/// depend on the data as can be: the keys are sorted by a network, and each
+/// session finds its clicks by counting with vector compares (the clicks
+/// at most 7 days before its start are a range [lo, hi) of the sorted
+/// keys; the last of them credits it; of each campaign in the range the
+/// last click assists it).
+#[inline(always)]
+unsafe fn attribute_small<const N: usize>(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut, sess: *const Sess, ns: usize) {
+    use std::arch::x86_64::*;
+    let (nd, organic) = (me.tl.nd, me.tl.organic);
+    let (credit, assist) = (me.credit.as_mut_ptr(), me.assist.as_mut_ptr());
+    let ob = dn.obits;
+    let n0 = keys.len();
+    let kp = keys.as_ptr();
+    let mut k = [u64::MAX; 16];
+    for (i, x) in k.iter_mut().enumerate().take(N) {
+        let v = *kp.add(i.min(n0 - 1)) | i as u64;
+        *x = if i < n0 { v } else { u64::MAX };
+    }
+    sort_net::<N>(&mut k);
+    // Two clicks at one time for different campaigns differ by at least a
+    // campaign step and by less than a time step (the padding never does).
+    let (lo1, span) = (1u64 << ob, (1u64 << 32) - (1u64 << ob));
+    let mut tie = false;
+    for i in 1..N {
+        tie |= (k[i] ^ k[i - 1]).wrapping_sub(lo1) < span;
+    }
+    let n = if tie { small_ties(&mut k, keys, cids, dn) } else { n0 };
+    let cmask = (1u64 << (32 - ob)) - 1;
+    // Per click: its time and its time plus 7 days (as signed numbers for
+    // the compares, the padding above every time), and its campaign's row.
+    let mut ts = [0x7FFF_FFFFu32; 16];
+    let mut tw = [0x7FFF_FFFFu32; 16];
+    let mut camp = [organic; 16];
+    for j in 0..N {
+        let t = (k[j] >> 32) as u32;
+        let real = k[j] != u64::MAX;
+        ts[j] = t ^ 0x8000_0000;
+        tw[j] = (if real { t + WEEK } else { u32::MAX }) ^ 0x8000_0000;
+        camp[j] = if real { ((k[j] >> ob) & cmask) as usize } else { organic };
+    }
+    // nxt[j]: the next click of the same campaign (16: none).
+    me.serial += 1;
+    let serial = me.serial;
+    let cov = me.cov.as_mut_ptr();
+    let mut nxt = [0i32; 16];
+    for j in (0..N).rev() {
+        let e = &mut *cov.add(camp[j]);
+        let m = 0u32.wrapping_sub((e[0] == serial) as u32);
+        nxt[j] = ((e[1] & m) | (16 & !m)) as i32;
+        *e = [serial, j as u32];
+    }
+    let mut row = [0usize; 16];
+    for j in 0..N {
+        row[j] = camp[j] * nd;
+    }
+    let ld = |a: &[u32; 16], h: usize| _mm256_loadu_si256(a.as_ptr().add(h) as *const __m256i);
+    let (ts0, ts1, tw0, tw1) = (ld(&ts, 0), ld(&ts, 8), ld(&tw, 0), ld(&tw, 8));
+    let nx0 = _mm256_loadu_si256(nxt.as_ptr() as *const __m256i);
+    let nx1 = _mm256_loadu_si256(nxt.as_ptr().add(8) as *const __m256i);
+    let mm = |a: __m256i, b: __m256i| {
+        (_mm256_movemask_ps(_mm256_castsi256_ps(a)) as u32) | (_mm256_movemask_ps(_mm256_castsi256_ps(b)) as u32) << 8
+    };
+    for i in 0..ns {
+        let s = &*sess.add(i);
+        let st = _mm256_set1_epi32((s.start ^ 0x8000_0000) as i32);
+        // Clicks at or before the start, and those more than 7 days before it.
+        let hi = 16 - mm(_mm256_cmpgt_epi32(ts0, st), _mm256_cmpgt_epi32(ts1, st)).count_ones();
+        let lo = mm(_mm256_cmpgt_epi32(st, tw0), _mm256_cmpgt_epi32(st, tw1)).count_ones();
+        let c = if hi > lo { camp[(hi as usize).max(1) - 1] } else { organic };
+        let day = s.day as usize;
+        let cr = &mut *credit.add(c * nd + day);
+        cr.sessions += 1;
+        cr.purch += s.purch as u32;
+        cr.rev += s.rev;
+        // Of each campaign in [lo, hi), the click whose next one is not.
+        let h1 = _mm256_set1_epi32(hi as i32 - 1);
+        let last = mm(_mm256_cmpgt_epi32(nx0, h1), _mm256_cmpgt_epi32(nx1, h1));
+        let cm = last & ((1u32 << hi) - 1) & !((1u32 << lo) - 1);
+        for j in 0..n {
+            *assist.add(row[j] + day) += (cm >> j) & 1;
+        }
+    }
+}
+
 /// Credit and assists for the sessions in `tl.sess` (in time order) from the
 /// person's clicks: their keys, in any order, and their numbers.
 ///
@@ -1388,6 +1591,16 @@ fn attribute(keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
             me.big.clear();
             me.big.extend(keys.iter().zip(cids).map(|(&k, &cid)| Ckd { ts: (k >> 32) as u32, cid, camp: (k as u32) >> ob }));
             crate::attribute(&mut me.big, &mut me.tl);
+            return;
+        }
+        if n0 <= 16 {
+            if n0 <= 4 {
+                attribute_small::<4>(keys, cids, dn, me, sess, ns);
+            } else if n0 <= 8 {
+                attribute_small::<8>(keys, cids, dn, me, sess, ns);
+            } else {
+                attribute_small::<16>(keys, cids, dn, me, sess, ns);
+            }
             return;
         }
         if me.timed {
