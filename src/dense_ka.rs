@@ -90,6 +90,13 @@ pub(crate) struct K {
     s_idx: u64,
     s_key: u64,
     s_n: u64,
+    /// The newline before the line the pass that ended was on.
+    s_line: u64,
+    /// (A register the loop borrows.)
+    s_rbx: u64,
+    // Where a run of passes stops, and the event streams' states (`table::Slot16`).
+    limit: u64,
+    streams: u64,
     // Tables.
     /// By an ID's length plus 1: a mask keeping its digits in the 8 bytes
     /// that end where it ends (0 for lengths no ID has).
@@ -129,6 +136,10 @@ const ST_ODD: u64 = 1;
 const ST_FORM: u64 = 2;
 const ST_DATE: u64 = 3;
 const ST_SPECIAL: u64 = 5;
+/// No line may start where the next pass would: the run is done.
+const ST_END: u64 = 7;
+/// The record is ready, but its stream needs a new chunk first.
+const ST_CHUNK: u64 = 9;
 
 /// How far ahead of the line being parsed to ask for input bytes.
 const AHEAD: usize = 4096;
@@ -385,12 +396,17 @@ macro_rules! define_events {
     let mut a0 = base.add(s - 1);
     let kp: *mut K = k;
     let ($c, $q, $n) = ($set1(b',' as i8), $set1(b'"' as i8), $set1(b'\n' as i8));
+    (*kp).limit = limit as u64;
+    (*kp).streams = out.ev.base() as u64;
     while a0 < limit {
-        _mm_prefetch(a0.wrapping_add(AHEAD) as *const i8, _MM_HINT_T0);
-        _mm_prefetch(a0.wrapping_add(AHEAD + 64) as *const i8, _MM_HINT_T0);
         let (st, w0, w1, stream): (u64, u64, u64, u64);
-        let line = a0;
+        // Line after line, until one needs the code outside (or none is left).
         asm!(
+            "mov qword ptr [rdi + {s_rbx}], rbx",
+            "2:",
+            "prefetcht0 byte ptr [rsi + {ahead}]",
+            "prefetcht0 byte ptr [rsi + {ahead} + 64]",
+            "mov rbx, rsi",             // rbx: the newline before the line
             // ---- The masks: newlines 41..104 bytes on (r15); commas (rax) and quotes (rdx) of the first 64.
             $($head,)*
             "tzcnt r15, r15",
@@ -611,8 +627,25 @@ macro_rules! define_events {
             "add rdx, qword ptr [rdi + {rbias}]",
             "shl rdx, 33",
             "lea rdx, [rdx + rax*4]",   // rdx: ingest31 << 33 | ts offset << 2
-            "xor eax, eax",
+            // ---- The record goes to its stream, whose count, write pointer and waiting items are one 128-byte block.
+            "shl r8, 7",
+            "add r8, qword ptr [rdi + {streams}]",
+            "mov eax, dword ptr [r8]",
+            "lea r9d, [rax + 1]",
+            "mov dword ptr [r8], r9d",
+            "and eax, 7",
+            "cmp eax, 7",
+            "je 70f",                   // the eighth: all eight go out
+            "shl eax, 4",
+            "mov qword ptr [r8 + rax + 16], rdx",
+            "mov qword ptr [r8 + rax + 24], rcx",
+            "71:",
+            "cmp rsi, qword ptr [rdi + {limit}]",
+            "jb 2b",
+            "mov eax, 7",               // no line may start here
             "99:",
+            "mov qword ptr [rdi + {s_line}], rbx",
+            "mov rbx, qword ptr [rdi + {s_rbx}]",
             // ---- Out of line.
             ".pushsection .text.unlikely.ss_ka,\"ax\",@progbits",
             // Ingest's date is not the date of ts: its own slot.
@@ -658,7 +691,39 @@ macro_rules! define_events {
             "88:",
             "mov eax, 1",
             "jmp 99b",
+            // The stream's seven waiting items and this one, out to where its items are kept.
+            "70:",
+            "lea eax, [r9 - 8]",        // the first one's index
+            "test eax, {chunk_mask}",
+            "jz 74f",                   // they start a chunk, which has to be made first
+            "mov r9, qword ptr [r8 + 8]",
+            "vmovdqu ymm0, ymmword ptr [r8 + 16]",
+            "vmovdqu ymm1, ymmword ptr [r8 + 48]",
+            "vmovdqu ymm2, ymmword ptr [r8 + 80]",
+            "vmovdqu xmm3, xmmword ptr [r8 + 112]",
+            "vmovq xmm4, rdx",
+            "vpinsrq xmm4, xmm4, rcx, 1",
+            "vinserti128 ymm3, ymm3, xmm4, 1",
+            "vmovntdq ymmword ptr [r9], ymm0",
+            "vmovntdq ymmword ptr [r9 + 32], ymm1",
+            "vmovntdq ymmword ptr [r9 + 64], ymm2",
+            "vmovntdq ymmword ptr [r9 + 96], ymm3",
+            "add r9, 128",
+            "mov qword ptr [r8 + 8], r9",
+            "jmp 71b",
+            "74:",
+            "sub dword ptr [r8], 1",    // (not appended after all: the code outside does it)
+            "sub r8, qword ptr [rdi + {streams}]",
+            "shr r8, 7",                // the stream's number again
+            "mov eax, 9",
+            "jmp 99b",
             ".popsection",
+            ahead = const AHEAD,
+            chunk_mask = const crate::dense::EvLists::CHUNK_MASK,
+            streams = const offset_of!(K, streams),
+            limit = const offset_of!(K, limit),
+            s_line = const offset_of!(K, s_line),
+            s_rbx = const offset_of!(K, s_rbx),
             t_keep = const offset_of!(K, t_keep),
             t_range = const offset_of!(K, t_range),
             t_fmask = const offset_of!(K, t_fmask),
@@ -732,12 +797,17 @@ macro_rules! define_events {
             out("ymm8") _, out("ymm9") _, out("ymm10") _, out("ymm11") _, out("ymm15") _,
             options(nostack),
         );
-        if st == 0 {
+        if st == ST_END {
+            break;
+        }
+        if st == ST_CHUNK {
             out.ev.push16(stream as usize, w0, w1, &mut out.arena);
             continue;
         }
+        let line = (*kp).s_line as *const u8;
         let next = cold(&mut *kp, st, line, file, end, ctx, dn, out);
         if next == usize::MAX {
+            a0 = line;
             break;
         }
         a0 = base.add(next - 1);

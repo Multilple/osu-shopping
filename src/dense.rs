@@ -40,6 +40,8 @@ use crate::table::{map_anon, release, Arena};
 /// less per record than plain stores (`table::Plain`) with 600 lists and
 /// 27% less with 1800, and do not get dearer as the lists multiply.
 pub(crate) type Lists = crate::table::Streams<[u64; 2], 10>;
+/// The event streams (appended to from the assembly kernel too).
+pub(crate) type EvLists = crate::table::Stage16<10>;
 use crate::util::*;
 use crate::{
     build_ctx, env_usize, fast, grid_tasks, input, lines, load_aux, par, person_grid, person_sorted,
@@ -490,7 +492,7 @@ pub(crate) struct DOut {
     /// in the second word and is followed by `[price | category << 24, EXT]`.
     /// (The first word orders the copies of an event: smallest ingest time
     /// first.)
-    pub(crate) ev: Lists,
+    pub(crate) ev: EvLists,
     /// Valid clicks by their user's person bucket (interned users: bucket
     /// `nq`): `[ts << 32 | campaign, node | click << 32]`.
     pub(crate) ck: Lists,
@@ -1795,7 +1797,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         .map(|_| {
             Shared(UnsafeCell::new(DOut {
                 arena: Arena::new(),
-                ev: Lists::new(nb),
+                ev: EvLists::new(nb),
                 ck: Lists::new(nq + 1),
                 reader: input::Reader::new(chunk),
                 pend_l: Vec::with_capacity(PEND),

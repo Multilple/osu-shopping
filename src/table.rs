@@ -550,6 +550,120 @@ impl<T: Copy, const CB: usize> Streams<T, CB> {
     }
 }
 
+/// One stream's write state and the items that wait: two cache lines.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct Slot16 {
+    /// Items appended so far.
+    pub n: u32,
+    _pad: u32,
+    /// Where the next eight items go.
+    pub dst: *mut [u64; 2],
+    /// The items that wait (an eighth never does: it leaves with these seven).
+    pub items: [[u64; 2]; 7],
+}
+
+/// `Streams` for 16-byte items with each stream's count, write pointer and
+/// waiting items together in two cache lines, moved out eight at a time: the
+/// layout the event kernel appends to from assembly (`dense_ka`).
+pub struct Stage16<const CB: usize> {
+    slots: Vec<Slot16>,
+    chunks: Vec<Vec<*mut [u64; 2]>>,
+}
+
+unsafe impl<const CB: usize> Sync for Stage16<CB> {}
+unsafe impl<const CB: usize> Send for Stage16<CB> {}
+
+impl<const CB: usize> Stage16<CB> {
+    /// A chunk's items less one.
+    pub const CHUNK_MASK: usize = (1 << CB) - 1;
+
+    pub fn new(streams: usize) -> Self {
+        assert!(std::mem::size_of::<Slot16>() == 128 && CB >= 3);
+        Stage16 {
+            slots: vec![Slot16 { n: 0, _pad: 0, dst: std::ptr::null_mut(), items: [[0; 2]; 7] }; streams],
+            chunks: (0..streams).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    /// The streams' states, 128 bytes each, by stream number.
+    pub fn base(&mut self) -> *mut Slot16 {
+        self.slots.as_mut_ptr()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn new_chunk(&mut self, s: usize, arena: &mut Arena) {
+        let p = arena.alloc(16 << CB) as *mut [u64; 2];
+        self.chunks[s].push(p);
+        self.slots[s].dst = p;
+    }
+
+    /// Append an item, given as two words, to stream `s`; returns its index.
+    #[inline(always)]
+    pub fn push16(&mut self, s: usize, a: u64, b: u64, arena: &mut Arena) -> usize {
+        unsafe {
+            let slot = self.slots.as_mut_ptr().add(s);
+            let n = (*slot).n as usize;
+            (*slot).n = (n + 1) as u32;
+            let r = n & 7;
+            if r == 7 {
+                self.out8(s, n, a, b, arena);
+            } else {
+                *(*slot).items.as_mut_ptr().add(r) = [a, b];
+            }
+            n
+        }
+    }
+
+    /// Stream `s`'s seven waiting items and item `n` (`a`, `b`) go out.
+    #[inline]
+    unsafe fn out8(&mut self, s: usize, n: usize, a: u64, b: u64, arena: &mut Arena) {
+        use core::arch::x86_64::*;
+        if (n - 7) & Self::CHUNK_MASK == 0 {
+            self.new_chunk(s, arena);
+        }
+        let slot = self.slots.as_mut_ptr().add(s);
+        let d = (*slot).dst as *mut __m256i;
+        let src = (*slot).items.as_ptr() as *const __m256i;
+        _mm256_stream_si256(d, _mm256_loadu_si256(src));
+        _mm256_stream_si256(d.add(1), _mm256_loadu_si256(src.add(1)));
+        _mm256_stream_si256(d.add(2), _mm256_loadu_si256(src.add(2)));
+        let last = _mm_loadu_si128((src as *const __m128i).add(6));
+        let hi = _mm256_inserti128_si256(_mm256_castsi128_si256(last), _mm_set_epi64x(b as i64, a as i64), 1);
+        _mm256_stream_si256(d.add(3), hi);
+        (*slot).dst = d.add(4) as *mut [u64; 2];
+    }
+
+    /// Move the items that still wait out. Call once, when done appending.
+    pub fn finish(&mut self, arena: &mut Arena) {
+        for s in 0..self.slots.len() {
+            let n = self.slots[s].n as usize;
+            let r = n & 7;
+            for k in 0..r {
+                let idx = n - r + k;
+                let off = idx & Self::CHUNK_MASK;
+                if off == 0 && self.chunks[s].len() == idx >> CB {
+                    let p = arena.alloc(16 << CB) as *mut [u64; 2];
+                    self.chunks[s].push(p);
+                }
+                unsafe { self.chunks[s][idx >> CB].add(off).write(self.slots[s].items[k]) };
+            }
+        }
+        unsafe { core::arch::x86_64::_mm_sfence() };
+    }
+
+    pub fn len(&self, s: usize) -> usize {
+        self.slots[s].n as usize
+    }
+
+    /// Stream `s` as (pointer, length) pieces (after `finish`).
+    pub fn pieces(&self, s: usize) -> impl Iterator<Item = (*mut [u64; 2], usize)> + '_ {
+        let n = self.slots[s].n as usize;
+        self.chunks[s].iter().enumerate().map(move |(i, &p)| (p, (n - (i << CB)).min(1 << CB)))
+    }
+}
+
 /// Many append-only lists of 16-byte items, each stored in chunks of
 /// `1 << CB` items, written in place with plain stores: appending is a load
 /// of the list's write pointer, two stores and a store of the pointer, with
