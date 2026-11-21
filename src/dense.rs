@@ -47,7 +47,7 @@ pub(crate) type EvLists = crate::table::Stage16<10>;
 pub(crate) type CkLists = crate::table::Stage16P<10>;
 use crate::util::*;
 use crate::{
-    build_ctx, env_usize, fast, grid_tasks, input, lines, load_aux, par, person_grid, person_sorted,
+    build_ctx, env_usize, fast, grid_tasks, input, lines, load_aux, par, person_sorted,
     slow_only, write_campaign_daily, write_user_daily, user_run, Cells, Click, Ctx, Rows, Sess, Shared, Tl, DAY_MS, GAP, NOCAT, WEEK,
 };
 
@@ -515,6 +515,9 @@ struct AOut {
     /// The bucket's table: the kept copy of each event number so far.
     w: Vec<[u64; 2]>,
     purch: Vec<u64>,
+    /// Scratch for the run in progress: its purchases (`session << 40 |
+    /// category << 24 | price`).
+    pscr: Vec<u64>,
 }
 
 /// A thread's state while putting persons together.
@@ -526,7 +529,6 @@ struct BOut {
     keys: Vec<u64>,
     cids: Vec<u32>,
     irr: Vec<(u32, *mut u64, u32)>,
-    gather: Vec<u64>,
     /// Clicks of persons that need a lookup: `[person | click << 32, ts << 32 | campaign]`.
     sp_ck: Vec<[u64; 2]>,
     /// Per campaign: the person it was last seen for, and how far into that
@@ -544,11 +546,15 @@ struct BOut {
     hi: Vec<u32>,
     ca: Vec<u32>,
     cb: Vec<u32>,
-    /// Scratch for one person: each session's start and event count, and
-    /// the purchases (session << 40 | category << 24 | price).
-    sstart: Vec<u32>,
-    scount: Vec<u32>,
+    /// Scratch for one person: each session's `start << 32 | event count`,
+    /// and the purchases (session << 40 | category << 24 | price).
+    sstart: Vec<u64>,
     spurch: Vec<u64>,
+    /// Scratch for a person with several runs: all their runs' sessions,
+    /// their order by start, and the session of the whole each one is part of.
+    sall: Vec<u64>,
+    sorder: Vec<u32>,
+    smap: Vec<u32>,
     /// Scratch for one person: each session's user_daily row, and each
     /// day's (the last row written for it).
     srow: Vec<u32>,
@@ -1003,50 +1009,85 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: 
 
 // ---------------------------------------------------------------- dedup
 
-/// What the walk over a bucket's table keeps between runs.
+/// Stage A's output, per run of one person's events (in event order):
+/// `[person | sessions << 32, (start << 32 | events, end) per session...,
+/// purchases...]`, `end` being the time of the session's last event, the
+/// first session's `end` word holding the number of purchases above bit 32,
+/// and a purchase being `session << 40 | category << 24 | price` (the session
+/// counted within the run).
+///
+/// Every session is a chain of events, each at most 30 minutes after the one
+/// before (a step back in time starts a new session, as a gap does), so it
+/// lies within one session of the person's whole time line whatever the
+/// order of the events: the sessions of all of a person's runs put together
+/// as intervals (`person_multi`) give the exact result. Only events in time
+/// order, the usual case, give sessions that need no putting together.
 struct Walk<'a> {
     dn: &'a Dn,
     me: &'a mut AOut,
     buf: *mut u64,
-    /// The open run's header.
-    hdr: *mut u64,
     cur_q: u32,
     /// Where the open segment starts.
     seg: *mut u64,
+    /// The open run's header (null: none yet).
+    hdr: *mut u64,
 }
 
 impl Walk<'_> {
-    /// The run in progress ends before `out`.
-    #[inline(always)]
-    unsafe fn close(&mut self, out: *mut u64) {
-        if !self.hdr.is_null() {
-            *self.hdr |= (out.offset_from(self.hdr) as u64 - 1) << 32;
-        }
-    }
-
-    /// An event whose person is not the open run's: start a run (the event
-    /// follows its header at the place returned), or, for a person that
-    /// needs a lookup, put the event on the side list (`None`).
+    /// An event of a person that needs a lookup: on the side list.
     #[cold]
     #[inline(never)]
-    unsafe fn turn(&mut self, p: u32, node: u32, ev: u64, out: *mut u64) -> Option<*mut u64> {
-        if (p as i32) < 0 {
-            self.me.sp_ev.push([self.dn.special_person(node) as u64, ev]);
-            return None;
+    unsafe fn special(&mut self, node: u32, w0: u64, w1: u64) {
+        let mut ev = w0 << 31;
+        if w0 & 2 != 0 {
+            ev = (ev ^ (1 << 32)) | self.me.purch[(w1 & LOW21) as usize];
         }
-        self.close(out);
+        self.me.sp_ev.push([self.dn.special_person(node) as u64, ev]);
+    }
+
+    /// The open run ends, its last session
+    /// at `sp`: write its sessions count and purchases (from the scratch up
+    /// to `pp`: pairs of the purchase's session and where its price is).
+    /// Returns where the next run's header goes.
+    #[cold]
+    #[inline(never)]
+    unsafe fn close(&mut self, sp: *mut u32, pp: *const u64) -> *mut u64 {
+        let hdr = self.hdr;
+        if hdr.is_null() {
+            return self.buf;
+        }
+        let pscr = self.me.pscr.as_ptr();
+        let np = pp.offset_from(pscr) as usize / 2;
+        let first = hdr.add(1) as usize;
+        let ns = (sp as usize - first) / 16 + 1;
+        *hdr |= (ns as u64) << 32;
+        *hdr.add(2) |= (np as u64) << 32;
+        let dst = hdr.add(1 + 2 * ns);
+        let purch = &self.me.purch;
+        for k in 0..np {
+            let sid = (*pscr.add(2 * k) as usize - first) / 16;
+            *dst.add(k) = (sid as u64) << 40 | purch[*pscr.add(2 * k + 1) as usize];
+        }
+        dst.add(np)
+    }
+
+    /// A run of person `p` starts with its header at `at`; returns where its
+    /// first session goes.
+    #[cold]
+    #[inline(never)]
+    unsafe fn open(&mut self, p: u32, at: *mut u64) -> *mut u32 {
         let q = p >> (self.dn.ku + 3);
         if q != self.cur_q {
             if self.cur_q != u32::MAX {
-                self.me.segs.push(Seg { q: self.cur_q, ptr: self.seg, words: out.offset_from(self.seg) as u32 });
+                self.me.segs.push(Seg { q: self.cur_q, ptr: self.seg, words: at.offset_from(self.seg) as u32 });
             }
             self.cur_q = q;
-            self.seg = out;
+            self.seg = at;
         }
         self.dn.mark_run(p);
-        self.hdr = out;
-        *out = p as u64;
-        Some(out.add(1))
+        *at = p as u64;
+        self.hdr = at;
+        at.add(1) as *mut u32
     }
 }
 
@@ -1129,48 +1170,120 @@ fn dedup_bucket(b: usize, outs: &[&DOut], dn: &Dn, me: &mut AOut) {
         }
     }
 
-    // Every valid kept event, in event order.
-    let room = 2 * nrec.min(ns) + 2;
+    // Every valid kept event, in event order, turned into sessions run by run.
+    // (Per run: a header word, at most a session (two words) and a purchase
+    // per event.)
+    let nmax = nrec.min(ns);
+    let room = 4 * nmax + 8;
     let buf = me.arena.alloc(room * 8) as *mut u64;
+    if me.pscr.len() < 2 * ns + 8 {
+        me.pscr.resize(2 * ns + 8, 0);
+    }
+    let pscr = me.pscr.as_mut_ptr();
     let r8 = dn.r8;
     let purch = me.purch.as_ptr();
-    let mut walk = Walk { dn, me, buf, hdr: std::ptr::null_mut(), cur_q: u32::MAX, seg: buf };
+    let mut walk = Walk { dn, me, buf, cur_q: u32::MAX, seg: buf, hdr: std::ptr::null_mut() };
     unsafe {
-        let mut out = buf;
+        // The open run: its header, its session's words (as halves: count,
+        // start, end), its start and count so far, the last event's time,
+        // where its next purchase goes in the scratch.
+        let mut sp: *mut u32 = std::ptr::null_mut();
+        let (mut start, mut cnt) = (0u32, 0u32);
+        let mut prev = 0u32;
+        let mut pp = pscr;
         // (No person has this number.)
         let mut cur_p = 0x7FFF_FFFFu32;
         let mut e = w;
         let wend = e.add(2 * ns);
-        while e != wend {
-            let (w0, w1) = (*e, *e.add(1));
-            // (Leave the table empty for the next bucket.)
-            *e = u64::MAX;
-            e = e.add(2);
-            // The time moves to the top; the ingest time above it falls off.
-            let mut ev = w0 << 31;
-            if w0 & 3 != 0 {
-                if w0 & 1 != 0 {
+        // (Kept in a register rather than set for every event.)
+        let ctl = std::hint::black_box(0x1F02u64);
+        loop {
+            // The open run's events (no calls here: the run's state stays in registers).
+            let (mut w0, mut w1, mut p) = (0u64, 0u64, 0u32);
+            let mut turn = false;
+            while e != wend {
+                let (a0, a1) = (*e, *e.add(1));
+                // (Leave the table empty for the next bucket.)
+                *e = u64::MAX;
+                e = e.add(2);
+                if a0 & 1 != 0 {
                     continue;
                 }
-                ev = (ev ^ (1 << 32)) | *purch.add((w1 & LOW21) as usize);
-            }
-            let node = (w1 >> 21) as u32;
-            // A node's entry gives its person's node; an entry of -1 ("look
-            // it up") gives a number no person has.
-            let p = node ^ (*r8.add(node as usize) as i8 as i32 as u32);
-            if p != cur_p {
-                match walk.turn(p, node, ev, out) {
-                    Some(o) => {
-                        out = o;
-                        cur_p = p;
-                    }
-                    None => continue,
+                let node = (a1 >> 21) as u32;
+                // A node's entry gives its person's node; an entry of -1 ("look
+                // it up") gives a number no person has.
+                let q = node ^ (*r8.add(node as usize) as i8 as i32 as u32);
+                if q != cur_p {
+                    (w0, w1, p, turn) = (a0, a1, q, true);
+                    break;
+                }
+                // In plain code (written out by hand: the compiler's takes a
+                // third more instructions):
+                //   let ts = (a0 >> 2) as u32 & 0x7FFF_FFFF;
+                //   let brk = ts.wrapping_sub(prev) > GAP;
+                //   start = if brk { ts } else { start };
+                //   cnt = if brk { 1 } else { cnt + 1 };
+                //   sp = sp.add(4 * brk as usize);
+                //   (*sp, *sp.add(1), *sp.add(2)) = (cnt, start, ts);
+                //   prev = ts;
+                // (A step back in time starts a session too: see `Walk`. The
+                // end word's top half stays as the run's start left it.)
+                std::arch::asm!(
+                    "bextr {ts:r}, {a0}, {ctl}",
+                    "mov {m:e}, {ts:e}",
+                    "sub {m:e}, {prev:e}",
+                    "cmp {m:e}, {gap1}",
+                    "cmovae {start:e}, {ts:e}",
+                    "sbb {m}, {m}",
+                    "and {cnt:e}, {m:e}",
+                    "inc {cnt:e}",
+                    "and {m}, -16",
+                    "lea {sp}, [{sp} + {m} + 16]",
+                    "mov dword ptr [{sp}], {cnt:e}",
+                    "mov dword ptr [{sp} + 4], {start:e}",
+                    "mov dword ptr [{sp} + 8], {ts:e}",
+                    "mov {prev:e}, {ts:e}",
+                    a0 = in(reg) a0,
+                    ctl = in(reg) ctl,
+                    gap1 = const GAP + 1,
+                    ts = out(reg) _,
+                    m = out(reg) _,
+                    prev = inout(reg) prev,
+                    start = inout(reg) start,
+                    cnt = inout(reg) cnt,
+                    sp = inout(reg) sp,
+                    options(nostack),
+                );
+                if a0 & 2 != 0 {
+                    // (Its session and price are found when the run ends.)
+                    *pp = sp as u64;
+                    *pp.add(1) = a1 & LOW21;
+                    pp = pp.add(2);
                 }
             }
-            *out = ev;
-            out = out.add(1);
+            if !turn {
+                break;
+            }
+            if (p as i32) < 0 {
+                walk.special((w1 >> 21) as u32, w0, w1);
+                continue;
+            }
+            // A new run, and its first event.
+            let at = walk.close(sp, pp);
+            sp = walk.open(p, at);
+            cur_p = p;
+            let ts = (w0 >> 2) as u32 & 0x7FFF_FFFF;
+            (start, cnt, prev) = (ts, 1, ts);
+            *(sp as *mut u64) = (ts as u64) << 32 | 1;
+            *(sp as *mut u64).add(1) = ts as u64;
+            pp = walk.me.pscr.as_mut_ptr();
+            if w0 & 2 != 0 {
+                *pp = sp as u64;
+                *pp.add(1) = w1 & LOW21;
+                pp = pp.add(2);
+            }
         }
-        walk.close(out);
+        let out = walk.close(sp, pp);
         if walk.cur_q != u32::MAX {
             let seg = Seg { q: walk.cur_q, ptr: walk.seg, words: out.offset_from(walk.seg) as u32 };
             walk.me.segs.push(seg);
@@ -1216,18 +1329,14 @@ fn reserve_rows(rows: &mut Rows, n: usize) {
 fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
     let n = evs.len();
     me.sstart.clear();
-    me.sstart.reserve(n + 1);
-    me.scount.clear();
-    me.scount.reserve(n + 1);
+    me.sstart.reserve(2 * n + 2);
     me.spurch.clear();
-    let (start, count) = (me.sstart.as_mut_ptr(), me.scount.as_mut_ptr());
+    let start = me.sstart.as_mut_ptr();
     let p = evs.as_ptr();
-    let tl = &mut me.tl;
     unsafe {
         let mut sid = 0usize;
         let mut prev = (*p >> 33) as u32;
-        let mut first = prev;
-        let mut cnt = 0u32;
+        let mut cur = (prev as u64) << 32;
         let mut back = false;
         for i in 0..n {
             let e = *p.add(i);
@@ -1236,10 +1345,9 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
             // (A step back in time looks like a gap here; `back` catches it.)
             let brk = ts.wrapping_sub(prev) > GAP;
             sid += brk as usize;
-            first = if brk { ts } else { first };
-            cnt = if brk { 1 } else { cnt + 1 };
-            *start.add(sid) = first;
-            *count.add(sid) = cnt;
+            cur = if brk { (ts as u64) << 32 | 1 } else { cur + 1 };
+            *start.add(2 * sid) = cur;
+            *start.add(2 * sid + 1) = ts as u64;
             prev = ts;
             if e & 0xFF_FFFF != 0 {
                 me.spurch.push((sid as u64) << 40 | (e & 0x1_FFFF_FFFF));
@@ -1248,7 +1356,21 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
         if back {
             return false;
         }
-        let ns = sid + 1;
+        let (np, pu) = (me.spurch.len(), me.spurch.as_ptr());
+        sess_rows(who, start, sid + 1, pu, np, me)
+    }
+}
+
+/// One person's sessions and user_daily rows from their sessions (two words
+/// each, the first `start << 32 | events`; in time order) and purchases (`session << 40 | category
+/// << 24 | price`). Neither list may be in `me.tl` or be `me.srow`/`me.dayrow`.
+/// Returns false, having written nothing, if a session does not start more
+/// than 30 minutes after the end (the second word's low half) of the one before.
+#[must_use]
+unsafe fn sess_rows(who: Key, sw: *const u64, ns: usize, pu: *const u64, np: usize, me: &mut BOut) -> bool {
+    let tl = &mut me.tl;
+    let purchases = std::slice::from_raw_parts(pu, np);
+    {
         tl.sess.clear();
         tl.sess.reserve(ns);
         let sess = tl.sess.as_mut_ptr();
@@ -1262,7 +1384,8 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
         // Sessions, and one row per day with a session: every session
         // writes its day's row as it stands so far at the row's number, and
         // the number moves on when the day changes (no branch on it).
-        reserve_rows(&mut tl.rows, tl.nd);
+        // (Sessions out of order may change days more often than there are days.)
+        reserve_rows(&mut tl.rows, tl.nd.max(ns));
         let rows = &mut tl.rows;
         let r0 = rows.n;
         let dayp = rows.day.as_mut_ptr().add(r0 * 4) as *mut i32;
@@ -1274,9 +1397,14 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
         let mut rc = usize::MAX;
         let mut prevday = u32::MAX;
         let (mut ds, mut de) = (0u32, 0u32);
+        // (The earliest start the next session may have.)
+        let mut next = 0u32;
+        let mut bad = false;
         for k in 0..ns {
-            let st = *start.add(k);
-            let events = *count.add(k);
+            let w = *sw.add(2 * k);
+            let (st, events) = ((w >> 32) as u32, w as u32);
+            bad |= st < next;
+            next = (*sw.add(2 * k + 1) as u32) + GAP + 1;
             let day = st / DAY_MS - 7;
             sess.add(k).write(Sess { start: st, day, purch: false, rev: 0, events });
             let newd = day != prevday;
@@ -1291,6 +1419,9 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
             catp.add(rc).write(NOCAT);
             *srow.add(k) = rc as u32;
             *dayrow.add(day as usize) = rc as u32;
+        }
+        if bad {
+            return false;
         }
         tl.sess.set_len(ns);
         let nrows = rc + 1;
@@ -1309,7 +1440,7 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
         // ranked byte-wise, so the smaller index wins a tie.
         let ncat = tl.ncat;
         let (daycat, best, best_sum) = (tl.daycat.as_mut_ptr(), tl.best.as_mut_ptr(), tl.best_sum.as_mut_ptr());
-        for &pp in &me.spurch {
+        for &pp in purchases {
             let si = (pp >> 40) as usize;
             let s = &mut *sess.add(si);
             let cat = ((pp >> 24) & 0x1FF) as usize;
@@ -1329,7 +1460,7 @@ fn person_stream(who: Key, evs: &[u64], me: &mut BOut) -> bool {
         }
         // (A day may be here more than once: the first time leaves its best
         // in the row, later ones find NOCAT, which is larger.)
-        for &pp in &me.spurch {
+        for &pp in purchases {
             let si = (pp >> 40) as usize;
             let d = (*sess.add(si)).day as usize;
             let cat = ((pp >> 24) & 0x1FF) as usize;
@@ -1815,21 +1946,112 @@ fn person_run(p: u32, evs: &mut [u64], keys: &mut [u64], cids: &[u32], dn: &Dn, 
     attribute(keys, cids, dn, me);
 }
 
+/// (Statistics, kept when timed: persons with one run whose sessions had to
+/// be put together (events out of time order); persons with several runs;
+/// sessions joined to the one before when putting runs together; persons
+/// whose sessions were not in order of start.)
+static RUNSTAT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+/// The sessions and purchases of a run at `hdr` (see `Walk`).
+#[inline(always)]
+unsafe fn run_parts(hdr: *const u64) -> (*const u64, usize, *const u64, usize) {
+    let ns = (*hdr >> 32) as usize;
+    let np = (*hdr.add(2) >> 32) as usize;
+    (hdr.add(1), ns, hdr.add(1 + 2 * ns), np)
+}
+
+/// One person whose events all came as one run, at `hdr`.
+#[inline(always)]
+unsafe fn person_sess(p: u32, hdr: *mut u64, keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
+    let who = dn.person_key(p);
+    // (A direct person's name is always short.)
+    debug_assert!(!is_long(who));
+    let (sw, ns, pu, np) = run_parts(hdr);
+    if !sess_rows(who, sw, ns, pu, np, me) {
+        if me.timed {
+            RUNSTAT[0].fetch_add(1, Relaxed);
+        }
+        return person_multi(p, &[(p, hdr, 0)], keys, cids, dn, me);
+    }
+    attribute(keys, cids, dn, me);
+}
+
+/// The time of a run's first event.
+#[inline(always)]
+unsafe fn run_first(hdr: *const u64) -> u32 {
+    (*hdr.add(1) >> 32) as u32
+}
+
+/// One person whose sessions came as several runs (`runs`, best sorted by
+/// their first times), or as one run whose sessions are not in order: put
+/// together exactly. In order of start, a session joins the one before when
+/// it starts at most 30 minutes after the latest end so far (see `Walk`: the
+/// sessions are chains of events; a chain within 30 minutes of another, or
+/// overlapping it, makes one chain with it).
+unsafe fn person_multi(p: u32, runs: &[(u32, *mut u64, u32)], keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
+    // Every run's sessions, one after the other, and their purchases
+    // (numbered among these).
+    let all = &mut me.sall;
+    all.clear();
+    me.spurch.clear();
+    for r in runs {
+        let (sw, ns, pu, np) = run_parts(r.1);
+        let base = (all.len() / 2) as u64;
+        all.extend_from_slice(std::slice::from_raw_parts(sw, 2 * ns));
+        for &pw in std::slice::from_raw_parts(pu, np) {
+            me.spurch.push(pw + (base << 40));
+        }
+    }
+    let n = all.len() / 2;
+    // In order of start (already so unless runs overlap or events were out of order).
+    let order = &mut me.sorder;
+    order.clear();
+    order.extend(0..n as u32);
+    let sorted = (1..n).all(|k| all[2 * k] >> 32 >= all[2 * k - 2] >> 32);
+    if !sorted {
+        order.sort_unstable_by_key(|&k| all[2 * k as usize] >> 32);
+    }
+    let (map, merged) = (&mut me.smap, &mut me.sstart);
+    map.clear();
+    map.resize(n, 0);
+    merged.clear();
+    let mut end = 0u32;
+    let mut joined = 0usize;
+    for &k in order.iter() {
+        let (w, e) = (all[2 * k as usize], all[2 * k as usize + 1] as u32);
+        let st = (w >> 32) as u32;
+        if !merged.is_empty() && st.saturating_sub(end) <= GAP {
+            let at = merged.len() - 2;
+            merged[at] += w & 0xFFFF_FFFF;
+            end = end.max(e);
+            merged[at + 1] = end as u64;
+            joined += 1;
+        } else {
+            merged.push(w);
+            merged.push(e as u64);
+            end = e;
+        }
+        map[k as usize] = (merged.len() / 2 - 1) as u32;
+    }
+    for pw in me.spurch.iter_mut() {
+        *pw = (*pw & ((1 << 40) - 1)) | (map[(*pw >> 40) as usize] as u64) << 40;
+    }
+    if me.timed {
+        RUNSTAT[1].fetch_add((runs.len() > 1) as usize, Relaxed);
+        RUNSTAT[2].fetch_add(joined, Relaxed);
+        RUNSTAT[3].fetch_add(!sorted as usize, Relaxed);
+    }
+    let who = dn.person_key(p);
+    let (sw, ns, pu, np) = (merged.as_ptr(), merged.len() / 2, me.spurch.as_ptr(), me.spurch.len());
+    let ok = sess_rows(who, sw, ns, pu, np, me);
+    debug_assert!(ok);
+    attribute(keys, cids, dn, me);
+}
+
 static NHIST: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 
 /// (Statistics: persons whose single run of events was not in time order.)
 static UNORDERED: AtomicUsize = AtomicUsize::new(0);
-
-/// One person whose events are in no particular order.
-fn person_any(p: u32, evs: &mut [u64], keys: &mut [u64], cids: &[u32], dn: &Dn, me: &mut BOut) {
-    let who = dn.person_key(p);
-    if evs.len() >= me.tl.grid_min {
-        person_grid(who, evs, &mut me.tl);
-    } else {
-        person_sorted(who, evs, &mut me.tl);
-    }
-    attribute(keys, cids, dn, me);
-}
 
 /// Person bucket `q`: its clicks sorted by person, then every person.
 fn person_bucket(q: usize, segs: &[Seg], outs: &[&DOut], dn: &Dn, me: &mut BOut) {
@@ -1917,37 +2139,37 @@ fn person_bucket(q: usize, segs: &[Seg], outs: &[&DOut], dn: &Dn, me: &mut BOut)
         let mut p = seg.ptr;
         let end = unsafe { p.add(seg.words as usize) };
         while p < end {
-            let (person, n) = unsafe { (*p as u32, (*p >> 32) as usize) };
-            let evs = unsafe { std::slice::from_raw_parts_mut(p.add(1), n) };
-            p = unsafe { p.add(1 + n) };
+            let hdr = p;
+            let (person, ns, np) = unsafe { (*hdr as u32, (*hdr >> 32) as usize, (*hdr.add(2) >> 32) as usize) };
+            p = unsafe { p.add(1 + 2 * ns + np) };
             if dn.one_run(person) {
                 let (k, c) = clicks(person);
-                me.prof[3] += n as f64;
-                person_run(person, evs, k, c, dn, me);
+                me.prof[3] += ns as f64;
+                unsafe { person_sess(person, hdr, k, c, dn, me) };
             } else {
-                me.prof[4] += n as f64;
-                me.irr.push((person, evs.as_mut_ptr(), n as u32));
+                me.prof[4] += ns as f64;
+                me.irr.push((person, hdr, unsafe { run_first(hdr) }));
             }
         }
     }
     let t_c = if timed { sys::thread_cpu() } else { 0.0 };
     me.prof[1] += t_c - t_b;
     if !me.irr.is_empty() {
-        // Persons whose events came in several runs: put each one's together.
-        me.irr.sort_unstable_by_key(|r| r.0);
-        let mut gather = std::mem::take(&mut me.gather);
+        // Persons whose events came in several runs: in time order.
+        let mut irr = std::mem::take(&mut me.irr);
+        irr.sort_unstable_by_key(|r| (r.0, r.2));
         let mut i = 0;
-        while i < me.irr.len() {
-            let person = me.irr[i].0;
-            gather.clear();
-            while i < me.irr.len() && me.irr[i].0 == person {
-                gather.extend_from_slice(unsafe { std::slice::from_raw_parts(me.irr[i].1, me.irr[i].2 as usize) });
-                i += 1;
+        while i < irr.len() {
+            let person = irr[i].0;
+            let mut j = i + 1;
+            while j < irr.len() && irr[j].0 == person {
+                j += 1;
             }
             let (k, c) = clicks(person);
-            person_any(person, &mut gather, k, c, dn, me);
+            unsafe { person_multi(person, &irr[i..j], k, c, dn, me) };
+            i = j;
         }
-        me.gather = gather;
+        me.irr = irr;
     }
     if timed {
         me.prof[2] += sys::thread_cpu() - t_c;
@@ -2308,7 +2530,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
 
     // ------------------------------------------------------------ dedup
     let aouts: Vec<Cell<AOut>> =
-        (0..threads).map(|_| Shared(UnsafeCell::new(AOut { arena: Arena::new(), segs: Vec::new(), sp_ev: Vec::new(), w: Vec::new(), purch: Vec::new() }))).collect();
+        (0..threads).map(|_| Shared(UnsafeCell::new(AOut { arena: Arena::new(), segs: Vec::new(), sp_ev: Vec::new(), w: Vec::new(), purch: Vec::new(), pscr: Vec::new() }))).collect();
     let next = AtomicUsize::new(0);
     par(threads, |tid| {
         let me = mine(&aouts, tid);
@@ -2372,7 +2594,6 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             keys: Vec::new(),
             cids: Vec::new(),
             irr: Vec::new(),
-            gather: Vec::new(),
             sp_ck: Vec::new(),
             cov: vec![[0; 2]; ctx.aux.camp_names.len() + 1],
             serial: 0,
@@ -2385,7 +2606,9 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             ca: Vec::new(),
             cb: Vec::new(),
             sstart: Vec::new(),
-            scount: Vec::new(),
+            sall: Vec::new(),
+            sorder: Vec::new(),
+            smap: Vec::new(),
             spurch: Vec::new(),
             srow: Vec::new(),
             dayrow: Vec::new(),
