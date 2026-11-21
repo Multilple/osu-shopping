@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [features]
 prof = []
+sprof = []
 
 [profile.release]
 opt-level = 3

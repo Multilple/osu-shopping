@@ -14,6 +14,8 @@
 
 mod fast;
 mod parquet;
+#[cfg(feature = "sprof")]
+mod sprof;
 mod table;
 mod util;
 
@@ -147,10 +149,14 @@ fn main() {
         .min(MAX_THREADS);
     // The ID table is sized from the input's size; if that guess is ever too
     // small, start over with a bigger one.
+    #[cfg(feature = "sprof")]
+    sprof::start();
     let mut scale = 1;
     while !run(&data_dir, &out_dir, threads, scale, t0) {
         scale *= 4;
     }
+    #[cfg(feature = "sprof")]
+    sprof::dump();
     // Skip destructors: the process is done.
     std::process::exit(0);
 }
@@ -253,6 +259,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     });
     if ctx.ids.overflow.load(Ordering::Relaxed) {
         return false;
+    }
+    if log {
+        eprintln!("    ids {} in {} slots, nq {}, pbits {}", ctx.ids.len(), ctx.ids.nregions * RSIZE, ctx.nq, ctx.pbits);
     }
     lap("parse");
     // From here on the per-thread outputs are shared read-only (dedup marks
@@ -637,6 +646,19 @@ fn flush_clicks(ctx: &Ctx, out: &mut ThreadOut) {
 fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
     let base = file.as_ptr();
     let exp = exp();
+    if exp == 3 {
+        return;
+    }
+    if exp == 4 || exp == 5 {
+        let mut sum = 0u64;
+        let mut i = start;
+        while i < end {
+            sum += file[i] as u64;
+            i += if exp == 4 { 64 } else { 4096 };
+        }
+        std::hint::black_box(sum);
+        return;
+    }
     let rest = if slow_only() {
         start
     } else {
@@ -1007,10 +1029,7 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
 
 /// One person: sessions, their user_daily rows, attribution and assists.
 fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
-    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     evs.sort_unstable();
-    let t1 = unsafe { core::arch::x86_64::_rdtsc() };
-    tl.prof[3] += (t1 - t0) as f64;
     let n = evs.len();
     let nd = tl.nd;
 
@@ -1060,8 +1079,6 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
     flush_row(who, cur_day, d_sessions, d_events, d_rev, tl);
 
     // ---- attribution
-    let t2 = unsafe { core::arch::x86_64::_rdtsc() };
-    tl.prof[4] += (t2 - t1) as f64;
     let organic = tl.organic;
     if cks.is_empty() {
         for s in &tl.sess {
@@ -1085,9 +1102,6 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
         }
     }
     let cks = &cks[..nc];
-    let t3 = unsafe { core::arch::x86_64::_rdtsc() };
-    tl.prof[6] += (t3 - t2) as f64;
-    tl.prof[10] += 1.0;
     let mut hi = 0;
     for s in &tl.sess {
         while hi < nc && cks[hi].ts <= s.start {
@@ -1102,21 +1116,15 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
 
     // ---- assists: per campaign, the union of [click, click + 7 days] over
     // its clicks; every session starting inside is assisted once.
-    let t4 = unsafe { core::arch::x86_64::_rdtsc() };
-    tl.prof[7] += (t4 - t3) as f64;
     tl.tmp.clear();
     tl.tmp.extend(cks.iter().map(|c| ((c.camp as u64) << 32) | c.ts as u64));
     if nc > 1 {
         tl.tmp.sort_unstable();
     }
-    let t5 = unsafe { core::arch::x86_64::_rdtsc() };
-    tl.prof[8] += (t5 - t4) as f64;
-    let mut nflush = 0u64;
     let sess = &tl.sess;
     let assisted = &mut tl.cells.assisted;
     let few = sess.len() <= 12;
     let mut flush = |camp: usize, a: u32, b: u32| {
-        nflush += 1;
         if few {
             for s in sess.iter() {
                 assisted[camp * nd + s.day as usize] += (s.start.wrapping_sub(a) <= b - a) as u32;
@@ -1152,9 +1160,6 @@ fn person(who: u32, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
         b = ts + WEEK;
     }
     flush(cur_camp as usize, a, b);
-    tl.prof[11] += nflush as f64;
-    tl.prof[9] += (unsafe { core::arch::x86_64::_rdtsc() } - t5) as f64;
-    tl.prof[5] += (unsafe { core::arch::x86_64::_rdtsc() } - t2) as f64;
 }
 
 #[inline(always)]

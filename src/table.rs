@@ -41,11 +41,18 @@ pub struct Slot {
 /// Every user ID seen, each in a fixed slot. The table is split into regions
 /// of 4096 slots; an ID hashes to a region and probes inside it. Lookups are
 /// lock-free; inserts take the region's lock.
+/// A region's insert lock and fill count, on a cache line of their own so
+/// threads inserting into different regions do not contend.
+#[repr(align(64))]
+struct Region {
+    lock: AtomicBool,
+    count: UnsafeCell<u16>,
+}
+
 pub struct IdTable {
     slots: *mut Slot,
     pub nregions: usize,
-    locks: Vec<AtomicBool>,
-    counts: Vec<UnsafeCell<u16>>,
+    regions: Vec<Region>,
     pub overflow: AtomicBool,
 }
 
@@ -58,14 +65,14 @@ impl IdTable {
         IdTable {
             slots: map_anon(nregions * RSIZE * std::mem::size_of::<Slot>()) as *mut Slot,
             nregions,
-            locks: (0..nregions).map(|_| AtomicBool::new(false)).collect(),
-            counts: (0..nregions).map(|_| UnsafeCell::new(0)).collect(),
+            regions: (0..nregions).map(|_| Region { lock: AtomicBool::new(false), count: UnsafeCell::new(0) }).collect(),
             overflow: AtomicBool::new(false),
         }
     }
 
-    pub fn nslots(&self) -> usize {
-        self.nregions * RSIZE
+    /// IDs in the table (call between stages only).
+    pub fn len(&self) -> usize {
+        self.regions.iter().map(|r| unsafe { *r.count.get() } as usize).sum()
     }
 
     #[inline(always)]
@@ -112,7 +119,7 @@ impl IdTable {
     #[inline(never)]
     fn insert(&self, klo: u64, khi: u64, base: usize, start: usize) -> u32 {
         let region = base >> RBITS;
-        let lock = &self.locks[region];
+        let lock = &self.regions[region].lock;
         while lock.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
             std::hint::spin_loop();
         }
@@ -124,7 +131,7 @@ impl IdTable {
                 break (base | pos) as u32;
             }
             if hi == 0 {
-                let count = unsafe { &mut *self.counts[region].get() };
+                let count = unsafe { &mut *self.regions[region].count.get() };
                 if *count >= RLIMIT {
                     self.overflow.store(true, Relaxed);
                     break base as u32;
