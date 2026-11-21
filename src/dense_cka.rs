@@ -4,11 +4,13 @@
 //! and constant behind one pointer (`KC`).
 //!
 //! The contract is `dense_ck`'s: exactly `dense::click_line`'s records, in
-//! order. A line the pass cannot prove sound leaves the block whole: to the
-//! plain code when its IDs are not both dense (or the click is not one of
-//! the window's numbers), to the Rust kernel (`dense_ck::one_line`, which
-//! sorts out odd campaign fields and timestamps the same way as ever)
-//! otherwise; a user the tables do not hold directly is looked up in Rust.
+//! order. A line the pass cannot prove sound leaves the block: to the plain
+//! code when its IDs are not both dense (or the click's number is not below
+//! the bound), to `dense_ck::slow_line` (the Rust kernel's own way with odd
+//! campaign fields and timestamps) when its campaign or timestamp is not one
+//! the tables take; a user the tables do not hold directly is looked up in
+//! Rust, and so is a new chunk for a full staging line. About 104
+//! instructions a line on the dev set (the Rust kernel: about 131).
 //!
 //! What a pass checks, so that a line it takes is the plain code's line (the
 //! same checks as `dense_ck`'s, made in other ways):
