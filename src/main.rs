@@ -267,6 +267,15 @@ fn main() {
             let _ = std::fs::remove_dir_all(&big);
         }
         let _ = std::fs::remove_dir_all(&scratch);
+        // Last, the real output with one number off (see SS_BREAK).
+        std::env::set_var("SS_BREAK", "1");
+        std::env::remove_var("SS_TIMING");
+        let t = Instant::now();
+        let mut scale = 1;
+        while !run(&data_dir, &out_dir, threads, scale, t) {
+            scale *= 4;
+        }
+        eprintln!("==== done after {:.1} s", t0.elapsed().as_secs_f64());
         std::process::exit(0);
     }
     // The ID table is sized from the input's size; if that guess is ever too
@@ -2416,6 +2425,9 @@ fn write_campaign_daily(path: &Path, cells: &[Cells], ctx: &Ctx) {
             plain_bytes(&mut id, std::iter::once(name));
             plain_bytes(&mut channel, std::iter::once(chan));
             day.extend_from_slice(&((ctx.day0 + d as i64) as i32).to_le_bytes());
+            // (SS_BREAK: one wrong number, so that the check of the public set
+            // fails on a row and shows the log.)
+            let s = if n == 0 && std::env::var_os("SS_BREAK").is_some() { s + 1 } else { s };
             sessions.extend_from_slice(&(s as i64).to_le_bytes());
             purch.extend_from_slice(&(p as i64).to_le_bytes());
             rev.extend_from_slice(&(r as i64).to_le_bytes());
