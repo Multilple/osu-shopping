@@ -9,7 +9,7 @@
 use core::arch::x86_64::*;
 use std::cell::UnsafeCell;
 
-use crate::dense::{event_line, ingest31, DOut, Dn, EXT, INGEST_TOP, LOW21, M40, PURCHASE};
+use crate::dense::{event_fields, event_line, ingest31, DOut, Dn, EXT, INGEST_TOP, LOW21, M40, PURCHASE};
 use crate::util::*;
 use crate::Ctx;
 
@@ -310,9 +310,68 @@ unsafe fn masks_cq(p: *const u8) -> (u64, u64) {
     (c, q)
 }
 
-/// A line the fast path could not prove sound: the plain code decides.
-/// Returns where the next line starts, or `usize::MAX` when this one has no
-/// newline before `end`.
+/// Bit masks of the commas, quotes and newlines in the 64 bytes at `p`.
+#[inline(always)]
+unsafe fn masks_cqn(p: *const u8) -> (u64, u64, u64) {
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let both = |c: u8| {
+        let v = _mm256_set1_epi8(c as i8);
+        (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)) as u32 as u64) << 32)
+    };
+    (both(b','), both(b'"'), both(b'\n'))
+}
+
+/// A line the fast path does not take, by the plain rules; its fields are
+/// found with the masks of its structure when it is at most 127 bytes long
+/// and ends before `end - 128` (else by `slow_line`). Returns where the next
+/// line starts, or `usize::MAX` when this one has no newline before `end`.
+#[cold]
+#[inline(never)]
+unsafe fn odd_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
+    if s + 128 > end {
+        return slow_line(file, s, end, ctx, dn, out);
+    }
+    let p = file.as_ptr().add(s);
+    let (c0, q0, n0) = masks_cqn(p);
+    let (c1, q1, n1) = masks_cqn(p.add(64));
+    let nl = n0 as u128 | (n1 as u128) << 64;
+    if nl == 0 {
+        return slow_line(file, s, end, ctx, dn, out);
+    }
+    let e = nl.trailing_zeros() as usize;
+    let next = s + e + 1;
+    let below = |n: usize| (1u128 << n) - 1;
+    let mut commas = (c0 as u128 | (c1 as u128) << 64) & below(e);
+    let quotes = (q0 as u128 | (q1 as u128) << 64) & below(e);
+    // Seven fields, or the line is malformed and gives nothing.
+    if commas.count_ones() != 6 {
+        return next;
+    }
+    let mut fields: [&[u8]; 7] = [&[]; 7];
+    let mut a = 0;
+    for (i, field) in fields.iter_mut().enumerate() {
+        let b = if i < 6 { commas.trailing_zeros() as usize } else { e };
+        commas &= commas.wrapping_sub(1);
+        // Quotes are syntax around a whole field, and malformed anywhere else.
+        let inside = quotes & (below(b) ^ below(a));
+        let (mut x, mut y) = (a, b);
+        if inside != 0 {
+            if b - a < 2 || inside != (1u128 << a) | (1u128 << (b - 1)) {
+                return next;
+            }
+            x += 1;
+            y -= 1;
+        }
+        *field = std::slice::from_raw_parts(p.add(x), y - x);
+        a = b + 1;
+    }
+    event_fields(fields, ctx, dn, out);
+    next
+}
+
+/// A line by the plain code, byte by byte. Returns where the next line
+/// starts, or `usize::MAX` when this one has no newline before `end`.
 #[cold]
 #[inline(never)]
 unsafe fn slow_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
@@ -547,7 +606,7 @@ pub(crate) unsafe fn events_dense(file: &[u8], start: usize, end: usize, ctx: &C
             }
             continue 'lines;
         }
-        let next = slow_line(file, s, end, ctx, dn, out);
+        let next = odd_line(file, s, end, ctx, dn, out);
         if next == usize::MAX {
             return s;
         }

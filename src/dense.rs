@@ -729,7 +729,13 @@ pub(crate) fn ingest31(ctx: &Ctx, ing: Option<i64>) -> u64 {
 /// One event line by the plain rules (see `event_line` in main.rs), as
 /// dense-mode records.
 pub(crate) fn event_line(line: &[u8], ctx: &Ctx, dn: &Dn, out: &mut DOut) {
-    let Some([eid, user, ts, ingest, typ, prod, price]) = split::<7>(line) else { return };
+    let Some(fields) = split::<7>(line) else { return };
+    event_fields(fields, ctx, dn, out);
+}
+
+/// `event_line` for a well-formed line, given its seven values.
+#[inline(always)]
+pub(crate) fn event_fields([eid, user, ts, ingest, typ, prod, price]: [&[u8]; 7], ctx: &Ctx, dn: &Dn, out: &mut DOut) {
     if eid.is_empty() {
         return;
     }
@@ -782,7 +788,7 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: 
         static CHUNKS: AtomicUsize = AtomicUsize::new(0);
         let bad = crate::dense_ev::check(file, start, end, ctx, dn);
         let (b, c) = (BAD.fetch_add(bad, Relaxed) + bad, CHUNKS.fetch_add(1, Relaxed) + 1);
-        if bad > 0 || c % 64 == 0 {
+        if bad > 0 || c.is_power_of_two() {
             eprintln!("    evcheck: {c} chunks, {b} streams differ");
         }
     }
