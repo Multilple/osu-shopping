@@ -595,6 +595,15 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
         }
         wait_until = 1.0 + 5.0 * t + 2.0 * code as f64;
     }
+    // SS_DIAG=cpu1, cpu2 or cpu3: the run ends at 2 s + 0.05 s x a number
+    // that tells one fact about the processor (see `diag::cpu_code`).
+    if let Some(which) = diag.as_deref().filter(|d| d.starts_with("cpu")) {
+        let code = diag::cpu_code(which);
+        if log {
+            eprintln!("    diag: {which} = {code}");
+        }
+        wait_until = 2.0 + 0.05 * code as f64;
+    }
     let now = t0.elapsed().as_secs_f64();
     if wait_until > now {
         std::thread::sleep(std::time::Duration::from_secs_f64(wait_until - now));

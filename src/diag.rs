@@ -138,3 +138,77 @@ pub fn bandwidth(threads: usize, par: &dyn Fn(&(dyn Fn(usize) + Sync))) -> f64 {
     }
     best
 }
+
+/// One fact about the processor as a number 0..=255 (`which` is "cpu1",
+/// "cpu2" or "cpu3"):
+/// - cpu1: the display model number (85 Skylake/Cascade Lake/Cooper Lake
+///   server, 106/108 Ice Lake, 143 Sapphire Rapids, 207 Emerald Rapids; for
+///   AMD the model within its family).
+/// - cpu2: family class (0: 6, Intel; 1: 0x17, Zen 1/2; 2: 0x19, Zen 3/4;
+///   3: anything else) + 4 x stepping + 64 x AVX-512F + 128 x AVX-512 VBMI2.
+/// - cpu3: L2 size class (0: up to 300 KB, 1: up to 600 KB, 2: up to 1.1 MB,
+///   3: up to 1.5 MB, 4: more) + 8 x threads per core (cpuid, up to 3)
+///   + 32 x (distinct cores among the CPUs this process may use, minus 1;
+///   7 when that cannot be read).
+pub fn cpu_code(which: &str) -> u32 {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    unsafe {
+        let l1 = __cpuid(1);
+        let (fam, model, stepping) = ((l1.eax >> 8) & 0xF, (l1.eax >> 4) & 0xF, l1.eax & 0xF);
+        let (ext_model, ext_fam) = ((l1.eax >> 16) & 0xF, (l1.eax >> 20) & 0xFF);
+        let dfam = if fam == 15 { fam + ext_fam } else { fam };
+        let dmodel = if fam == 6 || fam == 15 { (ext_model << 4) | model } else { model };
+        match which {
+            "cpu1" => dmodel & 0xFF,
+            "cpu2" => {
+                let l7 = __cpuid_count(7, 0);
+                let class = match dfam {
+                    6 => 0,
+                    0x17 => 1,
+                    0x19 => 2,
+                    _ => 3,
+                };
+                class | (stepping << 2) | (((l7.ebx >> 16) & 1) << 6) | (((l7.ecx >> 6) & 1) << 7)
+            }
+            _ => {
+                let l2_kb = __cpuid(0x8000_0006).ecx >> 16;
+                let c2 = match l2_kb {
+                    0..=300 => 0,
+                    301..=600 => 1,
+                    601..=1100 => 2,
+                    1101..=1500 => 3,
+                    _ => 4,
+                };
+                let smt = (__cpuid_count(0xB, 0).ebx & 0xFFFF).min(3);
+                // The CPUs this process may run on, and how many cores they are.
+                let allowed = read("/proc/self/status")
+                    .lines()
+                    .find(|l| l.starts_with("Cpus_allowed_list:"))
+                    .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
+                    .unwrap_or_default();
+                let mut cores: Vec<String> = Vec::new();
+                for part in allowed.split(',').filter(|p| !p.is_empty()) {
+                    let (a, b) = match part.split_once('-') {
+                        Some((a, b)) => (a.parse::<u32>().unwrap_or(0), b.parse::<u32>().unwrap_or(0)),
+                        None => {
+                            let a = part.parse::<u32>().unwrap_or(0);
+                            (a, a)
+                        }
+                    };
+                    for cpu in a..=b.min(a + 4096) {
+                        let core = read(&format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_id"));
+                        let pkg = read(&format!("/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"));
+                        if !core.trim().is_empty() {
+                            let id = format!("{}:{}", pkg.trim(), core.trim());
+                            if !cores.contains(&id) {
+                                cores.push(id);
+                            }
+                        }
+                    }
+                }
+                let ncores = if cores.is_empty() { 7 } else { (cores.len() as u32 - 1).min(6) };
+                c2 | (smt << 3) | (ncores << 5)
+            }
+        }
+    }
+}
