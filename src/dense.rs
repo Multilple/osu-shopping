@@ -2166,15 +2166,18 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     // The input text is done with (every name kept was copied): one more
     // thread gives its pages back while the stages below run, so that this
     // is neither left for the end nor for the exit.
-    let unmapper = {
-        let files: Vec<Src> = event_files.into_iter().chain(click_files).collect();
+    // (SS_UNMAP=final: every thread gives back its share at the end instead;
+    // SS_UNMAP=none: left to the exit.)
+    let unmap_mode = std::env::var("SS_UNMAP").unwrap_or_default();
+    let in_files: std::sync::Arc<Vec<Src>> = std::sync::Arc::new(event_files.into_iter().chain(click_files).collect());
+    let unmapper = unmap_mode.is_empty().then(|| {
+        let files = in_files.clone();
         std::thread::spawn(move || {
-            for f in &files {
+            for f in files.iter() {
                 f.unmap();
             }
-            std::mem::forget(files);
         })
-    };
+    });
 
     // ------------------------------------------------------------ dedup
     let aouts: Vec<Cell<AOut>> =
@@ -2306,8 +2309,18 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         }
         outs_ref[tid].arena.release();
         aouts_ref[tid].arena.release();
+        if unmap_mode == "final" {
+            for (i, f) in in_files.iter().enumerate() {
+                if i % threads == tid {
+                    f.unmap();
+                }
+            }
+        }
     });
-    let _ = unmapper.join();
+    if let Some(u) = unmapper {
+        let _ = u.join();
+    }
+    std::mem::forget(in_files);
     release(dn.r8, d + XCAP);
     release(dn.runs, d);
     CURRENT.store(std::ptr::null_mut(), Relaxed);
