@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 const CAP: usize = 1 << 17;
 static N: AtomicUsize = AtomicUsize::new(0);
 static BUF: [AtomicU64; CAP] = [const { AtomicU64::new(0) }; CAP];
+static RET: [AtomicU64; CAP] = [const { AtomicU64::new(0) }; CAP];
 
 #[repr(C)]
 struct SigAction {
@@ -27,9 +28,14 @@ extern "C" {
 extern "C" fn on_prof(_sig: i32, _info: *mut c_void, uctx: *mut c_void) {
     // ucontext_t.uc_mcontext.gregs[REG_RIP] on x86-64 Linux.
     let rip = unsafe { *((uctx as *const u8).add(168) as *const u64) };
+    // The word at the stack pointer: the return address when a leaf routine
+    // (memcpy, pread) was interrupted.
+    let rsp = unsafe { *((uctx as *const u8).add(160) as *const u64) };
+    let ret = unsafe { *(rsp as *const u64) };
     let i = N.fetch_add(1, Relaxed);
     if i < CAP {
         BUF[i].store(rip, Relaxed);
+        RET[i].store(ret, Relaxed);
     }
 }
 
@@ -55,6 +61,6 @@ pub fn dump() {
     let mut f = std::io::BufWriter::new(std::fs::File::create("/tmp/sprof.txt").unwrap());
     writeln!(f, "anchor {:x}", anchor as usize).unwrap();
     for i in 0..n {
-        writeln!(f, "{:x}", BUF[i].load(Relaxed)).unwrap();
+        writeln!(f, "{:x} {:x}", BUF[i].load(Relaxed), RET[i].load(Relaxed)).unwrap();
     }
 }

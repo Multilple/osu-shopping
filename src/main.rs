@@ -113,6 +113,8 @@ struct ThreadOut {
     dates: fast::Dates,
     reader: input::Reader,
     pend_e: Vec<PendE>,
+    /// Purchases among `pend_e` (by index) and their product IDs.
+    pend_p: Vec<(u32, Key)>,
     pend_c: Vec<PendC>,
     pend_l: Vec<(Key, u64, Key, u64)>,
 }
@@ -167,6 +169,9 @@ fn main() {
         .min(MAX_THREADS);
     // The ID table is sized from the input's size; if that guess is ever too
     // small, start over with a bigger one.
+    // Large buffers always get their own mapping, so growing one remaps it
+    // instead of copying it.
+    unsafe { sys::mallopt(sys::M_MMAP_THRESHOLD, 1 << 18) };
     #[cfg(feature = "sprof")]
     sprof::start();
     let mut scale = 1;
@@ -216,6 +221,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
                 dates: fast::Dates::new(),
                 reader: input::Reader::new(chunk),
                 pend_e: Vec::with_capacity(PEND),
+                pend_p: Vec::with_capacity(PEND),
                 pend_c: Vec::with_capacity(PEND),
                 pend_l: Vec::with_capacity(PEND),
             }))
@@ -591,16 +597,22 @@ fn ingest32(ctx: &Ctx, ing: Option<i64>) -> u32 {
     }
 }
 
-/// Record one parsed event line: `ev` is `Some` when the copy is valid.
+/// Record one parsed event line: `ev` is `Some` when the copy is valid, and
+/// then `prod` is its product ID if it is a purchase (0 otherwise); the
+/// category is filled in when the batch is flushed.
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
-fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev: Option<u64>, ing: Option<i64>) {
+fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev: Option<u64>, prod: Key, ing: Option<i64>) {
     let (h, hb) = hash_pair(ek);
     let h2 = (hb >> 20) & H2_MASK;
     let ingest = ingest32(ctx, ing);
     match ev {
         Some(ev) => {
             ctx.ids.prefetch(hash64(user));
+            if prod != 0 {
+                ctx.aux.products.prefetch(prod);
+                out.pend_p.push((out.pend_e.len() as u32, prod));
+            }
             out.pend_e.push(PendE { user, ev, h, x: (h2 << H2_SHIFT) | ingest as u64 });
             if out.pend_e.len() == PEND {
                 flush_events(ctx, out, tid);
@@ -616,6 +628,11 @@ fn emit_event(ctx: &Ctx, out: &mut ThreadOut, tid: usize, ek: Key, user: Key, ev
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
 fn flush_events(ctx: &Ctx, out: &mut ThreadOut, tid: usize) {
+    for &(i, prod) in &out.pend_p {
+        let cat = ctx.aux.products.get(prod).unwrap_or(ctx.aux.unknown);
+        out.pend_e[i as usize].ev |= (cat as u64) << 24;
+    }
+    out.pend_p.clear();
     for i in 0..out.pend_e.len() {
         let pe = unsafe { *out.pend_e.get_unchecked(i) };
         let person = ctx.ids.root(ctx.ids.get_or_insert(pe.user, hash64(pe.user)));
@@ -688,6 +705,7 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
                 let ek = fast::pack_at(base, s[0], e[0]);
                 let ing = out.dates.f1(base, s[3], e[3]);
                 let mut ev = None;
+                let mut prod = 0;
                 if e[1] > s[1] && e[5] > s[5] {
                     if let Some(t) = out.dates.ts(base, s[2], e[2]) {
                         if t >= ctx.ws && t < ctx.we && ing.is_some_and(|i| i - t <= DAY) {
@@ -704,8 +722,8 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
                             {
                                 let price = std::slice::from_raw_parts(base.add(s[6]), e[6] - s[6]);
                                 if let Some(p) = parse_price(price) {
-                                    let cat = ctx.aux.products.get(fast::pack_at(base, s[5], e[5])).unwrap_or(ctx.aux.unknown);
-                                    ev = Some(off | ((cat as u64) << 24) | p as u64);
+                                    prod = fast::pack_at(base, s[5], e[5]);
+                                    ev = Some(off | p as u64);
                                 }
                             }
                         }
@@ -716,7 +734,7 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
                     std::hint::black_box((ek, user, ev, ing));
                     return;
                 }
-                emit_event(ctx, out, tid, ek, user, ev, ing);
+                emit_event(ctx, out, tid, ek, user, ev, prod, ing);
             })
         }
     };
@@ -729,6 +747,7 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
         let ek = pack(eid);
         let ing = parse_f1(ingest);
         let mut ev = None;
+        let mut prod_key = 0;
         if !user.is_empty() && !prod.is_empty() {
             if let Some(t) = parse_ts(ts) {
                 // In the window, and not ingested more than 24 hours late.
@@ -738,15 +757,15 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
                         ev = Some(off);
                     } else if typ == b"purchase" {
                         if let Some(p) = parse_price(price) {
-                            let cat = ctx.aux.products.get(pack(prod)).unwrap_or(ctx.aux.unknown);
-                            ev = Some(off | ((cat as u64) << 24) | p as u64);
+                            prod_key = pack(prod);
+                            ev = Some(off | p as u64);
                         }
                     }
                 }
             }
         }
         let user = if ev.is_some() { pack(user) } else { 0 };
-        emit_event(ctx, out, tid, ek, user, ev, ing);
+        emit_event(ctx, out, tid, ek, user, ev, prod_key, ing);
     }
 }
 
@@ -821,6 +840,30 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
             unsafe { (*ev_at(x)).ev = DEAD };
         }
     };
+    // A repeat is settled a little later, in arrival order, so the events
+    // it needs (far apart in memory) can be fetched meanwhile.
+    const LATER: usize = 16;
+    let mut later = [(0usize, Slim { h: 0, x: 0 }, 0u32); LATER];
+    let mut nl = 0;
+    let settle = |later: &[(usize, Slim, u32)], table: &mut Vec<u64>| {
+        for &(i, s, idx) in later {
+            let v = table[i];
+            let kept = unsafe { *note(v as u32) };
+            // The copy with the smallest ingest_ts is kept, valid or not;
+            // copies with equal ingest_ts are identical.
+            if ingest(s.x) < ingest(kept.x) {
+                drop_copy(kept.x);
+                table[i] = (v & !0xFFFF_FFFF) | idx as u64;
+            } else {
+                drop_copy(s.x);
+            }
+        }
+    };
+    let fetch = |x: u64| {
+        if x & TAG == 0 {
+            unsafe { core::arch::x86_64::_mm_prefetch(ev_at(x) as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+        }
+    };
     for (t, o) in outs.iter().enumerate() {
         let mut idx = (t as u32) << IDX_BITS;
         for (ptr, len) in o.slim.pieces(p) {
@@ -838,13 +881,13 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
                         let kept = unsafe { *note(v as u32) };
                         // Copies of one event share the hash and the 20 extra hash bits.
                         if kept.h == s.h && ((kept.x ^ s.x) >> H2_SHIFT) & H2_MASK == 0 {
-                            // The copy with the smallest ingest_ts is kept, valid or
-                            // not; copies with equal ingest_ts are identical.
-                            if ingest(s.x) < ingest(kept.x) {
-                                drop_copy(kept.x);
-                                unsafe { *table.get_unchecked_mut(i) = ((tag as u64) << 32) | idx as u64 };
-                            } else {
-                                drop_copy(s.x);
+                            fetch(s.x);
+                            fetch(kept.x);
+                            later[nl] = (i, s, idx);
+                            nl += 1;
+                            if nl == LATER {
+                                settle(&later, table);
+                                nl = 0;
                             }
                             break;
                         }
@@ -855,6 +898,7 @@ fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
             }
         }
     }
+    settle(&later[..nl], table);
 }
 
 // ====================================================================== persons
@@ -907,6 +951,7 @@ struct Tl {
     nd: usize,
     day0: i32,
     organic: usize,
+    dayfirst: Vec<usize>,
     /// Per campaign: the last session (by serial number) it was counted for.
     stamp: Vec<u32>,
     serial: u32,
@@ -935,6 +980,7 @@ impl Tl {
             nd: ctx.nd,
             day0: ctx.day0 as i32,
             organic: ctx.aux.camp_names.len(),
+            dayfirst: Vec::new(),
             stamp: vec![0; ctx.aux.camp_names.len() + 1],
             serial: 0,
             prof: [0.0; 12],
@@ -983,10 +1029,15 @@ fn person_bucket(q: usize, outs: &[&ThreadOut], ctx: &Ctx, tl: &mut Tl) {
         sc += cc;
     }
     // Pass 2: counting sort by person.
+    // Every element is written below.
     tl.evs.clear();
-    tl.evs.resize(ne as usize, 0);
+    tl.evs.reserve(ne as usize);
     tl.cks.clear();
-    tl.cks.resize(ncl as usize, Ckl::default());
+    tl.cks.reserve(ncl as usize);
+    unsafe {
+        tl.evs.set_len(ne as usize);
+        tl.cks.set_len(ncl as usize);
+    }
     for o in outs {
         for (ptr, len) in o.ev.pieces(q) {
             for e in unsafe { std::slice::from_raw_parts(ptr, len) } {
@@ -1102,7 +1153,7 @@ fn person(who: Key, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
         }
     }
     let cks = &cks[..nc];
-    if tl.sess.len() * nc <= 4096 {
+    if tl.sess.len() * nc <= 16384 {
         // The common, small case: per session, walk the clicks in the 7 days
         // up to its start. The latest credits it; each campaign among them
         // assists it once (`stamp` remembers which were already counted).
@@ -1153,21 +1204,24 @@ fn person(who: Key, evs: &mut [u64], cks: &mut [Ckl], tl: &mut Tl) {
     tl.tmp.extend(cks.iter().map(|c| ((c.camp as u64) << 32) | c.ts as u64));
     tl.tmp.sort_unstable();
     let sess = &tl.sess;
+    // dayfirst[d]: the index of the first session on day d or later.
+    tl.dayfirst.clear();
+    tl.dayfirst.resize(nd + 1, sess.len());
+    for (k, s) in sess.iter().enumerate().rev() {
+        tl.dayfirst[s.day as usize] = k;
+    }
+    for d in (0..nd).rev() {
+        tl.dayfirst[d] = tl.dayfirst[d].min(tl.dayfirst[d + 1]);
+    }
+    let dayfirst = &tl.dayfirst;
     let assisted = &mut tl.cells.assisted;
     let mut flush = |camp: usize, a: u32, b: u32| {
         let lo = sess.partition_point(|s| s.start < a);
         let hi = lo + sess[lo..].partition_point(|s| s.start <= b);
-        if hi - lo <= 8 {
-            for s in &sess[lo..hi] {
-                assisted[camp * nd + s.day as usize] += 1;
-            }
-        } else {
-            let mut k = lo;
-            while k < hi {
-                let d = sess[k].day;
-                let e = k + sess[k..hi].partition_point(|s| s.day == d);
-                assisted[camp * nd + d as usize] += (e - k) as u32;
-                k = e;
+        if hi > lo {
+            for d in sess[lo].day as usize..=sess[hi - 1].day as usize {
+                let n = hi.min(dayfirst[d + 1]).saturating_sub(lo.max(dayfirst[d]));
+                assisted[camp * nd + d] += n as u32;
             }
         }
     };

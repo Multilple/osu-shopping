@@ -127,6 +127,14 @@ impl<V: Copy> KMap<V> {
     }
 
     #[inline(always)]
+    pub fn prefetch(&self, k: Key) {
+        let i = (hash64(k) as usize) & self.mask;
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(self.slots.as_ptr().add(i) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+
+    #[inline(always)]
     pub fn get(&self, k: Key) -> Option<V> {
         let mut i = (hash64(k) as usize) & self.mask;
         loop {
@@ -190,7 +198,9 @@ pub mod sys {
     pub const MAP_NORESERVE: i32 = 0x4000;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
     pub const MADV_HUGEPAGE: i32 = 14;
+    pub const M_MMAP_THRESHOLD: i32 = -3;
     extern "C" {
+        pub fn mallopt(param: i32, value: i32) -> i32;
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     }
