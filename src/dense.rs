@@ -1924,61 +1924,62 @@ fn person_bucket(q: usize, segs: &[Seg], outs: &[&DOut], dn: &Dn, me: &mut BOut)
     }
 }
 
-/// The persons that need a lookup, shared out by person number: thread
-/// `tid` of `threads` takes its share of their events and clicks from every
-/// thread's lists.
-fn special_persons(tid: usize, threads: usize, outs: &[&DOut], aouts: &[&AOut], sp_ck: &[&Vec<[u64; 2]>], dn: &Dn, me: &mut BOut) {
-    let take = |p: u64| (p as usize - dn.d) % threads == tid;
-    let mut evs: Vec<[u64; 2]> = aouts.iter().flat_map(|a| a.sp_ev.iter()).filter(|r| take(r[0])).copied().collect();
-    if evs.is_empty() {
-        return;
-    }
-    evs.sort_unstable();
-    // Clicks as (person, key, number): forwarded ones, and those of interned users.
+/// A click of a person that needs a lookup: (person, key (see `Dn::obits`), click number).
+type SpCk = (u32, u64, u32);
+
+/// The persons that need a lookup, put together once.
+struct Special {
+    /// The clicks of interned users, sorted by person.
+    ext: Vec<SpCk>,
+    /// Every person with events, biggest first (events and clicks of
+    /// interned users).
+    persons: Vec<u32>,
+}
+
+/// The special persons' event lists sorted (`runs`: per list, each person's
+/// number of events): put the persons in order of size, and the clicks of
+/// interned users by person.
+fn prep_special(outs: &[&DOut], runs: &[&[(u32, u32)]], dn: &Dn) -> Special {
     let ob = dn.obits;
     let key = |w: u64| (w & !0xFFFF_FFFF) | (w & 0xFFFF_FFFF) << ob;
-    let mut cks: Vec<(u32, u64, u32)> = Vec::new();
-    for list in sp_ck {
-        for r in list.iter() {
-            if take(r[0] & 0xFFFF_FFFF) {
-                cks.push((r[0] as u32, key(r[1]), (r[0] >> 32) as u32));
-            }
-        }
-    }
+    let mut ext: Vec<SpCk> = Vec::new();
     for o in outs {
         for (ptr, len) in o.ck.pieces(dn.nq) {
             for r in unsafe { std::slice::from_raw_parts(ptr, len) } {
-                let p = dn.special_person(r[1] as u32);
-                if take(p as u64) {
-                    cks.push((p, key(r[0]), (r[1] >> 32) as u32));
-                }
+                ext.push((dn.special_person(r[1] as u32), key(r[0]), (r[1] >> 32) as u32));
             }
         }
     }
-    cks.sort_unstable_by_key(|c| c.0);
-    let (mut own_k, mut own_c): (Vec<u64>, Vec<u32>) = (Vec::new(), Vec::new());
-    let mut gather = Vec::new();
-    let (mut i, mut c) = (0, 0);
-    while i < evs.len() {
-        let person = evs[i][0] as u32;
-        gather.clear();
-        while i < evs.len() && evs[i][0] as u32 == person {
-            gather.push(evs[i][1]);
-            i += 1;
+    ext.sort_unstable_by_key(|c| c.0);
+    let mut all: Vec<(u32, u32)> = runs.iter().flat_map(|r| r.iter()).copied().collect();
+    all.sort_unstable();
+    let mut sized: Vec<(u32, u32)> = Vec::new();
+    let mut c = 0;
+    for &(p, n) in &all {
+        match sized.last_mut() {
+            Some(last) if last.0 == p => last.1 += n,
+            _ => {
+                while c < ext.len() && ext[c].0 < p {
+                    c += 1;
+                }
+                let c0 = c;
+                while c < ext.len() && ext[c].0 == p {
+                    c += 1;
+                }
+                sized.push((p, n + (c - c0) as u32));
+            }
         }
-        while c < cks.len() && cks[c].0 < person {
-            c += 1;
-        }
-        own_k.clear();
-        own_c.clear();
-        while c < cks.len() && cks[c].0 == person {
-            own_k.push(cks[c].1);
-            own_c.push(cks[c].2);
-            c += 1;
-        }
-        // (Sorted above: by person, then by time.)
-        person_run(person, &mut gather, &mut own_k, &own_c, dn, me);
     }
+    sized.sort_unstable_by_key(|&(p, n)| (std::cmp::Reverse(n), p));
+    Special { ext, persons: sized.into_iter().map(|(p, _)| p).collect() }
+}
+
+/// The entries of `list` (sorted by person) that are person `p`'s.
+#[inline]
+fn of_person<T>(list: &[T], p: u32, person: impl Fn(&T) -> u32) -> &[T] {
+    let lo = list.partition_point(|x| person(x) < p);
+    let n = list[lo..].partition_point(|x| person(x) == p);
+    &list[lo..lo + n]
 }
 
 // ---------------------------------------------------------------- the run
@@ -2058,8 +2059,8 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     // parse; the joined sets are settled once everything is read (the
     // parse needs nothing of them: the dedup is the first to read them).
     // Before its first piece each thread touches its share of the parents
-    // and maps some of the event and click files; on a side thread the
-    // products and campaigns are read and the click kernel's tables made.
+    // and maps some of the event and click files; one thread first reads
+    // the products and campaigns and makes the click kernel's tables.
     let mapped = env_usize("SS_MMAP", 1) != 0;
     let piece = env_usize("SS_PIECE", if mapped { 4 << 20 } else { chunk });
     let mut tasks = Vec::new();
@@ -2077,31 +2078,17 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     // (Asking for a piece's pages in one call costs more than their faults on the scoring machine.)
     let populate = env_usize("SS_POP", 0) != 0;
     // The context with the products and campaigns in it: set (once, with
-    // `dn.ckx` before it) by the side thread; no event or click piece is
+    // `dn.ckx` before it) by thread `aux_tid`; no event or click piece is
     // parsed before it is.
     let ready: std::sync::OnceLock<Ctx> = std::sync::OnceLock::new();
+    let ctx_slot = Mutex::new(Some(ctx));
     let aux_failed = AtomicBool::new(false);
+    let aux_panic = Mutex::new(None);
+    // (The last thread reads them: a pool worker, whose heap is grown ahead.)
+    let aux_tid = threads - 1;
     lap("links");
-    std::thread::scope(|scope| {
+    {
         let dn = &dn;
-        let (ready, aux_failed) = (&ready, &aux_failed);
-        scope.spawn(move || {
-            // (Should this panic, the parsing threads stop waiting; the
-            // panic comes out of the scope.)
-            struct Failed<'a>(&'a AtomicBool, &'a std::sync::OnceLock<Ctx>);
-            impl Drop for Failed<'_> {
-                fn drop(&mut self) {
-                    if self.1.get().is_none() {
-                        self.0.store(true, Release);
-                    }
-                }
-            }
-            let _failed = Failed(aux_failed, ready);
-            let mut ctx = ctx;
-            ctx.aux = load_aux(data_dir);
-            let _ = dn.ckx.set(crate::dense_ck::Cx::new(&ctx, dn));
-            let _ = ready.set(ctx);
-        });
         par(threads, |tid| {
             let out = mine(&outs, tid);
             // The parents are read before they are written: touch them first,
@@ -2115,6 +2102,22 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
                 o += 4096;
             }
             touched.fetch_add(1, Release);
+            if tid == aux_tid {
+                // (Should this panic, nobody waits for it; the panic goes on
+                // once all threads are back.)
+                let mut ctx = ctx_slot.lock().unwrap().take().unwrap();
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_aux(data_dir))) {
+                    Ok(aux) => {
+                        ctx.aux = aux;
+                        let _ = dn.ckx.set(crate::dense_ck::Cx::new(&ctx, dn));
+                        let _ = ready.set(ctx);
+                    }
+                    Err(e) => {
+                        *aux_panic.lock().unwrap() = Some(e);
+                        aux_failed.store(true, Release);
+                    }
+                }
+            }
             // The event and click files are mapped now, before any of them is
             // parsed (no thread maps anything once the parse has started).
             loop {
@@ -2183,8 +2186,11 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             out.ev.finish(&mut out.arena);
             out.ck.finish(&mut out.arena);
         });
-    });
+    }
     drop(to_map);
+    if let Some(e) = aux_panic.into_inner().unwrap() {
+        std::panic::resume_unwind(e);
+    }
     let ctx = ready.into_inner().expect("products and campaigns");
     lap("  parse: links, events, clicks");
     if log {
@@ -2242,6 +2248,8 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         }
         return give_up(&dn, &outs, nodes);
     }
+    // (The special persons' events, apart: each thread sorts one list in the persons stage.)
+    let sp_evs: Vec<Cell<Vec<[u64; 2]>>> = (0..threads).map(|t| Shared(UnsafeCell::new(std::mem::take(&mut mine(&aouts, t).sp_ev)))).collect();
     let aouts_ref: Vec<&AOut> = (0..threads).map(|t| &*mine(&aouts, t)).collect();
 
     // ------------------------------------------------------------ persons
@@ -2263,6 +2271,20 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     let ncell = (ctx.aux.camp_names.len() + 1) * ctx.nd;
     let rows_room = if env_usize("SS_ROOM", 1) != 0 { kept / 6 / threads + 4096 } else { 0 };
     let bouts: Vec<Cell<Option<BOut>>> = (0..threads).map(|_| Shared(UnsafeCell::new(None))).collect();
+    // The persons that need a lookup: their events are all known now, their
+    // clicks once every bucket is done. Each thread first sorts one of the
+    // lists of their events (by person, then event), and once done with the
+    // buckets the clicks it found; the first thread done with the buckets
+    // puts the persons in order. Then all take persons from that order.
+    let special: std::sync::OnceLock<Special> = std::sync::OnceLock::new();
+    let sp_runs: Vec<Cell<Vec<(u32, u32)>>> = (0..threads).map(|_| Shared(UnsafeCell::new(Vec::new()))).collect();
+    let sorted = AtomicUsize::new(0);
+    let prep_claim = AtomicBool::new(false);
+    let buckets_done = AtomicUsize::new(0);
+    let buckets_at = AtomicU64::new(0);
+    let next_sp = AtomicUsize::new(0);
+    let sp_cks: Vec<Cell<Vec<SpCk>>> = (0..threads).map(|_| Shared(UnsafeCell::new(Vec::new()))).collect();
+    let cells: Vec<Cell<Option<Cells>>> = (0..threads).map(|_| Shared(UnsafeCell::new(None))).collect();
     let next = AtomicUsize::new(0);
     par(threads, |tid| {
         let me = mine(&bouts, tid).insert(BOut {
@@ -2291,37 +2313,103 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
             prof: [0.0; 8],
             timed: log,
         });
+        let cpu = || if log { sys::thread_cpu() } else { 0.0 };
+        let t_a = cpu();
+        {
+            // (Written only here, read by the others only once `sorted` says so.)
+            let evs = mine(&sp_evs, tid);
+            evs.sort_unstable();
+            let runs = mine(&sp_runs, tid);
+            for r in evs.iter() {
+                match runs.last_mut() {
+                    Some(last) if last.0 == r[0] as u32 => last.1 += 1,
+                    _ => runs.push((r[0] as u32, 1)),
+                }
+            }
+        }
+        sorted.fetch_add(1, Release);
+        let t_q = cpu();
         loop {
             let i = next.fetch_add(1, Relaxed);
             let Some(&q) = order.get(i) else { break };
             person_bucket(q, &by_q[q], &outs_ref, &dn, me);
         }
-    });
-    lap("  persons");
-    let sp_ck: Vec<Vec<[u64; 2]>> = (0..threads).map(|t| std::mem::take(&mut mine(&bouts, t).as_mut().unwrap().sp_ck)).collect();
-    let sp_ck: Vec<&Vec<[u64; 2]>> = sp_ck.iter().collect();
-    let cells: Vec<Cell<Option<Cells>>> = (0..threads).map(|_| Shared(UnsafeCell::new(None))).collect();
-    par(threads, |tid| {
-        // (Each thread reads every thread's forwarded clicks and writes only its own rows.)
-        let me = mine(&bouts, tid).as_mut().unwrap();
-        let t_s = sys::thread_cpu();
-        special_persons(tid, threads, &outs_ref, &aouts_ref, &sp_ck, &dn, me);
-        let t_w = sys::thread_cpu();
+        let t_b = cpu();
+        {
+            // (Written only here, read by the others only once every thread is past this.)
+            let ob = dn.obits;
+            let key = |w: u64| (w & !0xFFFF_FFFF) | (w & 0xFFFF_FFFF) << ob;
+            let own = mine(&sp_cks, tid);
+            own.extend(me.sp_ck.iter().map(|r| (r[0] as u32, key(r[1]), (r[0] >> 32) as u32)));
+            own.sort_unstable_by_key(|c| c.0);
+        }
+        if buckets_done.fetch_add(1, Release) + 1 == threads {
+            buckets_at.store(t0.elapsed().as_micros() as u64, Relaxed);
+        }
+        if !prep_claim.swap(true, Relaxed) {
+            wait_until(|| sorted.load(Acquire) == threads);
+            let runs: Vec<&[(u32, u32)]> = sp_runs.iter().map(|c| unsafe { &*c.0.get() }.as_slice()).collect();
+            let _ = special.set(prep_special(&outs_ref, &runs, &dn));
+        }
+        let t_p = cpu();
+        // This thread's rows so far are all of its buckets': write them while
+        // the others finish theirs. Special persons' rows go to a file of
+        // their own.
         if tid == 0 || me.tl.rows.n > 0 {
             write_user_daily(&user_dir.join(format!("part-{tid:03}.parquet")), &mut me.tl.rows, &ctx);
         }
+        me.tl.rows = Rows::default();
+        let t_w = cpu();
+        wait_until(|| buckets_done.load(Acquire) == threads && special.get().is_some());
+        let t_x = cpu();
+        let sp = special.get().unwrap();
+        // (No thread writes its list after the count above.)
+        let cks: Vec<&[SpCk]> = sp_cks.iter().map(|c| unsafe { &*c.0.get() }.as_slice()).chain(std::iter::once(sp.ext.as_slice())).collect();
+        let evs: Vec<&[[u64; 2]]> = sp_evs.iter().map(|c| unsafe { &*c.0.get() }.as_slice()).collect();
+        let (mut own_k, mut own_c): (Vec<u64>, Vec<u32>) = (Vec::new(), Vec::new());
+        let mut gather = Vec::new();
+        loop {
+            let i = next_sp.fetch_add(1, Relaxed);
+            let Some(&person) = sp.persons.get(i) else { break };
+            gather.clear();
+            for list in &evs {
+                gather.extend(of_person(list, person, |r| r[0] as u32).iter().map(|r| r[1]));
+            }
+            // (In event order, as one sorted list would give them.)
+            gather.sort_unstable();
+            own_k.clear();
+            own_c.clear();
+            for list in &cks {
+                for c in of_person(list, person, |c| c.0) {
+                    own_k.push(c.1);
+                    own_c.push(c.2);
+                }
+            }
+            person_run(person, &mut gather, &mut own_k, &own_c, &dn, me);
+        }
+        let t_s = cpu();
+        if me.tl.rows.n > 0 {
+            write_user_daily(&user_dir.join(format!("part-{tid:03}-s.parquet")), &mut me.tl.rows, &ctx);
+        }
         if log {
+            let t_e = sys::thread_cpu();
             eprintln!(
-                "    t{tid}: CPU ms: clicks {:.1} (clear {:.1} prefix {:.1}) one-run {:.1} others {:.1} special {:.1} write {:.1} | events one-run {:.0} others {:.0}",
+                "    t{tid}: CPU ms: clicks {:.1} (clear {:.1} prefix {:.1}) one-run {:.1} others {:.1} special {:.1} write {:.1} | events one-run {:.0} others {:.0} | wait {:.1} prep {:.1} special persons {:.1} write {:.1} + {:.1} | done at {:.1} ms",
                 me.prof[0] * 1e3,
                 me.prof[5] * 1e3,
                 me.prof[6] * 1e3,
                 me.prof[1] * 1e3,
                 me.prof[2] * 1e3,
-                (t_w - t_s) * 1e3,
-                (sys::thread_cpu() - t_w) * 1e3,
+                (t_q - t_a + t_p - t_b + t_s - t_x) * 1e3,
+                (t_w - t_p + t_e - t_s) * 1e3,
                 me.prof[3],
-                me.prof[4]
+                me.prof[4],
+                (t_x - t_w) * 1e3,
+                (t_q - t_a + t_p - t_b) * 1e3,
+                (t_s - t_x) * 1e3,
+                (t_w - t_p) * 1e3,
+                (t_e - t_s) * 1e3,
+                t0.elapsed().as_secs_f64() * 1e3,
             );
         }
         let done = mine(&bouts, tid).take().unwrap();
@@ -2335,6 +2423,10 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         *mine(&cells, tid) = Some(tl.cells);
     });
     lap("persons + user_daily");
+    if log {
+        let sp = special.get().unwrap();
+        eprintln!("    persons: buckets done at {:.1} ms; {} special persons, {} of their events, {} clicks of interned users, {} other clicks", buckets_at.load(Relaxed) as f64 / 1e3, sp.persons.len(), sp_evs.iter().map(|c| unsafe { &*c.0.get() }.len()).sum::<usize>(), sp.ext.len(), sp_cks.iter().map(|c| unsafe { &*c.0.get() }.len()).sum::<usize>());
+    }
     if log {
         let v: Vec<usize> = STATS.iter().map(|x| x.swap(0, Relaxed)).collect();
         eprintln!("    persons with clicks by clicks x sessions (<=64, <=256, <=1024, more): {:?}; pairs {:?}; clicks {:?}", &v[..4], &v[4..8], &v[8..]);
