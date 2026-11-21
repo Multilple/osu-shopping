@@ -904,8 +904,36 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: 
             eprintln!("    evcheck: {c} chunks, {b} streams differ");
         }
     }
+    // SS_EVTIME=1: the kernel's own time on its thread's processor clock,
+    // summed over the chunks so far (on stderr after every chunk).
+    static TIME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let timed = *TIME.get_or_init(|| std::env::var_os("SS_EVTIME").is_some());
+    if timed {
+        // SS_EVREP=n: first n passes of the kernel over the chunk into throwaway
+        // output, so that the timed pass finds its input in the caches.
+        static REP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let rep = *REP.get_or_init(|| crate::env_usize("SS_EVREP", 0));
+        if rep > 0 {
+            thread_local! { static SCRATCH: std::cell::RefCell<Option<DOut>> = const { std::cell::RefCell::new(None) }; }
+            SCRATCH.with(|sc| {
+                let mut sc = sc.borrow_mut();
+                let o = sc.get_or_insert_with(|| crate::dense_ev::scratch_out(dn));
+                for _ in 0..rep {
+                    unsafe { crate::dense_ev::events_dense(file, start, end, ctx, dn, o) };
+                }
+            });
+        }
+    }
+    let t0 = if timed { sys::thread_cpu() } else { 0.0 };
     // The kernel takes the lines it can prove sound; the plain code the rest.
     let rest = if slow_only() { start } else { unsafe { crate::dense_ev::events_dense(file, start, end, ctx, dn, out) } };
+    if timed {
+        static NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static BYTES: AtomicUsize = AtomicUsize::new(0);
+        let dt = ((sys::thread_cpu() - t0) * 1e9) as u64;
+        let (t, b) = (NANOS.fetch_add(dt, Relaxed) + dt, BYTES.fetch_add(rest - start, Relaxed) + rest - start);
+        eprintln!("    evtime: {:.1} ms for {} MB: {:.3} ns per byte", t as f64 / 1e6, b >> 20, t as f64 / b as f64);
+    }
     for line in lines(&file[rest..end]) {
         event_line(line, ctx, dn, out);
     }

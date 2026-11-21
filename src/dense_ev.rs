@@ -28,8 +28,8 @@ const fn inverse(a: u64) -> u64 {
 }
 
 /// `(B_INV << 24)`: a 40-bit ID times this is `(ID * B_INV mod 2^40) << 24`.
-const BINV24: u64 = (inverse(MUL_B) & M40) << 24;
-const AINV24: u64 = (inverse(MUL_A) & M40) << 24;
+pub(crate) const BINV24: u64 = (inverse(MUL_B) & M40) << 24;
+pub(crate) const AINV24: u64 = (inverse(MUL_A) & M40) << 24;
 
 // ------------------------------------------------------------------ times
 
@@ -50,10 +50,10 @@ struct Memo {
 
 /// The bits of a form key that pick its slot: of the sign, the hours and the
 /// tens of minutes, and one that tells the offset form from the others.
-const FORM_BITS: u64 = 0x02 | (0x01 << 8) | (0x0F << 16) | (0x05 << 32) | (1 << 58);
+pub(crate) const FORM_BITS: u64 = 0x02 | (0x01 << 8) | (0x0F << 16) | (0x05 << 32) | (1 << 58);
 
 #[repr(C, align(64))]
-struct T64([u64; 64]);
+pub(crate) struct T64(pub(crate) [u64; 64]);
 
 /// By ts length: which of the 8 bytes from its 20th on belong to a form's key
 /// (`Z` of the 20-byte form, `+HH:MM` of the 25-byte one, nothing of the
@@ -93,38 +93,7 @@ impl Memo {
     #[cold]
     #[inline(never)]
     unsafe fn date_miss(&mut self, p: *const u8, idx: usize) -> bool {
-        let b = std::slice::from_raw_parts(p, 11);
-        let d = |i: usize| -> Option<i64> {
-            let v = b[i].wrapping_sub(b'0');
-            (v <= 9).then_some(v as i64)
-        };
-        let v = (|| {
-            if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
-                return None;
-            }
-            let year = d(0)? * 1000 + d(1)? * 100 + d(2)? * 10 + d(3)?;
-            let month = d(5)? * 10 + d(6)?;
-            let day = d(8)? * 10 + d(9)?;
-            if !(1..=12).contains(&month) || day < 1 {
-                return None;
-            }
-            let dim = match month {
-                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                4 | 6 | 9 | 11 => 30,
-                _ => {
-                    if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-                        29
-                    } else {
-                        28
-                    }
-                }
-            };
-            if day > dim {
-                return None;
-            }
-            Some(days_from_civil(year, month, day) * 86_400)
-        })();
-        match v {
+        match date_secs(p) {
             Some(v) => {
                 self.key8[idx] = std::ptr::read_unaligned(p as *const u64);
                 self.key4[idx] = std::ptr::read_unaligned(p.add(7) as *const u32);
@@ -154,29 +123,70 @@ impl Memo {
     #[cold]
     #[inline(never)]
     fn form_miss(&mut self, key: u64, idx: usize, n: usize) -> bool {
-        let b = key.to_le_bytes();
-        let val = match n {
-            13 => 0,
-            20 if b[0] == b'Z' => 0,
-            25 => {
-                let d = |i: usize| (b[i].wrapping_sub(b'0') as i64, b[i].wrapping_sub(b'0') <= 9);
-                let ((h1, a), (h0, c), (m1, e), (m0, f)) = (d(1), d(2), d(4), d(5));
-                let (hh, mm) = (h1 * 10 + h0, m1 * 10 + m0);
-                if !(a && c && e && f) || (b[0] != b'+' && b[0] != b'-') || b[3] != b':' || hh > 23 || mm > 59 {
-                    return false;
-                }
-                let off = (hh * 60 + mm) * MINUTE;
-                if b[0] == b'+' {
-                    off
-                } else {
-                    -off
-                }
+        match form_off(key, n) {
+            Some(val) => {
+                self.fkey[idx] = key;
+                self.fval[idx] = val;
+                true
             }
-            _ => return false,
-        };
-        self.fkey[idx] = key;
-        self.fval[idx] = val;
-        true
+            None => false,
+        }
+    }
+}
+
+/// The time at midnight (seconds) of the date in the 11 bytes `YYYY-MM-DDT`
+/// at `p`, by the plain rules; `None` when they are not a valid date.
+pub(crate) unsafe fn date_secs(p: *const u8) -> Option<i64> {
+    let b = std::slice::from_raw_parts(p, 11);
+    let d = |i: usize| -> Option<i64> {
+        let v = b[i].wrapping_sub(b'0');
+        (v <= 9).then_some(v as i64)
+    };
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+        return None;
+    }
+    let year = d(0)? * 1000 + d(1)? * 100 + d(2)? * 10 + d(3)?;
+    let month = d(5)? * 10 + d(6)?;
+    let day = d(8)? * 10 + d(9)?;
+    if !(1..=12).contains(&month) || day < 1 {
+        return None;
+    }
+    let dim = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    if day > dim {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400)
+}
+
+/// What a ts of `n` bytes takes off its local time (ms), given the form
+/// bytes in the low 6 bytes of `key` (`Z`, or `+HH:MM`, or nothing for 13
+/// digits); `None` when that is none of the three forms.
+pub(crate) fn form_off(key: u64, n: usize) -> Option<i64> {
+    let b = key.to_le_bytes();
+    match n {
+        13 => Some(0),
+        20 if b[0] == b'Z' => Some(0),
+        25 => {
+            let d = |i: usize| (b[i].wrapping_sub(b'0') as i64, b[i].wrapping_sub(b'0') <= 9);
+            let ((h1, a), (h0, c), (m1, e), (m0, f)) = (d(1), d(2), d(4), d(5));
+            let (hh, mm) = (h1 * 10 + h0, m1 * 10 + m0);
+            if !(a && c && e && f) || (b[0] != b'+' && b[0] != b'-') || b[3] != b':' || hh > 23 || mm > 59 {
+                return None;
+            }
+            let off = (hh * 60 + mm) * MINUTE;
+            Some(if b[0] == b'+' { off } else { -off })
+        }
+        _ => None,
     }
 }
 
@@ -185,21 +195,21 @@ thread_local! {
 }
 
 #[repr(C, align(32))]
-struct Y32([u8; 32]);
+pub(crate) struct Y32(pub(crate) [u8; 32]);
 #[repr(C, align(32))]
-struct W16([i16; 16]);
+pub(crate) struct W16(pub(crate) [i16; 16]);
 #[repr(C, align(32))]
-struct D8([u32; 8]);
+pub(crate) struct D8(pub(crate) [u32; 8]);
 
 // The constants of `times`, low lane (two times of day) then high lane (13 digits).
-static T_PAT: Y32 = Y32(*b"00:00:0000:00:000000000000000000");
-static T_MAX: Y32 = Y32([2, 9, 0, 5, 9, 0, 5, 9, 2, 9, 0, 5, 9, 0, 5, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 255, 255, 255]);
-static T_W1: Y32 = Y32([10, 1, 0, 10, 1, 0, 10, 1, 10, 1, 0, 10, 1, 0, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 1, 0, 0, 0]);
-static T_MAXW: W16 = W16([23, 0x7FFF, 0x7FFF, 0x7FFF, 23, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF]);
-static T_W2: W16 = W16([60, 1, 60, 1, 60, 1, 60, 1, 100, 1, 100, 1, 100, 1, 1, 0]);
-static T_SHUF: Y32 = Y32([0, 1, 4, 5, 128, 128, 128, 128, 8, 9, 12, 13, 128, 128, 128, 128, 0, 1, 4, 5, 8, 9, 12, 13, 128, 128, 128, 128, 128, 128, 128, 128]);
-static T_W3: W16 = W16([60, 1, 0, 0, 60, 1, 0, 0, 10_000, 1, 10, 1, 0, 0, 0, 0]);
-static T_MUL: D8 = D8([1000, 0, 1, 0, 100_000, 0, 0, 0]);
+pub(crate) static T_PAT: Y32 = Y32(*b"00:00:0000:00:000000000000000000");
+pub(crate) static T_MAX: Y32 = Y32([2, 9, 0, 5, 9, 0, 5, 9, 2, 9, 0, 5, 9, 0, 5, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 255, 255, 255]);
+pub(crate) static T_W1: Y32 = Y32([10, 1, 0, 10, 1, 0, 10, 1, 10, 1, 0, 10, 1, 0, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 1, 0, 0, 0]);
+pub(crate) static T_MAXW: W16 = W16([23, 0x7FFF, 0x7FFF, 0x7FFF, 23, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF]);
+pub(crate) static T_W2: W16 = W16([60, 1, 60, 1, 60, 1, 60, 1, 100, 1, 100, 1, 100, 1, 1, 0]);
+pub(crate) static T_SHUF: Y32 = Y32([0, 1, 4, 5, 128, 128, 128, 128, 8, 9, 12, 13, 128, 128, 128, 128, 0, 1, 4, 5, 8, 9, 12, 13, 128, 128, 128, 128, 128, 128, 128, 128]);
+pub(crate) static T_W3: W16 = W16([60, 1, 0, 0, 60, 1, 0, 0, 10_000, 1, 10, 1, 0, 0, 0, 0]);
+pub(crate) static T_MUL: D8 = D8([1000, 0, 1, 0, 100_000, 0, 0, 0]);
 
 /// By ts length, 8 bytes apart: the parts of what `times` finds wrong that
 /// count. The two times of day always do; the 13 digits when ts has that
@@ -247,7 +257,7 @@ unsafe fn times(a: *const u8, b: *const u8, c: *const u8) -> (__m256i, __m256i) 
 
 /// By `digits + 2` (the length of an ID field less its quotes, plus 1): a
 /// mask keeping the last `digits` bytes of 8, for 1..=8 digits; else 0.
-static MASK8: T64 = {
+pub(crate) static MASK8: T64 = {
     let mut t = [0u64; 64];
     let mut nd = 1;
     while nd <= 8 {
@@ -289,14 +299,14 @@ static SPAN36: T64 = {
 
 /// By whether the ingest field is quoted: what follows its first 19 bytes
 /// (`Z,` or `Z",`), as a mask and a value for the 4 bytes there.
-static ZMASK: [u32; 2] = [0x0000_FFFF, 0x00FF_FFFF];
-static ZPAT: [u32; 2] = [u32::from_le_bytes([b'Z', b',', 0, 0]), u32::from_le_bytes([b'Z', b'"', b',', 0])];
+pub(crate) static ZMASK: [u32; 2] = [0x0000_FFFF, 0x00FF_FFFF];
+pub(crate) static ZPAT: [u32; 2] = [u32::from_le_bytes([b'Z', b',', 0, 0]), u32::from_le_bytes([b'Z', b'"', b',', 0])];
 
 const VIEW: u32 = u32::from_le_bytes(*b"view");
 const CART: u32 = u32::from_le_bytes(*b"cart");
 
 /// How far past a line's start the fast path may read.
-const MARGIN: usize = 160;
+pub(crate) const MARGIN: usize = 160;
 
 /// Bit masks of the commas and quotes in the 64 bytes at `p`.
 #[inline(always)]
@@ -328,7 +338,7 @@ unsafe fn masks_cqn(p: *const u8) -> (u64, u64, u64) {
 /// line starts, or `usize::MAX` when this one has no newline before `end`.
 #[cold]
 #[inline(never)]
-unsafe fn odd_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
+pub(crate) unsafe fn odd_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
     if s + 128 > end {
         return slow_line(file, s, end, ctx, dn, out);
     }
@@ -374,7 +384,7 @@ unsafe fn odd_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &
 /// starts, or `usize::MAX` when this one has no newline before `end`.
 #[cold]
 #[inline(never)]
-unsafe fn slow_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
+pub(crate) unsafe fn slow_line(file: &[u8], s: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
     match memchr(b'\n', &file[s..end]) {
         Some(i) => {
             event_line(&file[s..s + i], ctx, dn, out);
@@ -419,8 +429,21 @@ unsafe fn odd_tail(file: &[u8], c4: usize, k5: usize, k6: usize, e: usize, qb: u
 /// returns where the rest starts (line by line for `event_line`).
 /// `file[start - 1]` is a newline; `end` is a line boundary or the end of
 /// the file.
-#[inline(never)]
 pub(crate) unsafe fn events_dense(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
+    // The fast path written out in assembly (dense_ka.rs), unless SS_KERNEL=rs
+    // or the window is one it was not made for; else the one below.
+    static ASM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ASM.get_or_init(|| std::env::var("SS_KERNEL").map_or(true, |v| v != "rs")) {
+        if let Some(rest) = crate::dense_ka::events(file, start, end, ctx, dn, out) {
+            return rest;
+        }
+    }
+    events_rs(file, start, end, ctx, dn, out)
+}
+
+/// `events_dense` with the fast path in Rust.
+#[inline(never)]
+unsafe fn events_rs(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
     let base = file.as_ptr();
     let end = end.min(file.len());
     let mut s = start;
@@ -623,14 +646,19 @@ fn ahead() -> usize {
 
 // ------------------------------------------------------------------ checking
 
+/// Output to throw away (for the check and for timing).
+pub(crate) fn scratch_out(dn: &Dn) -> DOut {
+    use crate::dense::Lists;
+    use crate::table::Arena;
+    DOut { arena: Arena::new(), ev: Lists::new(dn.nb), ck: Lists::new(1), reader: crate::input::Reader::new(1 << 10), pend_l: Vec::new() }
+}
+
 /// SS_EVCHECK=1: for the lines of `file[start..end]`, the records the kernel
 /// (with the plain code for what it leaves) gives against those of the plain
 /// code alone, stream by stream and in order. Returns how many lines' worth
 /// of streams differ (and says so on stderr).
 pub(crate) fn check(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn) -> usize {
-    use crate::dense::Lists;
-    use crate::table::Arena;
-    let fresh = || DOut { arena: Arena::new(), ev: Lists::new(dn.nb), ck: Lists::new(1), reader: crate::input::Reader::new(1 << 10), pend_l: Vec::new() };
+    let fresh = || scratch_out(dn);
     let (mut a, mut b) = (fresh(), fresh());
     let rest = unsafe { events_dense(file, start, end, ctx, dn, &mut a) };
     for line in crate::lines(&file[rest..end]) {
