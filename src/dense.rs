@@ -1539,7 +1539,10 @@ unsafe fn attribute_small<const N: usize>(keys: &mut [u64], cids: &[u32], dn: &D
     for i in 1..N {
         tie |= (k[i] ^ k[i - 1]).wrapping_sub(lo1) < span;
     }
-    let n = if tie { small_ties(&mut k, keys, cids, dn) } else { n0 };
+    if tie {
+        // (This pads the keys left again.)
+        small_ties(&mut k, keys, cids, dn);
+    }
     let cmask = (1u64 << (32 - ob)) - 1;
     // Per click: its time and its time plus 7 days (as signed numbers for
     // the compares, the padding above every time), and its campaign's row.
@@ -1591,7 +1594,8 @@ unsafe fn attribute_small<const N: usize>(keys: &mut [u64], cids: &[u32], dn: &D
         let h1 = _mm256_set1_epi32(hi as i32 - 1);
         let last = mm(_mm256_cmpgt_epi32(nx0, h1), _mm256_cmpgt_epi32(nx1, h1));
         let cm = last & ((1u32 << hi) - 1) & !((1u32 << lo) - 1);
-        for j in 0..n {
+        // (All N, the padding's bits being 0: a count fixed at compile time.)
+        for j in 0..N {
             *assist.add(row[j] + day) += (cm >> j) & 1;
         }
     }
