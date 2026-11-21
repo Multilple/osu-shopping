@@ -229,6 +229,8 @@ pub struct Dn {
     pub(crate) click_names: Vec<Key>,
     /// A click key is `ts << 32 | campaign << obits | number among its person's clicks`.
     pub(crate) obits: u32,
+    /// The click kernel's tables.
+    pub(crate) ckx: crate::dense_ck::Cx,
 }
 
 unsafe impl Sync for Dn {}
@@ -501,6 +503,8 @@ pub(crate) struct DOut {
     pub(crate) ck: Streams<[u64; 2], 10>,
     pub(crate) reader: input::Reader,
     pub(crate) pend_l: Vec<(u32, u32)>,
+    /// The click kernel's memory of dates.
+    pub(crate) ckd: Box<crate::dense_ck::DateMemo>,
 }
 
 /// What a thread produces while removing duplicates.
@@ -865,7 +869,9 @@ pub(crate) fn click_line(line: &[u8], ctx: &Ctx, dn: &Dn, out: &mut DOut) {
 }
 
 fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) {
-    for line in lines(&file[start..end]) {
+    // The kernel takes the lines it can prove sound; the plain code the rest.
+    let rest = if slow_only() { start } else { unsafe { crate::dense_ck::clicks_dense(file, start, end, ctx, dn, out) } };
+    for line in lines(&file[rest..end]) {
         click_line(line, ctx, dn, out);
     }
 }
@@ -1619,6 +1625,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
         names: Vec::new(),
         click_names: Vec::new(),
         obits: 0,
+        ckx: Default::default(),
     };
     // Interned users are always looked up.
     unsafe { std::ptr::write_bytes(dn.r8.add(d), 0xFF, XCAP) };
@@ -1631,6 +1638,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
                 ck: Streams::new(nq + 1),
                 reader: input::Reader::new(chunk),
                 pend_l: Vec::with_capacity(PEND),
+                ckd: crate::dense_ck::DateMemo::new(ctx.origin),
             }))
         })
         .collect();
@@ -1675,6 +1683,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, threads: usize, t0: Instant) -> bool
     // Campaign numbers take the bits they need; the rest of a click key's
     // low half numbers the click among its person's.
     dn.obits = (ctx.aux.camp_names.len() as u32).leading_zeros();
+    dn.ckx = crate::dense_ck::Cx::new(&ctx, &dn);
     lap("links");
     if dn.overflow.load(Relaxed) {
         return give_up(&dn, &outs, nodes);
