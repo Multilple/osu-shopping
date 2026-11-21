@@ -397,10 +397,12 @@ impl Arena {
 /// How many cache lines of each stream's items wait before they are moved
 /// out together. (The move is a branch that cannot be predicted: with two
 /// lines it comes half as often as with one.)
-#[cfg(not(feature = "stage1"))]
+#[cfg(not(any(feature = "stage1", feature = "stage4")))]
 const SL: usize = 2;
 #[cfg(feature = "stage1")]
 const SL: usize = 1;
+#[cfg(feature = "stage4")]
+const SL: usize = 4;
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]

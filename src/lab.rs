@@ -64,18 +64,30 @@ fn machine() -> String {
         let t = read(&format!("/sys/kernel/mm/transparent_hugepage/{f}"));
         t.split('[').nth(1).and_then(|x| x.split(']').next()).unwrap_or("?").to_string()
     };
+    // How the data directory is mounted (its line of mountinfo: type, then the options).
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
+    let mounts = read("/proc/self/mountinfo");
+    let data = mounts
+        .lines()
+        .filter(|l| l.split_whitespace().nth(4) == Some(data_dir.as_str()))
+        .last()
+        .map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let dash = f.iter().position(|x| *x == "-").unwrap_or(f.len());
+            let mut t = format!("{} {} {}", f.get(dash + 1).unwrap_or(&"?"), f.get(5).unwrap_or(&"?"), f.get(dash + 3).unwrap_or(&"?"));
+            t.truncate(90);
+            t
+        })
+        .unwrap_or_else(|| "?".into());
+    let _ = (model, cache, allowed, yes);
     format!(
-        "C {} m{}s{} +{} A {} sib {} L2 {} L3 {} thp {}/{} os {}",
+        "C {} mhz {} thp {}/{} shm {} data [{}] os {}",
         field("model name").replace("Intel(R) Xeon(R) ", "").replace("CPU ", ""),
-        model,
-        field("stepping"),
-        yes.join(","),
-        allowed,
-        read(&format!("/sys/devices/system/cpu/cpu{c0}/topology/thread_siblings_list")).trim(),
-        cache(2, "size"),
-        cache(3, "size"),
+        field("cpu MHz"),
         sel("enabled"),
         sel("defrag"),
+        sel("shmem_enabled"),
+        data,
         read("/proc/sys/kernel/osrelease").trim()
     )
 }
@@ -168,34 +180,16 @@ pub fn main(threads: usize) -> ! {
         let big = tag == "60";
         // (label, threads, settings, which binary: "" is this one, "2" is /ss2 and so on, where present)
         let mut variants: Vec<(&str, usize, Vec<(&str, &str)>, &str)> = vec![("g", threads, vec![("SS_DENSE", "0")], ""), ("d", threads, vec![], "")];
+        variants.extend([
+            ("s2", threads, vec![], "2"),
+            ("gw", threads, vec![], "3"),
+            ("s4", threads, vec![], "4"),
+            ("k5", threads, vec![("SS_K512", "1")], "2"),
+            ("s2b", threads, vec![("SS_KB", "16")], "2"),
+            ("s4b", threads, vec![("SS_KB", "16")], "4"),
+        ]);
         if !big {
-            variants.extend([
-                ("rs", threads, vec![("SS_KERNEL", "rs")], ""),
-                ("pgo", threads, vec![], "2"),
-                ("pgors", threads, vec![("SS_KERNEL", "rs")], "2"),
-                ("clx", threads, vec![], "3"),
-                ("clxp", threads, vec![], "4"),
-                ("d6", threads * 3 / 4, vec![], ""),
-                ("d4", threads / 2, vec![], ""),
-                ("a1k", threads, vec![("SS_AHEAD", "1024")], ""),
-                ("a2k", threads, vec![("SS_AHEAD", "2048")], ""),
-                ("nh", threads, vec![("SS_NOHUGE", "1")], ""),
-                ("kb14", threads, vec![("SS_KB", "14")], ""),
-                ("kb16", threads, vec![("SS_KB", "16")], ""),
-                ("ku8", threads, vec![("SS_KU", "8")], ""),
-                ("ku9", threads, vec![("SS_KU", "9")], ""),
-                ("ku11", threads, vec![("SS_KU", "11")], ""),
-            ]);
-        } else {
-            variants.extend([
-                ("pgo", threads, vec![], "2"),
-                ("clx", threads, vec![], "3"),
-                ("clxp", threads, vec![], "4"),
-                ("kb16", threads, vec![("SS_KB", "16")], ""),
-                ("ku8", threads, vec![("SS_KU", "8")], ""),
-                ("ku9", threads, vec![("SS_KU", "9")], ""),
-                ("ku11", threads, vec![("SS_KU", "11")], ""),
-            ]);
+            variants.extend([("k5d", threads, vec![("SS_K512", "1")], ""), ("u9", threads, vec![("SS_KU", "9")], "2")]);
         }
         variants.retain(|v| v.3.is_empty() || Path::new(&format!("{}{}", exe.display(), v.3)).exists());
         let mut best: Vec<Option<Run>> = variants.iter().map(|_| None).collect();
@@ -225,6 +219,13 @@ pub fn main(threads: usize) -> ! {
         page.push(line);
         if let (Some(g), Some(d)) = (&best[0], &best[1]) {
             page.push(format!("Ld {}", d.laps));
+            // The other settings' stages: wall time only.
+            for (v, b) in variants.iter().zip(&best).skip(2) {
+                if let Some(r) = b {
+                    let walls: Vec<&str> = r.laps.split_whitespace().map(|t| t.split('/').next().unwrap_or("")).collect();
+                    page.push(format!("L{} {}", v.0, walls.join(" ")));
+                }
+            }
             page.push(format!("Ls {}", d.subs));
             page.push(format!("Lg {}", g.laps));
             page.push(format!("sum {} [{}] hwm d{:.1} g{:.1}", if !d.sum.is_empty() && d.sum == g.sum { "SAME" } else { "DIFFERENT" }, d.sum, d.hwm_gb, g.hwm_gb));

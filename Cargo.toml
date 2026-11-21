@@ -15,6 +15,7 @@ sprof = []
 exp = []
 lab = []
 stage1 = []
+stage4 = []
 
 [profile.release]
 opt-level = 3

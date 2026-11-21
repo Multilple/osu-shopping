@@ -432,9 +432,21 @@ unsafe fn odd_tail(file: &[u8], c4: usize, k5: usize, k6: usize, e: usize, qb: u
 pub(crate) unsafe fn events_dense(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> usize {
     // The fast path written out in assembly (dense_ka.rs), unless SS_KERNEL=rs
     // or the window is one it was not made for; else the one below.
-    static ASM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ASM.get_or_init(|| std::env::var("SS_KERNEL").map_or(true, |v| v != "rs")) {
-        if let Some(rest) = crate::dense_ka::events(file, start, end, ctx, dn, out) {
+    // 0: the Rust one; 1: assembly; 2: assembly with 64-byte mask compares
+    // (SS_K512=1, on a processor that has them).
+    static ASM: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let which = *ASM.get_or_init(|| {
+        if std::env::var("SS_KERNEL").is_ok_and(|v| v == "rs") {
+            0
+        } else if std::env::var("SS_K512").is_ok_and(|v| v == "1") && std::arch::is_x86_feature_detected!("avx512bw") {
+            2
+        } else {
+            1
+        }
+    });
+    if which != 0 {
+        let rest = if which == 2 { crate::dense_ka::events512(file, start, end, ctx, dn, out) } else { crate::dense_ka::events(file, start, end, ctx, dn, out) };
+        if let Some(rest) = rest {
             return rest;
         }
     }

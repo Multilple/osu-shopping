@@ -353,8 +353,12 @@ unsafe fn cold(k: &mut K, st: u64, a0: *const u8, file: &[u8], end: usize, ctx: 
 /// them; returns where the rest starts, or `None` when this kernel cannot
 /// take the run at all. `file[start - 1]` is a newline; `end` is a line
 /// boundary or the end of the file; 128 bytes past `end` can be read.
+/// The kernel, once per way of finding a line's commas, quotes and end.
+macro_rules! define_events {
+    ($(#[$attr:meta])* $name:ident, $set1:ident, [$c:ident $q:ident $n:ident], [$($head:literal),* $(,)?], [$($regs:tt)*]) => {
 #[inline(never)]
-pub(crate) unsafe fn events(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> Option<usize> {
+        $(#[$attr])*
+        pub(crate) unsafe fn $name(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn: &Dn, out: &mut DOut) -> Option<usize> {
     let base = file.as_ptr();
     let end = end.min(file.len());
     let k: &mut K = &mut *KS.with(|k| k.get());
@@ -380,32 +384,15 @@ pub(crate) unsafe fn events(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn
     let limit = base.add(end - MARGIN - 1);
     let mut a0 = base.add(s - 1);
     let kp: *mut K = k;
-    let (commas, quotes, newlines) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b'\n' as i8));
+    let ($c, $q, $n) = ($set1(b',' as i8), $set1(b'"' as i8), $set1(b'\n' as i8));
     while a0 < limit {
         _mm_prefetch(a0.wrapping_add(AHEAD) as *const i8, _MM_HINT_T0);
         _mm_prefetch(a0.wrapping_add(AHEAD + 64) as *const i8, _MM_HINT_T0);
         let (st, w0, w1, stream): (u64, u64, u64, u64);
         let line = a0;
         asm!(
-            // ---- The masks: newlines 41..104 bytes on; commas and quotes of the first 64.
-            "vpcmpeqb ymm6, ymm14, ymmword ptr [rsi + 41]",
-            "vpcmpeqb ymm7, ymm14, ymmword ptr [rsi + 73]",
-            "vpcmpeqb ymm2, ymm12, ymmword ptr [rsi]",
-            "vpcmpeqb ymm3, ymm12, ymmword ptr [rsi + 32]",
-            "vpcmpeqb ymm0, ymm13, ymmword ptr [rsi]",
-            "vpcmpeqb ymm1, ymm13, ymmword ptr [rsi + 32]",
-            "vpmovmskb r15d, ymm6",
-            "vpmovmskb r14d, ymm7",
-            "vpmovmskb eax, ymm2",
-            "vpmovmskb ecx, ymm3",
-            "vpmovmskb edx, ymm0",
-            "vpmovmskb r8d, ymm1",
-            "shl r14, 32",
-            "or r15, r14",
-            "shl rcx, 32",
-            "or rax, rcx",              // commas
-            "shl r8, 32",
-            "or rdx, r8",               // quotes
+            // ---- The masks: newlines 41..104 bytes on (r15); commas (rax) and quotes (rdx) of the first 64.
+            $($head,)*
             "tzcnt r15, r15",
             "jc 88f",                   // no newline in sight
             "lea r15, [rsi + r15 + 41]", // the newline that ends the line
@@ -735,9 +722,7 @@ pub(crate) unsafe fn events(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn
             s_indirect = const offset_of!(K, s_indirect),
             inout("rsi") a0,
             in("rdi") kp,
-            in("ymm12") commas,
-            in("ymm13") quotes,
-            in("ymm14") newlines,
+            $($regs)*
             out("rax") st,
             out("rdx") w0,
             out("rcx") w1,
@@ -759,3 +744,46 @@ pub(crate) unsafe fn events(file: &[u8], start: usize, end: usize, ctx: &Ctx, dn
     }
     Some(a0.offset_from(base) as usize + 1)
 }
+    };
+}
+
+define_events!(
+    events, _mm256_set1_epi8, [commas quotes newlines],
+    [
+        "vpcmpeqb ymm6, ymm14, ymmword ptr [rsi + 41]",
+        "vpcmpeqb ymm7, ymm14, ymmword ptr [rsi + 73]",
+        "vpcmpeqb ymm2, ymm12, ymmword ptr [rsi]",
+        "vpcmpeqb ymm3, ymm12, ymmword ptr [rsi + 32]",
+        "vpcmpeqb ymm0, ymm13, ymmword ptr [rsi]",
+        "vpcmpeqb ymm1, ymm13, ymmword ptr [rsi + 32]",
+        "vpmovmskb r15d, ymm6",
+        "vpmovmskb r14d, ymm7",
+        "vpmovmskb eax, ymm2",
+        "vpmovmskb ecx, ymm3",
+        "vpmovmskb edx, ymm0",
+        "vpmovmskb r8d, ymm1",
+        "shl r14, 32",
+        "or r15, r14",
+        "shl rcx, 32",
+        "or rax, rcx",
+        "shl r8, 32",
+        "or rdx, r8",
+    ],
+    [in("ymm12") commas, in("ymm13") quotes, in("ymm14") newlines,]
+);
+
+// The same with 64-byte compares into mask registers (AVX-512BW): a third
+// of the instructions for the masks.
+define_events!(
+    #[target_feature(enable = "avx512f,avx512bw")]
+    events512, _mm512_set1_epi8, [commas quotes newlines],
+    [
+        "vpcmpeqb k1, zmm14, zmmword ptr [rsi + 41]",
+        "vpcmpeqb k2, zmm12, zmmword ptr [rsi]",
+        "vpcmpeqb k3, zmm13, zmmword ptr [rsi]",
+        "kmovq r15, k1",
+        "kmovq rax, k2",
+        "kmovq rdx, k3",
+    ],
+    [in("zmm12") commas, in("zmm13") quotes, in("zmm14") newlines, out("k1") _, out("k2") _, out("k3") _,]
+);
