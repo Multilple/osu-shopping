@@ -389,15 +389,28 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     let outs_ref: Vec<&ThreadOut> = (0..threads).map(|t| &*out_mut(&outs, t)).collect();
 
     // ------------------------------------------------------------ dedup
+    // Two tables do this. Comparing a cache line of small entries at once
+    // has no hard-to-predict branch, which pays on Intel processors; on AMD
+    // ones the plain table measured faster. SS_DEDUP=rows|wide overrides.
+    let rows = match std::env::var("SS_DEDUP").ok().as_deref() {
+        Some("rows") => true,
+        Some("wide") => false,
+        _ => util::intel(),
+    };
     let next = AtomicUsize::new(0);
     par(threads, |_| {
-        let mut table: Vec<u64> = Vec::new();
+        let mut table: Vec<Row> = Vec::new();
+        let mut wide: Vec<u64> = Vec::new();
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
             if p >= 1 << ctx.pbits {
                 break;
             }
-            dedup_bucket(p, &outs_ref, &mut table);
+            if rows {
+                dedup_bucket_rows(p, &outs_ref, &mut table, &mut wide);
+            } else {
+                dedup_bucket(p, &outs_ref, &mut wide);
+            }
         }
     });
     lap("dedup");
@@ -409,6 +422,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     std::fs::create_dir_all(&camp_dir).unwrap();
 
     let ncell = (ctx.aux.camp_names.len() + 1) * ctx.nd;
+    // About one output row per nine events in generated data; each thread
+    // sets aside room for half as many again as its share of that.
+    let kept: usize = outs_ref.iter().map(|o| (0..ctx.nq).map(|q| o.ev.len(q)).sum::<usize>()).sum();
+    let rows_room = if env_usize("SS_ROOM", 1) != 0 { kept / 6 / threads + 4096 } else { 0 };
     // Biggest buckets first, so one huge person cannot be left for the end.
     let mut order: Vec<usize> = (0..ctx.nq).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(outs_ref.iter().map(|o| o.ev.len(q) + o.ck.len(q)).sum::<usize>()));
@@ -417,7 +434,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, scale: usize, t0: Instan
     par(threads, |tid| {
         // Nobody reads the dedup notes any more.
         outs_ref[tid].arena_slim.release();
-        let mut tl = Tl::new(&ctx, ncell);
+        let mut tl = Tl::new(&ctx, ncell, rows_room);
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(&q) = order.get(i) else { break };
@@ -1181,6 +1198,146 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, out: &mut Thre
 
 // ====================================================================== dedup
 
+/// One cache line of the dedup table: 16 entries.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Row([u32; 16]);
+
+/// Marks the losing copies of every event ID in dedup bucket `p`.
+///
+/// The table holds one entry per event ID seen so far: some bits of its hash
+/// and the number of the note of its kept copy (smallest ingest_ts so far),
+/// counting the bucket's notes thread after thread. A note looks at one
+/// cache line of 16 entries at a time: all 16 are compared at once, a new ID
+/// takes the line's first free entry, and only a full line sends it on to
+/// the next.
+fn dedup_bucket_rows(p: usize, outs: &[&ThreadOut], table: &mut Vec<Row>, wide: &mut Vec<u64>) {
+    use core::arch::x86_64::*;
+    const EMPTY: u32 = u32::MAX;
+    let n: usize = outs.iter().map(|o| o.slim.len(p)).sum();
+    if n < 2 {
+        return;
+    }
+    // Note numbers take `sb` bits (never all ones, so no entry looks empty); the hash gets the rest.
+    let sb = usize::BITS - n.leading_zeros();
+    if sb > 22 {
+        return dedup_bucket(p, outs, wide);
+    }
+    let seq_mask = (1u32 << sb) - 1;
+    let tag_mask = (1u32 << (32 - sb)) - 1;
+    let rows = (n / 11 + 1).next_power_of_two();
+    table.clear();
+    table.resize(rows, Row([EMPTY; 16]));
+    let rmask = rows - 1;
+    // Where each thread's notes start in the numbering.
+    let mut first = [0u32; MAX_THREADS + 2];
+    for (t, o) in outs.iter().enumerate() {
+        first[t + 1] = first[t] + o.slim.len(p) as u32;
+    }
+    let nt = outs.len();
+    let note = |seq: u32| -> *mut Slim {
+        let mut t = 0;
+        while t + 1 < nt && first[t + 1] <= seq {
+            t += 1;
+        }
+        outs[t].slim.at(p, (seq - first[t]) as usize)
+    };
+    let ev_at = |x: u64| -> *mut Ev {
+        let t = (x >> (IDX_BITS + Q_BITS)) as usize & ((1 << T_BITS) - 1);
+        let q = (x >> IDX_BITS) as usize & ((1 << Q_BITS) - 1);
+        outs[t].ev.at(q, (x & ((1 << IDX_BITS) - 1)) as usize)
+    };
+    let ingest = |x: u64| -> u32 { if x & TAG != 0 { x as u32 } else { unsafe { (*ev_at(x)).ingest } } };
+    // A copy that is not the kept one goes (invalid copies have no event to drop).
+    let drop_copy = |x: u64| {
+        if x & TAG == 0 {
+            unsafe { (*ev_at(x)).ev = DEAD };
+        }
+    };
+    // A repeat is settled a little later, in arrival order, so the events
+    // it needs (far apart in memory) can be fetched meanwhile.
+    const LATER: usize = 16;
+    const AHEAD: usize = 12;
+    let mut later = [(0usize, Slim { h: 0, x: 0 }, 0u32); LATER];
+    let mut nl = 0;
+    let entries = table.as_mut_ptr() as *mut u32;
+    let settle = |later: &[(usize, Slim, u32)]| {
+        for &(i, s, seq) in later {
+            let v = unsafe { *entries.add(i) };
+            let kept = unsafe { *note(v & seq_mask) };
+            // The copy with the smallest ingest_ts is kept, valid or not;
+            // copies with equal ingest_ts are identical.
+            if ingest(s.x) < ingest(kept.x) {
+                drop_copy(kept.x);
+                unsafe { *entries.add(i) = (v & !seq_mask) | seq };
+            } else {
+                drop_copy(s.x);
+            }
+        }
+    };
+    let fetch = |x: u64| {
+        if x & TAG == 0 {
+            unsafe { _mm_prefetch(ev_at(x) as *const i8, _MM_HINT_T0) };
+        }
+    };
+    unsafe {
+        let shift = _mm_cvtsi32_si128(sb as i32);
+        let ones = _mm256_set1_epi32(-1);
+        let mut seq = 0u32;
+        for o in outs {
+            for (ptr, len) in o.slim.pieces(p) {
+                for k in 0..len {
+                    // The table may not fit in cache: ask for a later note's line now.
+                    if k + AHEAD < len {
+                        let h = (*ptr.add(k + AHEAD)).h;
+                        _mm_prefetch(entries.add((h as usize & rmask) * 16) as *const i8, _MM_HINT_T0);
+                    }
+                    let s = *ptr.add(k);
+                    let tag = (s.h >> 20) as u32 & tag_mask;
+                    let want = _mm256_set1_epi32(tag as i32);
+                    let mut r = s.h as usize & rmask;
+                    'probe: loop {
+                        let row = entries.add(r * 16);
+                        let (a, b) = (_mm256_load_si256(row as *const __m256i), _mm256_load_si256(row.add(8) as *const __m256i));
+                        let free = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a, ones))) as u32
+                            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(b, ones))) as u32) << 8;
+                        let same = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_srl_epi32(a, shift), want))) as u32
+                            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_srl_epi32(b, shift), want))) as u32) << 8;
+                        let mut same = same & !free;
+                        while same != 0 {
+                            let j = same.trailing_zeros() as usize;
+                            same &= same - 1;
+                            let kept = *note(*row.add(j) & seq_mask);
+                            // Copies of one event share the hash and the 20 extra hash bits.
+                            if kept.h == s.h && ((kept.x ^ s.x) >> H2_SHIFT) & H2_MASK == 0 {
+                                fetch(s.x);
+                                fetch(kept.x);
+                                later[nl] = (r * 16 + j, s, seq);
+                                nl += 1;
+                                if nl == LATER {
+                                    settle(&later);
+                                    nl = 0;
+                                }
+                                break 'probe;
+                            }
+                        }
+                        if free != 0 {
+                            *row.add(free.trailing_zeros() as usize) = (tag << sb) | seq;
+                            break;
+                        }
+                        r = (r + 1) & rmask;
+                    }
+                    seq += 1;
+                }
+            }
+        }
+    }
+    settle(&later[..nl]);
+}
+
+/// `dedup_bucket_rows` with a plain open-addressing table of 8-byte entries:
+/// for buckets too large for the other, and for processors where the
+/// branch-free line compare does not pay.
 fn dedup_bucket(p: usize, outs: &[&ThreadOut], table: &mut Vec<u64>) {
     const EMPTY: u64 = u64::MAX;
     let n: usize = outs.iter().map(|o| o.slim.len(p)).sum();
@@ -1315,6 +1472,23 @@ struct Rows {
     cat: Vec<u16>,
 }
 
+impl Rows {
+    /// With room for about `n` rows set aside on huge pages (it is only
+    /// address space until written, and the lists still grow past it).
+    fn with_room(n: usize) -> Rows {
+        fn big<T>(n: usize) -> Vec<T> {
+            let v: Vec<T> = Vec::with_capacity(n);
+            let (a, b) = (v.as_ptr() as usize, v.as_ptr() as usize + n * std::mem::size_of::<T>());
+            let (a, b) = ((a + 4095) & !4095, b & !4095);
+            if b > a + (4 << 20) && std::env::var_os("SS_NOHUGE").is_none() {
+                unsafe { sys::madvise(a as *mut std::ffi::c_void, b - a, sys::MADV_HUGEPAGE) };
+            }
+            v
+        }
+        Rows { n: 0, user: big(n * 14), day: big(n * 4), sessions: big(n * 4), events: big(n * 4), rev: big(n * 8), cat: big(n) }
+    }
+}
+
 struct Cells {
     sessions: Vec<u32>,
     purch: Vec<u32>,
@@ -1359,7 +1533,7 @@ struct Tl {
 }
 
 impl Tl {
-    fn new(ctx: &Ctx, ncell: usize) -> Tl {
+    fn new(ctx: &Ctx, ncell: usize, rows_room: usize) -> Tl {
         let bslots = 1usize << ctx.qshift;
         // Half-hour bins of event time, counted from the time origin.
         let bin_lo = ((ctx.ws - ctx.origin).max(0) / GAP as i64) as usize;
@@ -1374,7 +1548,7 @@ impl Tl {
             catsum: vec![0; ctx.aux.cat_names.len()],
             touched: Vec::new(),
             tmp: Vec::new(),
-            rows: Rows::default(),
+            rows: if rows_room > 0 { Rows::with_room(rows_room) } else { Rows::default() },
             cells: Cells {
                 sessions: vec![0; ncell],
                 purch: vec![0; ncell],
