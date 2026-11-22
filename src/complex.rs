@@ -128,7 +128,7 @@ pub struct PScratch {
 // (records equal in both are identical). `WX_CHECK=1` verifies exactly that at run time.
 
 /// Build switch: `XL_WXG=0` keeps the general sort and the record-by-record hand-over.
-const WX_GATHER: bool = crate::env_u32(option_env!("XL_WXG"), 1) == 1;
+pub const WX_GATHER: bool = crate::env_u32(option_env!("XL_WXG"), 1) == 1;
 
 fn wx_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

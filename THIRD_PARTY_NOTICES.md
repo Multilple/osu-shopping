@@ -4,7 +4,7 @@
 
 The Rust sources in `src/`, `.cargo/config.toml`, `Cargo.toml`, `Cargo.lock` and
 the `Dockerfile` are based on Team 67's Express Lane, commit
-`3493fdd5a56eb4a3340d2ef5224e8ca567c11229`.
+`2d7801e1f7d45c693fe53847801ef5b1ad06d929`.
 
 - Copyright (c) 2026 Team 67
 - MIT License; the full text is in `LICENSE`.
