@@ -16,3 +16,13 @@ Relative to Team 67's Express Lane at commit `1cda738`:
   user partitions instead of 2048, which measured about 1% faster there
   (358 ms against 362 ms, median of 12 interleaved runs). At 60M events the
   count stays 2048, so that case runs exactly as before.
+- `src/v3b.rs`: the dedup stage writes its output with one copy. Each user
+  partition has one 64-byte slot (the `SB` type, used for both the short-ID and
+  the long-ID lane); a full slot is streamed straight into the partition's
+  4 KiB chunk as two 256-bit stores, so the stage still uses no 512-bit
+  registers. Before, every record went through a 16 or 32 word run buffer and
+  then a 24 word stage. The chunk layout and the per-user reader are unchanged.
+  Measured on the scoring hardware at 60M events: 1073 ms against 1100 ms
+  (median of 6 interleaved runs); the dedup stage itself 195 ms against 215 to
+  234 ms. About 1% at 20M events. Output unchanged: checked against the
+  independent pipeline at 5M, 20M and 60M events and by output digest.

@@ -1174,6 +1174,35 @@ impl LB {
             _mm_prefetch(s.add(64), _MM_HINT_T0);
         }
     }
+    #[inline(always)]
+    fn prefetch_w(&self, p: usize) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let s = self.st.add(p) as *const i8;
+            _mm_prefetch(s, _MM_HINT_ET0);
+            _mm_prefetch(s.add(64), _MM_HINT_ET0);
+        }
+    }
+    #[inline(always)]
+    fn words(&self, p: usize) -> usize {
+        unsafe { (*self.st.add(p)).nwords }
+    }
+    /// Appends one word to partition `p`: one store into its 64-byte slot, and a
+    /// streamed line into the chunk when the slot fills.
+    #[inline(always)]
+    fn push1(&mut self, p: usize, w: u64) {
+        unsafe {
+            let s = self.st.add(p);
+            let f = (*s).fill;
+            *(*s).data.get_unchecked_mut(f) = w;
+            if f == 7 {
+                self.line(s, std::arch::x86_64::_mm512_load_si512((*s).data.as_ptr() as *const _), 8);
+                (*s).fill = 0;
+            } else {
+                (*s).fill = f + 1;
+            }
+        }
+    }
     fn slices(&self, p: usize, out: &mut Vec<(*const u64, usize)>) {
         unsafe {
             let s = self.st.add(p);
@@ -1230,14 +1259,138 @@ fn h32(h: u64, b2: u32) -> u64 {
     (h << b2) >> 32
 }
 
+
+/// Short-user output lane of the dedup stage: one 64-byte write-combining slot per
+/// partition in a dense array, fill counts in their own byte array, and whole lines
+/// streamed into the same 4 KiB chunk layout the other lanes use (CW payload words,
+/// then the link to the next chunk).
+pub struct SB {
+    data: *mut u64,
+    fill: *mut u8,
+    wp: *mut *mut u64,
+    head: *mut *mut u64,
+    nwords: *mut usize,
+    np: usize,
+    blk: *mut u8,
+    blk_end: *mut u8,
+    free: Vec<*mut u64>,
+}
+impl SB {
+    fn new(np: usize) -> SB {
+        let dbytes = np * 64;
+        let m = crate::sys::anon_pack(dbytes + np * 8 * 3 + np + 64);
+        unsafe {
+            SB {
+                data: m as *mut u64,
+                wp: m.add(dbytes) as *mut *mut u64,
+                head: m.add(dbytes + np * 8) as *mut *mut u64,
+                nwords: m.add(dbytes + np * 16) as *mut usize,
+                fill: m.add(dbytes + np * 24),
+                np,
+                blk: std::ptr::null_mut(),
+                blk_end: std::ptr::null_mut(),
+                free: Vec::new(),
+            }
+        }
+    }
+    #[inline(never)]
+    #[cold]
+    fn chunk(&mut self) -> *mut u64 {
+        if let Some(c) = self.free.pop() {
+            return c;
+        }
+        unsafe {
+            if self.blk.is_null() || self.blk.add(CHUNK) > self.blk_end {
+                self.blk = anon(BLOCK);
+                self.blk_end = self.blk.add(BLOCK);
+            }
+            let c = self.blk;
+            self.blk = self.blk.add(CHUNK);
+            c as *mut u64
+        }
+    }
+    #[inline(always)]
+    unsafe fn line(&mut self, p: usize, valid: usize) {
+        let mut w = *self.wp.add(p);
+        if w.is_null() || (w as usize & (CHUNK - 1)) == CW * 8 {
+            let c = self.chunk();
+            if w.is_null() {
+                *self.head.add(p) = c;
+            } else {
+                *(w as *mut *mut u64) = c;
+            }
+            w = c;
+        }
+        // two 256-bit streams: the dedup stage otherwise uses no 512-bit registers
+        let src = self.data.add(p * 8) as *const std::arch::x86_64::__m256i;
+        std::arch::x86_64::_mm256_stream_si256(w as *mut _, std::arch::x86_64::_mm256_load_si256(src));
+        std::arch::x86_64::_mm256_stream_si256((w as *mut std::arch::x86_64::__m256i).add(1), std::arch::x86_64::_mm256_load_si256(src.add(1)));
+        *self.wp.add(p) = w.add(8);
+        *self.nwords.add(p) += valid;
+    }
+    #[inline(always)]
+    fn prefetch_w(&self, p: usize) {
+        unsafe { std::arch::x86_64::_mm_prefetch(self.data.add(p * 8) as *const i8, std::arch::x86_64::_MM_HINT_ET0) };
+    }
+    #[inline(always)]
+    fn push1(&mut self, p: usize, w: u64) {
+        unsafe {
+            let f = *self.fill.add(p) as usize;
+            *self.data.add(p * 8 + f) = w;
+            if f == 7 {
+                self.line(p, 8);
+                *self.fill.add(p) = 0;
+            } else {
+                *self.fill.add(p) = (f + 1) as u8;
+            }
+        }
+    }
+    #[inline(always)]
+    unsafe fn put(&mut self, p: usize, src: *const u64, n: usize) {
+        for i in 0..n {
+            self.push1(p, *src.add(i));
+        }
+    }
+    fn finish(&mut self) {
+        unsafe {
+            for p in 0..self.np {
+                let f = *self.fill.add(p) as usize;
+                if f > 0 {
+                    self.line(p, f);
+                    *self.fill.add(p) = 0;
+                }
+            }
+            std::arch::x86_64::_mm_sfence();
+        }
+    }
+    #[inline(always)]
+    fn words(&self, p: usize) -> usize {
+        unsafe { *self.nwords.add(p) }
+    }
+    fn slices(&self, p: usize, out: &mut Vec<(*const u64, usize)>) {
+        unsafe {
+            let mut c = *self.head.add(p);
+            let mut rem = *self.nwords.add(p);
+            while rem > 0 {
+                let k = rem.min(CW);
+                out.push((c as *const u64, k));
+                rem -= k;
+                if rem > 0 {
+                    c = *(c.add(CW) as *const *mut u64);
+                }
+            }
+        }
+    }
+}
+
 pub struct UBins {
-    s: VB,
-    w: VB,
+    s: SB,
+    w: SB,
     np: Vec<u32>,
 }
 impl UBins {
     fn new(np: usize) -> UBins {
-        UBins { s: VB::new(np), w: VB::new(np), np: vec![0; np] }
+        UBins { s: SB::new(np), w: SB::new(np), np: vec![0; np] }
     }
     fn finish(&mut self) {
         self.s.finish();
@@ -1262,11 +1415,8 @@ fn urec_put(u: &mut UBins, b2: u32, w0: u64, uh: u64, ul: u64) {
         let h = hash(Key { hi: uh, lo: ul });
         let q = part(h, b2);
         let a = h32(h, b2) << 32 | lo;
-        if pur != 0 {
-            u.w.push(q, [a, ul, uh, pay]);
-        } else {
-            u.w.push(q, [a, ul, uh]);
-        }
+        let r = [a, ul, uh, pay];
+        unsafe { u.w.put(q, r.as_ptr(), 3 + pur as usize) };
     }
 }
 pub struct CBins {
@@ -3098,7 +3248,7 @@ const RUN_PUT: bool = true;
 #[inline(always)]
 fn emit_run(t: &mut T3, b2: u32, q: usize, words: &[u64]) {
     if RUN_PUT {
-        unsafe { dd_put(&mut t.u2.s, q, words.as_ptr(), words.len()) };
+        unsafe { t.u2.s.put(q, words.as_ptr(), words.len()) };
     } else {
         let rb = 42 - b2;
         let mut i = 0;
@@ -3114,13 +3264,7 @@ fn emit_run(t: &mut T3, b2: u32, q: usize, words: &[u64]) {
 #[inline(always)]
 fn emit_run_w(t: &mut T3, b2: u32, q: usize, words: &[u64]) {
     if RUN_PUT {
-        unsafe {
-            let n = words.len();
-            dd_put(&mut t.u2.w, q, words.as_ptr(), n.min(16));
-            if n > 16 {
-                dd_put(&mut t.u2.w, q, words.as_ptr().add(16), n - 16);
-            }
-        }
+        unsafe { t.u2.w.put(q, words.as_ptr(), words.len()) };
     } else {
         let mut i = 0;
         while i < words.len() {
@@ -3154,6 +3298,7 @@ const MWW: usize = 32;
 const MWT: usize = 24;
 const _: () = assert!(MSW <= 16 && MWW <= 32);
 const DFL: usize = 24;
+const DSA: usize = 12;
 const DLA: usize = 4;
 const DPA: usize = 8;
 const DREC: usize = 256;
@@ -3483,70 +3628,44 @@ unsafe fn dd_run_w(t: &mut T3, b2: u32, q: usize, p: *const u64, n: usize) {
     emit_run_w(t, b2, q, std::slice::from_raw_parts(p, n));
 }
 #[inline(never)]
-unsafe fn dd_push_s(t: &mut T3, b2: u32, r: &mut Runs, ow: *const u64, oq: *const u32, m: usize) {
-    let (ms, msf, fl) = (r.ms, r.msf, r.fl);
-    let mut nf = r.nf;
-    for j in 0..m {
-        let q = *oq.add(j) as usize;
-        let mut f = *msf.add(q) as usize;
-        if f >= MSW {
-            dd_run_s(t, b2, q, ms.add(q * MSW), f);
-            f = 0;
-        }
-        *ms.add(q * MSW + f) = *ow.add(j);
-        *msf.add(q) = (f + 1) as u8;
-        *fl.add(nf) = q as u16;
-        nf += (f + 1 == MST) as usize;
+unsafe fn dd_push_s(t: &mut T3, _b2: u32, _r: &mut Runs, ow: *const u64, oq: *const u32, m: usize) {
+    // One copy: each survivor goes straight into its partition's 64-byte slot.
+    let lb = &mut t.u2.s;
+    for j in 0..m.min(DSA) {
+        lb.prefetch_w(*oq.add(j) as usize);
     }
-    r.nf = nf;
+    for j in 0..m {
+        if j + DSA < m {
+            lb.prefetch_w(*oq.add(j + DSA) as usize);
+        }
+        lb.push1(*oq.add(j) as usize, *ow.add(j));
+    }
 }
 #[inline(never)]
-unsafe fn dd_push_s2(t: &mut T3, b2: u32, r: &mut Runs, o: &WOut, m: usize) {
-    let (ms, msf, fl) = (r.ms, r.msf, r.fl);
+unsafe fn dd_push_s2(t: &mut T3, _b2: u32, _r: &mut Runs, o: &WOut, m: usize) {
     let np = t.u2.np.as_mut_ptr();
-    let mut nf = r.nf;
+    let lb = &mut t.u2.s;
     for j in 0..m {
         let e = *o.sq.add(j);
         let q = (e & 0xFFFF) as usize;
-        let mut f = *msf.add(q) as usize;
-        if f + 2 > MSW {
-            dd_run_s(t, b2, q, ms.add(q * MSW), f);
-            f = 0;
+        let pur = e >> 16;
+        lb.push1(q, *o.sw.add(j));
+        if pur != 0 {
+            lb.push1(q, *o.sp.add(j));
+            *np.add(q) += pur;
         }
-        *ms.add(q * MSW + f) = *o.sw.add(j);
-        *ms.add(q * MSW + f + 1) = *o.sp.add(j);
-        let f2 = f + 1 + (e >> 16) as usize;
-        if RUN_PUT {
-            *np.add(q) += e >> 16;
-        }
-        *msf.add(q) = f2 as u8;
-        *fl.add(nf) = q as u16;
-        nf += (f < MST && f2 >= MST) as usize;
     }
-    r.nf = nf;
 }
 #[inline(never)]
-unsafe fn dd_push_w(t: &mut T3, b2: u32, r: &mut Runs, o: &WOut, m: usize) {
-    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_ET0};
-    let (mw, mwf, fl) = (r.mw, r.mwf, r.flw);
-    let mut nf = r.nfw;
+unsafe fn dd_push_w(t: &mut T3, _b2: u32, _r: &mut Runs, o: &WOut, m: usize) {
+    let sb = &mut t.u2.w;
     for j in 0..m {
-        let qa = (*o.wq.add((j + DPA).min(m - 1)) & 0xFFFF) as usize;
-        _mm_prefetch(mw.add(qa * MWW + (*mwf.add(qa) as usize & !7)) as *const i8, _MM_HINT_ET0);
+        sb.prefetch_w((*o.wq.add((j + DPA).min(m - 1)) & 0xFFFF) as usize);
         let e = *o.wq.add(j);
         let q = (e & 0xFFFF) as usize;
-        let mut f = *mwf.add(q) as usize;
-        if f + 4 > MWW {
-            dd_run_w(t, b2, q, mw.add(q * MWW), f);
-            f = 0;
-        }
-        *(mw.add(q * MWW + f) as *mut [u64; 4]) = [*o.wa.add(j), *o.wl.add(j), *o.wh.add(j), *o.wp.add(j)];
-        let f2 = f + 3 + (e >> 16) as usize;
-        *mwf.add(q) = f2 as u8;
-        *fl.add(nf) = q as u16;
-        nf += (f < MWT && f2 >= MWT) as usize;
+        let r = [*o.wa.add(j), *o.wl.add(j), *o.wh.add(j), *o.wp.add(j)];
+        sb.put(q, r.as_ptr(), 3 + (e >> 16) as usize);
     }
-    r.nfw = nf;
 }
 #[inline(always)]
 unsafe fn dd_pf4(p: *const i8) {
@@ -3558,8 +3677,8 @@ unsafe fn dd_pf4(p: *const i8) {
 }
 #[inline(never)]
 unsafe fn dd_drain_s(t: &mut T3, b2: u32, r: &mut Runs) {
-    let st = t.u2.s.st as *const i8;
-    let vs = std::mem::size_of::<VStage>();
+    let st = t.u2.s.data as *const i8;
+    let vs = 64usize;
     let nf = r.nf;
     for i in 0..nf.min(DLA) {
         dd_pf4(st.add(*r.fl.add(i) as usize * vs));
@@ -3579,8 +3698,8 @@ unsafe fn dd_drain_s(t: &mut T3, b2: u32, r: &mut Runs) {
 }
 #[inline(never)]
 unsafe fn dd_drain_w(t: &mut T3, b2: u32, r: &mut Runs) {
-    let st = t.u2.w.st as *const i8;
-    let vs = std::mem::size_of::<VStage>();
+    let st = t.u2.w.data as *const i8;
+    let vs = 64usize;
     let nf = r.nfw;
     for i in 0..nf.min(DLA) {
         dd_pf4(st.add(*r.flw.add(i) as usize * vs));
@@ -3914,27 +4033,7 @@ fn dedup_thread(cx: &Cx, tid: usize) {
     }
     let d4 = unsafe { _rdtsc() };
     unsafe {
-        let vs = std::mem::size_of::<VStage>();
-        for q in 0..np2 {
-            if q + DLA < np2 {
-                dd_pf4((t.u2.s.st as *const i8).add((q + DLA) * vs));
-            }
-            let f = *rn.msf.add(q) as usize;
-            if f > 0 {
-                emit_run(t, b2, q, std::slice::from_raw_parts(rn.ms.add(q * MSW), f));
-                *rn.msf.add(q) = 0;
-            }
-        }
-        for q in 0..np2 {
-            if q + DLA < np2 {
-                dd_pf4((t.u2.w.st as *const i8).add((q + DLA) * vs));
-            }
-            let f = *rn.mwf.add(q) as usize;
-            if f > 0 {
-                emit_run_w(t, b2, q, std::slice::from_raw_parts(rn.mw.add(q * MWW), f));
-                *rn.mwf.add(q) = 0;
-            }
-        }
+        let _ = np2;
     }
     me.dc[6] += unsafe { _rdtsc() } - d4;
     t.n_rows[3] += kept;
@@ -6743,7 +6842,7 @@ pub fn run(g: &G, outdir: &str, timing: bool) {
     if timing {
         let (mut a, mut b, mut f) = ((0, 0), (0, 0), [0usize; 2]);
         for tid in 0..nt {
-            let (x, y) = (vbc(&cx.t(tid).u2.s), vbc(&cx.t(tid).u2.w));
+            let (x, y) = ({ let v = &cx.t(tid).u2.s; let (mut c, mut w) = (0, 0); for p in 0..v.np { let n = v.words(p); c += n.div_ceil(CW); w += n; } (c, w) }, { let v = &cx.t(tid).u2.w; let (mut c, mut w) = (0, 0); for p in 0..v.np { let n = v.words(p); c += n.div_ceil(CW); w += n; } (c, w) });
             a = (a.0 + x.0, a.1 + x.1);
             b = (b.0 + y.0, b.1 + y.1);
             f[0] += cx.t(tid).u2.s.free.len();
