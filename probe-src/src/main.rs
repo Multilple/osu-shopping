@@ -60,13 +60,14 @@ fn main() {
     let gen = std::env::var("PROBE_GEN").unwrap_or_else(|_| "/generate".into());
     let gen_threads = std::env::var("PROBE_GEN_THREADS").unwrap_or_else(|_| "8".into());
     // name of the variant whose own stage timings are printed (run once more, with XL_TIMING=1)
-    let lap_of = std::env::var("PROBE_LAPS").unwrap_or_else(|_| "f,x,o3".into());
+    let lap_of = std::env::var("PROBE_LAPS").unwrap_or_else(|_| "f,o3,o4".into());
     // sizes below this get no timed rounds, only the detail run
     let loop_min: u64 = std::env::var("PROBE_LOOP_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     // name of the variant (a build with the upstream stage statistics) whose report is condensed and printed
     let detail_of = std::env::var("PROBE_DETAIL").unwrap_or_else(|_| "sp".into());
     let mut details = String::new();
-    let check_of = std::env::var("PROBE_CHECKS").unwrap_or_else(|_| "f,o3".into());
+    let wx_of = std::env::var("PROBE_WX").unwrap_or_else(|_| "od".into());
+    let check_of = std::env::var("PROBE_CHECKS").unwrap_or_else(|_| "f,o4".into());
     let settle_min: u64 = std::env::var("PROBE_SETTLE_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(40_000_000);
     let reps: usize = std::env::var("PROBE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
     let budget: f64 = std::env::var("PROBE_BUDGET").ok().and_then(|s| s.parse().ok()).unwrap_or(155.0);
@@ -224,6 +225,35 @@ fn main() {
                 checks.push_str(&format!(" C[{}]{}{}", v.name, line, bad));
             }
         }
+        // our debug build's own timings of the linked-person chain, condensed
+        let mut wx = String::new();
+        if let Some(v) = variants.iter().find(|v| v.name == wx_of) {
+            let _ = fs::remove_dir_all(&out);
+            let _ = fs::create_dir_all(&out);
+            let mut c = Command::new(&v.bin);
+            c.arg(&data).arg(&out).env("XL_TIMING", "1").env("WX_DBG", "1").stdout(Stdio::null()).stderr(Stdio::piped());
+            if let Ok(o) = c.output() {
+                let err = String::from_utf8_lossy(&o.stderr);
+                wx.push_str(" X:");
+                for l in err.lines() {
+                    let t: Vec<&str> = l.split_whitespace().collect();
+                    if t.len() < 6 || t[0] != "[wx]" {
+                        continue;
+                    }
+                    let num = |x: &str| x.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').parse::<f64>().unwrap_or(0.0);
+                    if t[1] == "clicks_a" && t.len() >= 12 {
+                        // [wx] clicks_a tid T: resolve_all N recs X ms, rest Y ms
+                        wx.push_str(&format!(" ca{}:{:.0}k/{:.1}+{:.1}", num(t[3]), num(t[5]) / 1e3, num(t[7]), num(t[10])));
+                    } else if t[1] == "shard" && t.len() >= 8 && t[4] == "recs" && num(t[3]) >= 100000.0 {
+                        // [wx] shard S: N recs gathered in X ms ...
+                        wx.push_str(&format!(" g{}:{:.0}k/{:.1}", num(t[2]), num(t[3]) / 1e3, num(t[7])));
+                    } else if t[1] == "shard" && t.len() >= 14 && t[3] == "tid" && num(t[5]) >= 100000.0 {
+                        // [wx] shard S tid T: N evs M cks: sort_ck X ms, persons Y ms
+                        wx.push_str(&format!(" s{}:{:.0}kck/{:.1}+p{:.1}", num(t[2]), num(t[7]) / 1e3, num(t[10]), num(t[13])));
+                    }
+                }
+            }
+        }
         let mut laps = String::new();
         for name in lap_of.split(',') {
             let Some(v) = variants.iter().find(|v| v.name == name) else { continue };
@@ -272,6 +302,7 @@ fn main() {
         }
         report.push_str(&laps);
         report.push_str(&checks);
+        report.push_str(&wx);
         report.push('\n');
         let _ = fs::remove_dir_all(&data);
     }
