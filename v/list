@@ -1,5 +1,9 @@
 s4 s4
-bm20 bm20
-m10 s4 XL_V3M2=10
-rel3 s4 XL_V3REL=3
-pmr0 s4 XL_PMR=0
+pinst s4 XL_PINSTART=1
+pref s4 XL_PREFAULT=1
+pinpref s4 XL_PINSTART=1 XL_PREFAULT=1
+spin0 s4 XL_SPIN=0
+spin5k s4 XL_SPIN=5000
+pmx0 s4 XL_PMX=0
+pmx1 s4 XL_PMX=1
+f4k s4 XL_FIRST4K=1
