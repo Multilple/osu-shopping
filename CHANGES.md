@@ -9,5 +9,10 @@ Relative to Team 67's Express Lane at commit `1cda738`:
   unaffected, because they already used 2^10. At 60M events the parser fills
   1024 event partitions instead of 2048, which measured about 2% faster on the
   scoring hardware (1074 ms against 1096 ms, median of 4 interleaved runs).
-  The answer is unchanged: checked against an independent pipeline on a 60M
-  event dataset.
+  The answer is unchanged: checked against an independent pipeline on 60M
+  event datasets (17 seeds) and by an output digest on the scoring machine.
+- `src/v3b.rs`: the target size of a user partition is 768 KB instead of 384 KB
+  (the default of the `XL_V3T2` setting). At about 20M events this gives 1024
+  user partitions instead of 2048, which measured about 1% faster there
+  (358 ms against 362 ms, median of 12 interleaved runs). At 60M events the
+  count stays 2048, so that case runs exactly as before.
