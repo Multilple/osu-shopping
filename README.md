@@ -9,14 +9,14 @@ It reads shopping events, ad clicks and linked user IDs from `/data` and writes 
 
 This entry is built on **Team 67's Express Lane**
 (https://github.com/jason-scheffel/express-lane), commit
-`2d7801e1f7d45c693fe53847801ef5b1ad06d929`, released under the MIT License.
+`1cda738c004b3b186b878bdb8eee6516bfa9f22a`, released under the MIT License.
 The Rust sources in `src/`, the build settings in `.cargo/` and the Dockerfile
 come from that project. Changes made by Team Wix are listed in `CHANGES.md`.
 See `THIRD_PARTY_NOTICES.md` and `LICENSE`.
 
 ## Build and run
 
-Needs a Linux x86-64 host with Cascade Lake class AVX-512.
+Needs a Linux x86-64 host with Cascade Lake class AVX-512. IDs are treated as opaque strings (scorer version 5).
 
 ```sh
 docker build --platform linux/amd64 -t osu-shopping .

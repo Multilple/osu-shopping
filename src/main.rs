@@ -12,6 +12,7 @@ mod parse;
 mod pqw;
 mod setup;
 mod sys;
+mod v3b;
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -328,6 +329,9 @@ fn main() {
     if std::env::var("XL_ALLOC").map_or(true, |v| v == "1") {
         sys::alloc_enable();
     }
+    if std::env::var("XL_PMB").is_ok_and(|v| v == "0") {
+        sys::BIG_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(v) = std::env::var("XL_DONATE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
         sys::DONATE_DIV.store(v, std::sync::atomic::Ordering::Relaxed);
     }
@@ -407,6 +411,22 @@ fn main() {
     let g: &'static mut G = Box::leak(Box::new(setup::setup(&data, nt, check)));
     sys::xm(10);
     lap("setup");
+    if v3b::ON.load(std::sync::atomic::Ordering::SeqCst) {
+        v3b::run(g, &outdir, timing || check);
+        if timing {
+            let mut s = String::new();
+            for (n, ms) in unsafe { sys::LAPS.iter() } {
+                s.push_str(&format!("{n}={ms:.1} "));
+            }
+            eprintln!("[v3b] setup ms: {s}; exit at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        match std::env::var("XL_PMX").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2) {
+            1 => sys::exit_release(g.nt, unsafe { &parse::FDS }),
+            2 => sys::exit_release_pieces(g.nt, unsafe { &parse::FDS }),
+            _ => {}
+        }
+        unsafe { sys::_exit(0) }
+    }
     if std::env::var("XL_SORTBENCH").is_ok() {
         links::sort_bench(g);
         unsafe { sys::_exit(0) };

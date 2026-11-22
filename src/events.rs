@@ -2408,26 +2408,13 @@ fn stage3b(g: &G, tid: usize) {
                 }
                 t.core.abort(&st);
             }
-            if crate::complex::WX_GATHER && tv & COMPLEX != 0 {
-                // (Team Wix) What `process_run` does with a linked user's records is append
-                // them to this list. Append them directly, without the copy in between (a
-                // whale on this path is hundreds of thousands of records).
-                let n: usize = segs.iter().map(|s| seg(s).len()).sum();
-                t.n_runs += 1;
-                t.cx_raw.reserve(n);
-                for s in segs {
-                    t.cx_raw.extend(seg(s).iter().map(|&w0| Rec { w0, w1: u as u64 }));
-                }
-                t.n_complex += n as u64;
-            } else {
-                let mut buf = std::mem::take(&mut t.runbuf);
-                buf.clear();
-                for s in segs {
-                    buf.extend(seg(s).iter().map(|&w0| Rec { w0, w1: (u as u64) << 37 }));
-                }
-                process_run(g, t, u, &mut buf);
-                t.runbuf = buf;
+            let mut buf = std::mem::take(&mut t.runbuf);
+            buf.clear();
+            for s in segs {
+                buf.extend(seg(s).iter().map(|&w0| Rec { w0, w1: (u as u64) << 37 }));
             }
+            process_run(g, t, u, &mut buf);
+            t.runbuf = buf;
         }
         if !released {
             g.ev_arena.release_part(tid, g.nt);

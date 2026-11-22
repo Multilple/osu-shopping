@@ -170,6 +170,65 @@ pub fn exit_release(nt: usize, fds: &[i32]) {
     }
 }
 
+pub fn exit_release_pieces(nt: usize, fds: &[i32]) {
+    extern "C" {
+        fn close(fd: i32) -> i32;
+    }
+    if nt < 2 || POOL_N.load(Ordering::SeqCst) + 1 < nt {
+        return;
+    }
+    let mut fd = [-1i32; 2048];
+    let nf = fds.len().min(fd.len());
+    fd[..nf].copy_from_slice(&fds[..nf]);
+    let base = A_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let zend = Z_END.load(Ordering::Relaxed);
+    let (z0, z1) = if zend != 0 { (zend - Z_SIZE, (Z_NEXT.load(Ordering::Relaxed) + 4095) & !4095) } else { (0, 0) };
+    let (h0, h1) = (if zend != 0 { zend } else { base }, (A_NEXT.load(Ordering::Relaxed) + HP - 1) & !(HP - 1));
+    let piece = ((h1.saturating_sub(h0) / (4 * nt)).max(32 << 20) + HP - 1) & !(HP - 1);
+    let np = h1.saturating_sub(h0).div_ceil(piece);
+    let next = AtomicUsize::new(0);
+    let (fd, next) = (&fd, &next);
+    let job = |tid: usize| unsafe {
+        for &x in &fd[nf * tid / nt..nf * (tid + 1) / nt] {
+            if x >= 0 {
+                close(x);
+            }
+        }
+        if tid == 0 && z1 > z0 {
+            madvise(z0 as *mut u8, z1 - z0, MADV_DONTNEED);
+        }
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= np {
+                break;
+            }
+            let (x, y) = (h0 + i * piece, (h0 + (i + 1) * piece).min(h1));
+            madvise(x as *mut u8, y - x, MADV_DONTNEED);
+        }
+    };
+    let n = POOL_N.load(Ordering::SeqCst);
+    unsafe {
+        let r: &(dyn Fn(usize) + Sync) = &job;
+        JOB = Some(std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(r));
+        JOB_NT = nt;
+    }
+    DONE.store(0, Ordering::SeqCst);
+    GEN.fetch_add(1, Ordering::SeqCst);
+    if SLEEPERS.load(Ordering::SeqCst) != 0 {
+        unsafe { syscall(SYS_FUTEX, GEN.as_ptr(), FUTEX_WAKE_PRIVATE, i32::MAX as i64, 0usize, 0usize, 0usize) };
+    }
+    let t0 = rdtsc();
+    job(0);
+    let t1 = rdtsc();
+    let bound = 3 * (t1 - t0) + 200_000;
+    while DONE.load(Ordering::Acquire) != n && rdtsc() - t1 < bound {
+        std::hint::spin_loop();
+    }
+}
+
 pub unsafe fn release_heap_part(tid: usize, nt: usize) {
     let base = A_BASE.load(Ordering::Relaxed);
     if base == 0 {
@@ -294,6 +353,20 @@ pub fn anon(len: usize) -> *mut u8 {
         madvise(a, len, if HUGE.load(Ordering::Relaxed) { MADV_HUGEPAGE } else { MADV_NOHUGEPAGE });
         a
     }
+}
+
+#[cfg_attr(feature = "tl", track_caller)]
+pub fn anon_pack(len: usize) -> *mut u8 {
+    if len < HP && ANON_REGION.load(Ordering::Relaxed) && A_BASE.load(Ordering::Relaxed) != 0 {
+        let len = (len + 4095) & !4095;
+        let p = a_region(len, 4096);
+        if p != 0 {
+            #[cfg(feature = "tl")]
+            mp::add(p, len, std::panic::Location::caller() as *const _ as usize, 0);
+            return p as *mut u8;
+        }
+    }
+    anon(len)
 }
 
 #[cfg_attr(feature = "tl", track_caller)]
@@ -1022,6 +1095,72 @@ pub mod mp {
 }
 
 pub struct Alloc;
+const BIG_SLOTS: usize = 64;
+static BIG_LOCK: AtomicBool = AtomicBool::new(false);
+static mut BIG_N: [usize; 48] = [0; 48];
+static mut BIG: [[usize; BIG_SLOTS]; 48] = [[0; BIG_SLOTS]; 48];
+pub static BIG_ON: AtomicBool = AtomicBool::new(true);
+#[inline(always)]
+fn big_lock() {
+    while BIG_LOCK.swap(true, Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+}
+#[inline(never)]
+unsafe fn big_put(p: usize, c: usize) -> bool {
+    if c >= 48 || !BIG_ON.load(Ordering::Relaxed) {
+        return false;
+    }
+    big_lock();
+    let n = BIG_N[c];
+    let ok = n < BIG_SLOTS;
+    if ok {
+        BIG[c][n] = p;
+        BIG_N[c] = n + 1;
+    }
+    BIG_LOCK.store(false, Ordering::Release);
+    ok
+}
+#[inline(never)]
+unsafe fn big_take(c: usize) -> usize {
+    if c >= 48 || !BIG_ON.load(Ordering::Relaxed) {
+        return 0;
+    }
+    big_lock();
+    let mut p = 0;
+    let mut k = c;
+    while k < 48 && BIG_N[k] == 0 {
+        k += 1;
+    }
+    if k < 48 {
+        let room = (c..k).all(|j| BIG_N[j] < BIG_SLOTS);
+        if room {
+            BIG_N[k] -= 1;
+            p = BIG[k][BIG_N[k]];
+            for j in c..k {
+                BIG[j][BIG_N[j]] = p + (1usize << j);
+                BIG_N[j] += 1;
+            }
+        }
+    }
+    BIG_LOCK.store(false, Ordering::Release);
+    p
+}
+#[cfg(feature = "tl")]
+pub static CLS_N: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
+#[cfg(feature = "tl")]
+pub static CLS_FRESH: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
+#[cfg(feature = "tl")]
+pub fn cls_report(name: &str) {
+    let mut s = String::new();
+    for c in 0..40 {
+        let (n, f) = (CLS_N[c].load(Ordering::Relaxed), CLS_FRESH[c].load(Ordering::Relaxed));
+        if f > 0 {
+            s.push_str(&format!("2^{c}:{n}/{f}/{:.1}MB ", (f << c) as f64 / 1048576.0));
+        }
+    }
+    eprintln!("[pm] alloc classes after {name} (calls/fresh/fresh MB): {s}");
+}
 static A_BASE: AtomicUsize = AtomicUsize::new(0);
 static A_END: AtomicUsize = AtomicUsize::new(0);
 static A_NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -1187,9 +1326,17 @@ impl Alloc {
         }
         let c = a_class(l.size(), l.align());
         let sz = 1usize << c;
+        #[cfg(feature = "tl")]
+        {
+            CLS_N[c].fetch_add(1, Ordering::Relaxed);
+        }
         let p = TL.with(|t| {
             let t = &mut *t.get();
             let h = t.free[c];
+            #[cfg(feature = "tl")]
+            if h == 0 {
+                CLS_FRESH[c].fetch_add(1, Ordering::Relaxed);
+            }
             if h != 0 {
                 t.free[c] = *(h as *const usize);
                 #[cfg(feature = "tl")]
@@ -1242,6 +1389,17 @@ impl Alloc {
                 }
                 return a;
             }
+            let h = big_take(c);
+            if h != 0 {
+                #[cfg(feature = "tl")]
+                mp::add(h, sz, 0, 3);
+                #[cfg(feature = "tl")]
+                CLS_FRESH[c].fetch_sub(1, Ordering::Relaxed);
+                if zero {
+                    std::ptr::write_bytes(h as *mut u8, 0, l.size());
+                }
+                return h;
+            }
             if !zero {
                 let d = a_donated(t, sz, if sz >= HP { HP } else { 4096 });
                 if d != 0 {
@@ -1280,6 +1438,9 @@ unsafe impl std::alloc::GlobalAlloc for Alloc {
             #[cfg(feature = "tl")]
             if c > A_SMALL_MAX {
                 mp::free(p as usize);
+            }
+            if c > A_SMALL_MAX && big_put(p as usize, c) {
+                return;
             }
             TL.with(|t| {
                 let t = &mut *t.get();
