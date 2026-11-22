@@ -60,14 +60,14 @@ fn main() {
     let gen = std::env::var("PROBE_GEN").unwrap_or_else(|_| "/generate".into());
     let gen_threads = std::env::var("PROBE_GEN_THREADS").unwrap_or_else(|_| "8".into());
     // name of the variant whose own stage timings are printed (run once more, with XL_TIMING=1)
-    let lap_of = std::env::var("PROBE_LAPS").unwrap_or_else(|_| "f,o4,o5".into());
+    let lap_of = std::env::var("PROBE_LAPS").unwrap_or_else(|_| "f,o5,y,oy".into());
     // sizes below this get no timed rounds, only the detail run
     let loop_min: u64 = std::env::var("PROBE_LOOP_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     // name of the variant (a build with the upstream stage statistics) whose report is condensed and printed
     let detail_of = std::env::var("PROBE_DETAIL").unwrap_or_else(|_| "sp".into());
     let mut details = String::new();
     let wx_of = std::env::var("PROBE_WX").unwrap_or_else(|_| "od".into());
-    let check_of = std::env::var("PROBE_CHECKS").unwrap_or_else(|_| "f,o5".into());
+    let check_of = std::env::var("PROBE_CHECKS").unwrap_or_else(|_| "f,o5,y,oy".into());
     let settle_min: u64 = std::env::var("PROBE_SETTLE_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(40_000_000);
     let reps: usize = std::env::var("PROBE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
     let budget: f64 = std::env::var("PROBE_BUDGET").ok().and_then(|s| s.parse().ok()).unwrap_or(155.0);
