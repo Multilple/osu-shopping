@@ -195,7 +195,7 @@ fn main() {
                                 }
                             }
                         }
-                    } else if l.starts_with("[v3b] X pmu") || l.starts_with("[v3b] C pmu") || l.starts_with("[v3b] pkpm") || l.starts_with("[v3b] pm:") || l.starts_with("[v3b] pe:") || l.starts_with("[v3b] links:") {
+                    } else if l.starts_with("[v3b] pf ") || l.starts_with("[v3b] pa ") || l.starts_with("[v3b] pe:") || l.starts_with("[v3b] links:") {
                         let body = l[6..].replace("(cycles/instructions/branch misses/calls)", "").replace("dedup Mcycles", "");
                         details.push_str(&format!(" |{}", &body[..body.len().min(900)]));
                     } else if l.starts_with("[v3b] cpu ms") || l.starts_with("[v3b] prof") || l.starts_with("[v3b] st:") || l.starts_with("[v3b] rows:") {
