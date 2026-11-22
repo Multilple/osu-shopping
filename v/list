@@ -1,4 +1,7 @@
-a a
-r1 r1
-r2 r2
-r3 r3
+b b
+rel0 b XL_V3REL=0
+rel2 b XL_V3REL=2
+rel3 b XL_V3REL=3
+ck0 b XL_CKLATE=0
+pmr0 b XL_PMR=0
+d b XL_PM=1 XL_PB6=1 XL_PKPM=1

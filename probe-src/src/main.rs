@@ -195,6 +195,9 @@ fn main() {
                                 }
                             }
                         }
+                    } else if l.starts_with("[v3b] X pmu") || l.starts_with("[v3b] C pmu") || l.starts_with("[v3b] pkpm") || l.starts_with("[v3b] pm:") || l.starts_with("[v3b] pe:") || l.starts_with("[v3b] links:") {
+                        let body = l[6..].replace("(cycles/instructions/branch misses/calls)", "").replace("dedup Mcycles", "");
+                        details.push_str(&format!(" |{}", &body[..body.len().min(900)]));
                     } else if l.starts_with("[v3b] cpu ms") || l.starts_with("[v3b] prof") || l.starts_with("[v3b] st:") || l.starts_with("[v3b] rows:") {
                         let body = l[6..].replace("(user/system, all threads): ", "").replace("(thread-ms): ", "");
                         details.push_str(&format!(" |{}", &body[..body.len().min(330)]));
@@ -348,7 +351,7 @@ fn main() {
         report.push('\n');
         let _ = fs::remove_dir_all(&data);
     }
-    eprintln!("{details}PROBE med/min ms\n{report}t{:.0}s", t0.elapsed().as_secs_f64());
+    eprintln!("PROBE med/min ms\n{report}t{:.0}s\n{details}", t0.elapsed().as_secs_f64());
     std::process::exit(3);
 }
 
