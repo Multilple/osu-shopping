@@ -1,2 +1,6 @@
-b b
 s4 s4
+n7 s4 NCPU=7
+n6 s4 NCPU=6
+n5 s4 NCPU=5
+n4 s4 NCPU=4
+dg dg XL_PB7=16
