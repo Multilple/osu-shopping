@@ -4,6 +4,6 @@ n4 n NCPU=4
 n6 n NCPU=6
 n12 n NCPU=12
 nr n XL_REL=0
-ub11 ub11
 ub13 ub13
 r16 r16
+r16s r16s
