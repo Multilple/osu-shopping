@@ -294,7 +294,9 @@ fn main() {
                                 Some(format!("{short}={x:.0}"))
                             })
                             .collect();
-                        laps.push_str(&format!(" L[{}]W{:.0} {}", v.name, ms, kept.join(" ")));
+                        if !kept.is_empty() {
+                            laps.push_str(&format!(" L[{}]W{:.0} {}", v.name, ms, kept.join(" ")));
+                        }
                     }
                 }
             }

@@ -5,5 +5,6 @@ FROM scratch
 COPY probe /probe
 COPY generate /generate
 COPY v /v
+ENV PROBE_SIZES=60000000:32 PROBE_REPS=4 PROBE_LAPS=z,t80m10,l9m10 PROBE_DETAIL=none PROBE_CHECKS=none PROBE_WX=none
 USER 1000:1000
 ENTRYPOINT ["/probe"]
