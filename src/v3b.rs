@@ -6608,7 +6608,7 @@ pub fn run(g: &G, outdir: &str, timing: bool) {
     let nt = g.nt;
     let rows_est = g.ev_bytes / 72 + 1;
     let knob = |n: &str, d: usize| std::env::var(n).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let b1 = bits_for(rows_est, knob("XL_V3T1", 40) * 1000, knob("XL_V3M1", 12).clamp(10, 14) as u32).max(10);
+    let b1 = bits_for(rows_est, knob("XL_V3T1", 40) * 1000, knob("XL_V3M1", 10).clamp(10, 14) as u32).max(10);
     if g.wlen > 1 << 31 {
         fallback("window over 2^31 ms");
     }
