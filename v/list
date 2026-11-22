@@ -1,4 +1,5 @@
 b b
-s1 s1
-s2 s2
 s3 s3
+p12 s3 XL_V3T2=256 XL_V3M2=12
+p13 s3 XL_V3T2=100 XL_V3M2=13
+s3h s3h XL_IOADV=14
