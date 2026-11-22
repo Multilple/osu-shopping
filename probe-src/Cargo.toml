@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+parquet = { version = "54", default-features = false }
 
 [profile.release]
 opt-level = 2

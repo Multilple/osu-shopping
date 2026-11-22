@@ -54,6 +54,11 @@ fn median(v: &mut Vec<f64>) -> f64 {
 
 fn main() {
     let t0 = Instant::now();
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "--digest" {
+        println!("{}", dg::of(Path::new(&args[2])));
+        return;
+    }
     let scratch = std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into());
     let outdir = std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into());
     let vdir = std::env::var("PROBE_V").unwrap_or_else(|_| "/v".into());
@@ -68,6 +73,8 @@ fn main() {
     let mut details = String::new();
     let wx_of = std::env::var("PROBE_WX").unwrap_or_else(|_| "od".into());
     let check_of = std::env::var("PROBE_CHECKS").unwrap_or_else(|_| "z".into());
+    // names of variants (repeats allowed) run once more, untimed, to digest their output tables
+    let digest_of = std::env::var("PROBE_DIGEST").unwrap_or_default();
     let settle_min: u64 = std::env::var("PROBE_SETTLE_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(40_000_000);
     let reps: usize = std::env::var("PROBE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let budget: f64 = std::env::var("PROBE_BUDGET").ok().and_then(|s| s.parse().ok()).unwrap_or(158.0);
@@ -301,6 +308,32 @@ fn main() {
                 }
             }
         }
+        let mut digests = String::new();
+        let mut first: Option<String> = None;
+        for name in digest_of.split(',').filter(|n| !n.is_empty()) {
+            let Some(v) = variants.iter().find(|v| v.name == name) else { continue };
+            if t0.elapsed().as_secs_f64() > budget {
+                digests.push_str(" G-cut");
+                break;
+            }
+            let _ = fs::remove_dir_all(&out);
+            let _ = fs::create_dir_all(&out);
+            let mut c = Command::new(&v.bin);
+            c.arg(&data).arg(&out).stdout(Stdio::null()).stderr(Stdio::piped());
+            for (k, val) in &v.env {
+                c.env(k, val);
+            }
+            let ok = matches!(c.output(), Ok(o) if o.status.success() && !String::from_utf8_lossy(&o.stderr).contains("FALLBACK"));
+            let d = if ok { dg::of(Path::new(&out)) } else { "RUNFAIL".to_string() };
+            match &first {
+                Some(f) if *f == d => digests.push_str(&format!(" G[{}]=", v.name)),
+                Some(_) => digests.push_str(&format!(" G[{}]DIFF {}", v.name, d)),
+                None => {
+                    digests.push_str(&format!(" G[{}]{}", v.name, d));
+                    first = Some(d);
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&out);
         report.push_str(&format!("{}M gen{:.0}s settle{:.0}s n{}", events / 1_000_000, gen_s, settle_s, times.iter().map(|t| t.len()).min().unwrap_or(0)));
         for (i, v) in variants.iter().enumerate() {
@@ -309,6 +342,7 @@ fn main() {
             report.push_str(&format!(" {}:{:.0}/{:.0}{}", v.name, md, if mn.is_finite() { mn } else { 0.0 }, bad[i]));
         }
         report.push_str(&laps);
+        report.push_str(&digests);
         report.push_str(&checks);
         report.push_str(&wx);
         report.push('\n');
@@ -316,4 +350,94 @@ fn main() {
     }
     eprintln!("{details}PROBE med/min ms\n{report}t{:.0}s", t0.elapsed().as_secs_f64());
     std::process::exit(3);
+}
+
+/// Order-insensitive digest of an output table: (rows, wrapping sum of row hashes).
+/// Used to check that every build writes the same answer on the scoring machine.
+mod dg {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::Field;
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
+
+    fn fnv(h: &mut u64, b: &[u8]) {
+        for &x in b {
+            *h ^= x as u64;
+            *h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+
+    pub fn table(dir: &Path) -> (u64, u64) {
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "parquet")).collect(),
+            Err(_) => return (0, 0),
+        };
+        files.sort();
+        let handles: Vec<_> = files.into_iter().map(|p| std::thread::spawn(move || one(&p))).collect();
+        let (mut n, mut s) = (0u64, 0u64);
+        for h in handles {
+            match h.join() {
+                Ok((a, b)) => {
+                    n += a;
+                    s = s.wrapping_add(b);
+                }
+                Err(_) => n = u64::MAX,
+            }
+        }
+        (n, s)
+    }
+
+    fn one(p: &Path) -> (u64, u64) {
+        let Ok(f) = File::open(p) else { return (0, 0xBAD) };
+        let Ok(r) = SerializedFileReader::new(f) else { return (0, 0xBAD) };
+        let Ok(it) = r.get_row_iter(None) else { return (0, 0xBAD) };
+        let (mut n, mut s) = (0u64, 0u64);
+        for row in it {
+            let Ok(row) = row else { return (n, 0xBAD) };
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for (_, f) in row.get_column_iter() {
+                match f {
+                    Field::Null => fnv(&mut h, &[0xFF, 0]),
+                    Field::Str(x) => {
+                        fnv(&mut h, &[1]);
+                        fnv(&mut h, x.as_bytes());
+                        fnv(&mut h, &[0]);
+                    }
+                    Field::Bytes(x) => {
+                        fnv(&mut h, &[1]);
+                        fnv(&mut h, x.data());
+                        fnv(&mut h, &[0]);
+                    }
+                    Field::Int(x) => {
+                        fnv(&mut h, &[3]);
+                        fnv(&mut h, &(*x as i64).to_le_bytes());
+                    }
+                    Field::Long(x) => {
+                        fnv(&mut h, &[3]);
+                        fnv(&mut h, &x.to_le_bytes());
+                    }
+                    Field::Date(x) => {
+                        fnv(&mut h, &[4]);
+                        fnv(&mut h, &(*x as i64).to_le_bytes());
+                    }
+                    other => {
+                        fnv(&mut h, &[9]);
+                        fnv(&mut h, other.to_string().as_bytes());
+                    }
+                }
+            }
+            h ^= h >> 32;
+            h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            h ^= h >> 29;
+            s = s.wrapping_add(h);
+            n += 1;
+        }
+        (n, s)
+    }
+
+    pub fn of(out: &Path) -> String {
+        let (un, us) = table(&out.join("user_daily"));
+        let (cn, cs) = table(&out.join("campaign_daily"));
+        format!("{un}:{us:016x}/{cn}:{cs:016x}")
+    }
 }
