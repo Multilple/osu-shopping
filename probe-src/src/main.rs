@@ -60,9 +60,14 @@ fn main() {
     let gen = std::env::var("PROBE_GEN").unwrap_or_else(|_| "/generate".into());
     let gen_threads = std::env::var("PROBE_GEN_THREADS").unwrap_or_else(|_| "8".into());
     // name of the variant whose own stage timings are printed (run once more, with XL_TIMING=1)
-    let lap_of = std::env::var("PROBE_LAPS").unwrap_or_else(|_| "n,n4,n6".into());
+    let lap_of = std::env::var("PROBE_LAPS").unwrap_or_else(|_| "n".into());
+    // sizes below this get no timed rounds, only the detail run
+    let loop_min: u64 = std::env::var("PROBE_LOOP_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(40_000_000);
+    // name of the variant (a build with the upstream stage statistics) whose report is condensed and printed
+    let detail_of = std::env::var("PROBE_DETAIL").unwrap_or_else(|_| "sp".into());
+    let mut details = String::new();
     let settle_min: u64 = std::env::var("PROBE_SETTLE_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(40_000_000);
-    let reps: usize = std::env::var("PROBE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let reps: usize = std::env::var("PROBE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
     let budget: f64 = std::env::var("PROBE_BUDGET").ok().and_then(|s| s.parse().ok()).unwrap_or(155.0);
     let sizes: Vec<(u64, u64)> = std::env::var("PROBE_SIZES")
         .unwrap_or_else(|_| "60000000:32,20000000:31".into())
@@ -109,7 +114,7 @@ fn main() {
         let mut times: Vec<Vec<f64>> = vec![Vec::new(); variants.len()];
         let mut bad: Vec<String> = vec![String::new(); variants.len()];
         // round 0 is a warm-up and is not counted
-        'rounds: for r in 0..=reps {
+        'rounds: for r in 0..=(if events >= loop_min { reps } else { 0 }) {
             for k in 0..variants.len() {
                 let i = (k + r) % variants.len();
                 if t0.elapsed().as_secs_f64() > budget {
@@ -140,6 +145,54 @@ fn main() {
                     }
                     Err(_) => bad[i] = "spawn".into(),
                 }
+            }
+        }
+        if let Some(v) = variants.iter().find(|v| v.name == detail_of) {
+            let _ = fs::remove_dir_all(&out);
+            let _ = fs::create_dir_all(&out);
+            let mut c = Command::new(&v.bin);
+            c.arg(&data).arg(&out).env("XL_TIMING", "1").env("XL_WPROF", "1").stdout(Stdio::null()).stderr(Stdio::piped());
+            for (k, val) in &v.env {
+                c.env(k, val);
+            }
+            if let Ok(o) = c.output() {
+                let err = String::from_utf8_lossy(&o.stderr);
+                details.push_str(&format!("D{}M", events / 1_000_000));
+                for l in err.lines() {
+                    let t: Vec<&str> = l.split_whitespace().collect();
+                    if t.first() == Some(&"[sp]") && t.len() > 12 && t[2] == "wall" {
+                        if !["s.mmap", "parse", "ev3a", "ev3b", "write", "endrel"].contains(&t[1]) {
+                            continue;
+                        }
+                        // [sp] name wall W user U sys S minflt M thp T tlbfl F tlbrecv R pgfree P thpfb B [madvise stats...]
+                        let get = |k: &str| t.iter().position(|x| *x == k).and_then(|i| t.get(i + 1)).and_then(|x| x.parse::<f64>().ok()).unwrap_or(-1.0);
+                        details.push_str(&format!(
+                            " |{} w{:.0} u{:.0} s{:.0} mf{:.0} thp{:.0} fb{:.0} pf{:.0}",
+                            t[1], get("wall"), get("user"), get("sys"), get("minflt"), get("thp"), get("thpfb"), get("pgfree")
+                        ));
+                        for x in t.iter().filter(|x| x.contains("x/")) {
+                            details.push(' ');
+                            details.push_str(x);
+                        }
+                    } else if t.first() == Some(&"[sp]") && (l.contains("block first touch") || l.contains("at report")) {
+                        details.push_str(&format!(" |{}", t[1..].join(" ").replace("thread-ms", "tms").replace("block first touch:", "bft").replace("input pre-touch", "pre")));
+                    } else if t.first() == Some(&"[wprof]") {
+                        details.push_str(" |wp");
+                        for x in &t {
+                            if let Some((k, v)) = x.split_once('=') {
+                                let v = v.split("ms").next().unwrap_or("0");
+                                if v.parse::<f64>().map_or(false, |f| f >= 3.0) {
+                                    details.push_str(&format!(" {k}={v}"));
+                                }
+                            }
+                        }
+                    } else if l.starts_with("[v2b] ms:") {
+                        if let Some(i) = l.find("peak_rss_kb=") {
+                            details.push_str(&format!(" |rss{}MB", l[i + 12..].trim().parse::<u64>().unwrap_or(0) / 1024));
+                        }
+                    }
+                }
+                details.push('\n');
             }
         }
         let mut laps = String::new();
@@ -192,6 +245,6 @@ fn main() {
         report.push('\n');
         let _ = fs::remove_dir_all(&data);
     }
-    eprintln!("PROBE med/min ms\n{report}t{:.0}s", t0.elapsed().as_secs_f64());
+    eprintln!("{details}PROBE med/min ms\n{report}t{:.0}s", t0.elapsed().as_secs_f64());
     std::process::exit(3);
 }
