@@ -1,8 +1,2 @@
 b b
-s1 b XL_V3SKIP=1
-s4 b XL_V3SKIP=4
-s2 b XL_V3SKIP=2
-n7 b NCPU=7
-k1 b XL_PB7=1
-pmr0 b XL_PMR=0
-pf b XL_PF=1 XL_PB7=16
+s1 s1
