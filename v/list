@@ -5,4 +5,4 @@ s2 b XL_V3SKIP=2
 n7 b NCPU=7
 k1 b XL_PB7=1
 pmr0 b XL_PMR=0
-pf b XL_PF=1
+pf b XL_PF=1 XL_PB7=16
