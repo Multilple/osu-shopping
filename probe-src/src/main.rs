@@ -69,8 +69,8 @@ fn main() {
     let wx_of = std::env::var("PROBE_WX").unwrap_or_else(|_| "od".into());
     let check_of = std::env::var("PROBE_CHECKS").unwrap_or_else(|_| "z".into());
     let settle_min: u64 = std::env::var("PROBE_SETTLE_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(40_000_000);
-    let reps: usize = std::env::var("PROBE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
-    let budget: f64 = std::env::var("PROBE_BUDGET").ok().and_then(|s| s.parse().ok()).unwrap_or(155.0);
+    let reps: usize = std::env::var("PROBE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let budget: f64 = std::env::var("PROBE_BUDGET").ok().and_then(|s| s.parse().ok()).unwrap_or(158.0);
     let sizes: Vec<(u64, u64)> = std::env::var("PROBE_SIZES")
         .unwrap_or_else(|_| "60000000:32,20000000:31".into())
         .split(',')

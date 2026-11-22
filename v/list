@@ -1,2 +1,7 @@
 z z
-sp sp
+zp zp
+m12 z XL_V3M2=12
+m13 z XL_V3M2=13
+t20 z XL_V3T1=20
+t80 z XL_V3T1=80
+mt z XL_V3M2=12 XL_V3T1=20
