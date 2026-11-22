@@ -1,9 +1,3 @@
-n n
-nr n XL_REL=0
-nf n XL_FREE=0
-nrf n XL_REL=0 XL_FREE=0
-nh n XL_NOHUGE=1
-nrg n XL_RGREL=0
-ne0 n XL_ENDREL=0
-ne2 n XL_ENDREL=2
-sp sp
+f f
+x x
+o3 o3
